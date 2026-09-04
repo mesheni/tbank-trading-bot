@@ -259,6 +259,36 @@ chmod 440 /etc/sudoers.d/tbank-bot
 
 ---
 
+### 3.10 Обновление кода на сервере
+
+Если серверная копия склонирована через git:
+
+```bash
+cd /root/tbank-trading-bot
+git pull
+# если менялся requirements.txt:
+.venv/bin/pip install -r requirements.txt
+systemctl restart tbank-bot
+```
+
+Если копировали по scp (нет .git) — переключитесь на репозиторий один раз:
+
+```bash
+cd /root/tbank-trading-bot
+git init -b main
+git remote add origin https://github.com/ВАШ-АККАУНТ/tbank-trading-bot.git
+git fetch origin
+git reset --hard origin/main
+git branch --set-upstream-to=origin/main main
+systemctl restart tbank-bot
+```
+
+`reset --hard` меняет только файлы из репозитория: `.env`, `data/`, `reports/`,
+`models_artifacts/`, `certs/` (в `.gitignore`) не затрагиваются. Ручные правки кода на сервере
+при этом теряются — править стоит локально и пушить. Цикл: локально `commit` + `push` →
+на сервере `git pull` → `systemctl restart tbank-bot`. Отставание видно в `git status -sb`
+(`[behind N]`).
+
 ## 4. Типичные проблемы на сервере
 
 | Симптом | Причина и решение |
