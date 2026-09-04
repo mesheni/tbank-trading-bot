@@ -55,7 +55,10 @@ copy .env.example .env
 
 ```bash
 # Ubuntu/Debian
-sudo apt update && sudo apt install -y python3-venv python3-pip git
+sudo apt update && sudo apt install -y python3-venv python3-pip git libgomp1
+
+# libgomp1 — OpenMP-рантайм, нужен LightGBM; на минимальных образах его часто нет.
+# CentOS/RHEL/AlmaLinux: sudo yum install -y libgomp
 
 # выделенный пользователь (не root)
 sudo useradd -m -s /bin/bash botuser
@@ -190,7 +193,17 @@ botuser ALL=(root) NOPASSWD: /usr/bin/systemctl restart tbank-bot
 
 ---
 
-## 4. Безопасность и важные оговорки
+## 4. Типичные проблемы на сервере
+
+| Симптом | Причина и решение |
+|---|---|
+| `OSError: libgomp.so.1: cannot open shared object file` при train | Нет OpenMP-рантайма: `sudo apt install -y libgomp1` (или `yum install libgomp`) |
+| `SSL: CERTIFICATE_VERIFY_FAILED` | Сервер в РФ с перехватом TLS: положите НУЦ-сертификаты в `certs/` проекта (см. §3.3) |
+| `T_INVEST_TOKEN не задан` | Не заполнен `.env` в рабочей директории юнита/cron (`WorkingDirectory`!) |
+| Ошибки вида `database is locked` | Одновременная запись в SQLite: не запускайте `download` параллельно с работающим ботом — по расписанию cron сначала `systemctl stop`, после `train` — `start` |
+| Обучение падает на новом листинге | Тикер с историей < 500 свечей пропускается с предупреждением — это норма |
+
+## 5. Безопасность и важные оговорки
 
 * `.env` с токеном никогда не попадает в git (`.gitignore`) — на сервере права `600`.
 * Токен давайте только с нужными правами; для песочницы — sandbox-токен, для реального счёта —
@@ -202,10 +215,10 @@ botuser ALL=(root) NOPASSWD: /usr/bin/systemctl restart tbank-bot
 * Бэкапьте `data/market.sqlite` и `reports/` (история выгрузок и журналы) — например, в cron
   `tar czf backup_$(date +\%F).tgz data reports`.
 
-## 5. Краткий чек-лист деплоя
+## 6. Краткий чек-лист деплоя
 
 1. VPS (лучше в РФ — ниже пинг к API; НУЦ-сертификаты в `certs/`).
-2. Python 3.11+, venv, `pip install -r requirements.txt`.
+2. Python 3.11+, venv, `pip install -r requirements.txt`, **`apt install libgomp1`**.
 3. `.env` с токеном, `chmod 600`.
 4. `cli.py smoke` → `download` → `news` → `train` → `backtest`.
 5. systemd-юнит `tbank-bot` → `enable --now` → `journalctl -f`.

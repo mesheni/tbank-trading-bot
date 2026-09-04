@@ -1,14 +1,35 @@
 """LightGBM-регрессор доходности на инженерных признаках."""
 from __future__ import annotations
 
+import logging
+
 import numpy as np
 import pandas as pd
 
 from features import FEATURE_COLUMNS, NEWS_FEATURE_COLUMNS, TARGET
 
+log = logging.getLogger(__name__)
+
+
+def _import_lightgbm():
+    """Импорт LightGBM с понятной подсказкой при нехватке системных библиотек."""
+    try:
+        import lightgbm as lgb
+
+        return lgb
+    except OSError as exc:
+        if "libgomp" in str(exc):
+            raise OSError(
+                f"{exc}\n"
+                "Не хватает OpenMP-рантайма для LightGBM. Установите его:\n"
+                "  Debian/Ubuntu: sudo apt install -y libgomp1\n"
+                "  CentOS/RHEL:   sudo yum install -y libgomp"
+            ) from exc
+        raise
+
 
 class LGBMReturnModel:
-    """Прогноз будущей доходности по признакам; обучается на истории walk-forward."""
+    """Прогноз будущей доходности по инженерным признакам; обучается на истории walk-forward."""
 
     name = "lgbm"
 
@@ -30,7 +51,7 @@ class LGBMReturnModel:
         return features[self.feature_cols].to_numpy(dtype=np.float64)
 
     def fit(self, features: pd.DataFrame) -> "LGBMReturnModel":
-        import lightgbm as lgb
+        lgb = _import_lightgbm()
 
         data = features.dropna(subset=self.feature_cols + [TARGET])
         X, y = self._matrix(data), data[TARGET].to_numpy(dtype=np.float64)
