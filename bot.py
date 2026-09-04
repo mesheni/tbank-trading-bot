@@ -77,8 +77,8 @@ class TradingBot:
         if not self.instruments:
             raise RuntimeError("Ни один тикер не разрешён в инструмент")
 
-        self.embedder = NewsEmbedder(config.embedding_model)
-        self.sentiment = make_sentiment(config.sentiment_model)
+        self.embedder = NewsEmbedder(config.embedding_model, enabled=config.nlp_embedder)
+        self.sentiment = make_sentiment(config.sentiment_model, preference=config.nlp_sentiment)
 
         self.artifacts: dict[str, ModelArtifact] = {}
         self.news_sentiments: dict[str, dict[str, float]] = {}

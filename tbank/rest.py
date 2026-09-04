@@ -113,8 +113,23 @@ def build_ca_bundle(
         return None
 
     base = Path(certifi.where()).read_text(encoding="utf-8", errors="ignore")
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_text(base.rstrip() + "\n" + extra, encoding="utf-8")
+    merged = base.rstrip() + "\n" + extra
+    try:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(merged, encoding="utf-8")
+    except OSError as exc:
+        # папка недоступна для записи (например, создана под root, а сервис работает от другого
+        # пользователя) — бандл кладём во временный каталог, чтобы бот не падал на старте
+        import tempfile
+
+        fallback = Path(tempfile.gettempdir()) / "tbank-bot-ca-bundle.pem"
+        log.warning(
+            "Не удалось записать TLS-бандл в %s (%s); использую временный %s. "
+            "Проверьте владельца файлов проекта: chown -R <пользователь> <проект>",
+            output_path, exc, fallback,
+        )
+        fallback.write_text(merged, encoding="utf-8")
+        output_path = fallback
     log.info("TLS: использую бандл %s (certifi + %s)", output_path, ", ".join(used))
     return str(output_path)
 

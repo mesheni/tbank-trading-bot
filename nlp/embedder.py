@@ -14,11 +14,18 @@ log = logging.getLogger(__name__)
 
 
 class NewsEmbedder:
-    """Обёртка над sentence-transformers с e5-моделью по умолчанию."""
+    """Обёртка над sentence-transformers с e5-моделью по умолчанию.
 
-    def __init__(self, model_name: str = "intfloat/multilingual-e5-small"):
+    enabled=False отключает загрузку модели (экономит ~450 МБ RAM на слабых VPS).
+    """
+
+    def __init__(self, model_name: str = "intfloat/multilingual-e5-small", enabled: bool = True):
         self.model_name = model_name
         self._model = None
+        self.available = False
+        if not enabled:
+            log.info("Эмбеддер отключён (NLP_EMBEDDER=0) — кластеризация повестки выключена")
+            return
         self.available = self._try_load(model_name)
 
     def _try_load(self, model_name: str) -> bool:

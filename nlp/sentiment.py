@@ -90,8 +90,19 @@ class TransformersSentiment:
         return self._label_map.get(label, 0.0) * prob
 
 
-def make_sentiment(model_name: str = "Blanchefort/rubert-base-cased-sentiment"):
-    """Фабрика: трансформер, если доступен, иначе лексикон."""
+def make_sentiment(
+    model_name: str = "Blanchefort/rubert-base-cased-sentiment",
+    preference: str = "auto",
+):
+    """Фабрика тональности.
+
+    preference: auto — трансформер, если доступен, иначе лексикон;
+    lexicon — принудительно офлайн-лексикон (для слабых по RAM серверов);
+    transformer — только трансформер (ошибка, если недоступен).
+    """
+    if preference == "lexicon":
+        log.info("Тональность: лексикон (NLP_SENTIMENT=lexicon)")
+        return LexiconSentiment()
     try:
         import transformers  # noqa: F401
         import torch  # noqa: F401
@@ -100,6 +111,8 @@ def make_sentiment(model_name: str = "Blanchefort/rubert-base-cased-sentiment"):
         log.info("Тональность: трансформер %s", model_name)
         return sentiment
     except Exception as exc:
+        if preference == "transformer":
+            raise
         log.info(
             "Трансформер тональности недоступен (%s) — используется лексиконный фолбэк. "
             "Для включения: pip install transformers torch",

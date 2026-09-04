@@ -74,6 +74,14 @@ class Config:
         default_factory=lambda: os.getenv("SENTIMENT_MODEL", "Blanchefort/rubert-base-cased-sentiment")
     )
     news_half_life_hours: float = field(default_factory=lambda: _env_float("NEWS_HALF_LIFE_HOURS", 24.0))
+    # Тональность: auto (трансформер, если установлен torch+transformers, иначе лексикон) |
+    # lexicon (принудительно офлайн) | transformer (паднуть, если трансформер недоступен)
+    nlp_sentiment: str = field(default_factory=lambda: os.getenv("NLP_SENTIMENT", "auto").lower())
+    # Эмбеддеры повестки: 0 — отключить (экономит ~450 МБ RAM, кластеризация тем off)
+    nlp_embedder: bool = field(
+        default_factory=lambda: os.getenv("NLP_EMBEDDER", "1").strip().lower()
+        not in {"0", "false", "off", "no"}
+    )
 
     @property
     def is_sandbox(self) -> bool:

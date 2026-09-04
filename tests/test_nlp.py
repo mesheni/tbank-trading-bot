@@ -4,7 +4,8 @@ import pandas as pd
 import pytest
 
 from nlp.agenda import batch_score_news, score_agenda
-from nlp.sentiment import LexiconSentiment
+from nlp.embedder import NewsEmbedder
+from nlp.sentiment import LexiconSentiment, make_sentiment
 
 
 @pytest.fixture
@@ -60,6 +61,19 @@ def test_score_agenda_empty_and_window():
     # новость за пределами окна не учитывается
     old = _news_df([(100, "Очень старая новость")])
     assert score_agenda(old, {"n0": 0.5}, now, window_hours=48).n_items == 0
+
+
+def test_lexicon_fallback_when_forced():
+    """NLP_SENTIMENT=lexicon принудительно даёт лексикон, даже если трансформеры установлены."""
+    sentiment = make_sentiment(preference="lexicon")
+    assert isinstance(sentiment, LexiconSentiment)
+
+
+def test_embedder_disabled_without_loading():
+    """NLP_EMBEDDER=0: эмбеддер недоступен, ничего не загружается (важно для VPS с 1 ГБ RAM)."""
+    embedder = NewsEmbedder(enabled=False)
+    assert embedder.available is False
+    assert embedder.encode(["тест"]) is None
 
 
 def test_momentum():
