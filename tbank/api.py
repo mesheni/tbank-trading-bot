@@ -115,12 +115,11 @@ class TBankAPI:
         }
         self.client.post(f"{self.SANDBOX}/SandboxPayIn", payload)
 
-    def pay_out(self, account_id: str, amount_rub: float) -> None:
-        payload = {
-            "accountId": account_id,
-            "amount": float_to_quotation_rub(amount_rub),
-        }
-        self.client.post(f"{self.SANDBOX}/SandboxPayOut", payload)
+    def close_sandbox_account(self, account_id: str) -> None:
+        """Закрывает sandbox-счёт вместе с позициями (вывода из песочницы в API нет)."""
+        if not self.client.host.endswith("sandbox-invest-public-api.tbank.ru"):
+            raise APIError(0, "close_sandbox_account доступен только в sandbox")
+        self.client.post(f"{self.SANDBOX}/CloseSandboxAccount", {"accountId": account_id})
 
     # ---------- Инструменты ----------
 

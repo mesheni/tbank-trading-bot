@@ -8,7 +8,8 @@
     python cli.py backtest              # бэктест стратегии с лучшей моделью
     python cli.py run                   # торговый цикл в sandbox
     python cli.py report                # состояние счёта и журнал сделок
-    python cli.py normalize             # вывести излишек sandbox-счёта сверх бюджета
+    python cli.py normalize             # проверить счёт на соответствие бюджету
+    python cli.py reset-sandbox         # пересоздать sandbox-счёт с бюджетом
 """
 from __future__ import annotations
 
@@ -512,10 +513,12 @@ def cmd_report(config: Config) -> int:
 
 
 def cmd_normalize(config: Config) -> int:
-    """Приводит sandbox-счёт к бюджету: выводит излишек сверх SANDBOX_INITIAL_RUB.
+    """Проверяет соответствие счёта бюджету SANDBOX_INITIAL_RUB.
 
-    Нужна после ошибочных пополнений (раньше бот доливал кэш в цикле) или ручных
-    экспериментов. Дефицит (просадку ниже бюджета) сознательно не восполняет.
+    Дефицит (просадку ниже бюджета) сознательно не восполняет. Излишек вывести
+    нельзя: в T-Invest API нет метода вывода из песочницы (SandboxPayOut не
+    существует — сервер отвечает 404). Вернуть бюджет можно только полным
+    сбросом счёта: python cli.py reset-sandbox.
     """
     if config.mode != "sandbox":
         print("[!!] Команда normalize доступна только в режиме sandbox", file=sys.stderr)
@@ -536,17 +539,77 @@ def cmd_normalize(config: Config) -> int:
         f"(кэш {ui.fmt_money(portfolio['cash_rub'])}, бюджет {ui.fmt_money(config.sandbox_initial_rub)})"
     )
     if excess > 1.0:
-        api.pay_out(trader.account_id, excess)
-        # компенсирующая пара в журнале движений: излишек появился из неучтённого
-        # пополнения, поэтому записываем его «восстановлением учёта» и сразу выводом —
-        # итог по бюджету не меняется, но P&L за периоды остаётся честным
-        trader.log_flow(excess, "adjust", "восстановление учёта: излишек сверх бюджета")
-        trader.log_flow(-excess, "withdraw", "вывод излишка до бюджета")
-        print(f"  Выведено {ui.fmt_money(excess)} руб — на счёте снова бюджет")
-    elif excess < -1.0:
+        warn(
+            f"излишек {ui.fmt_money(excess)} руб. Вывести его через API нельзя — "
+            "в T-Invest API нет метода вывода из sandbox. Вернуть бюджет можно "
+            "только пересозданием счёта: python cli.py reset-sandbox"
+        )
+        return 1
+    if excess < -1.0:
         print("  На счёте ниже бюджета (просадка) — дефицит сознательно не восполняем")
     else:
         print("  Счёт в пределах бюджета ±1 руб — ничего не делаем")
+    return 0
+
+
+def _rotate_report_file(path: Path) -> str | None:
+    """Убирает журнал старого счёта в архив с меткой времени, возвращает имя архива."""
+    if not path.exists():
+        return None
+    stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    archived = path.with_name(f"{path.stem}_{stamp}{path.suffix}")
+    path.replace(archived)
+    return archived.name
+
+
+def cmd_reset_sandbox(config: Config, assume_yes: bool = False) -> int:
+    """Полный сброс sandbox: закрыть счёт, открыть новый, внести бюджет.
+
+    Единственный способ вернуть счёт к бюджету после ошибочного пополнения:
+    вывода из песочницы в API нет. Позиции и кэш закрываются вместе со счётом;
+    journal.csv / equity_live.csv / flows.csv ротируются с меткой времени —
+    история старого счёта остаётся в reports/ с суффиксом-датой.
+    После сброса бота нужно перезапустить, чтобы он подхватил новый счёт.
+    """
+    if config.mode != "sandbox":
+        print("[!!] Команда reset-sandbox доступна только в режиме sandbox", file=sys.stderr)
+        return 2
+    api = make_api(config)
+    accounts = api.get_accounts()
+    if not accounts:
+        print("[!!] Sandbox-счёт не найден — запустите бота, он откроет и наполнит счёт сам")
+        return 2
+    from tbank.trader import Trader
+
+    trader = Trader(api, Path(config.reports_dir) / "journal.csv")
+    portfolio = trader.portfolio()
+    print(
+        f"  Счёт {trader.account_id}: {ui.fmt_money(portfolio['total_amount_rub'])} руб, "
+        f"позиций: {len(portfolio['positions'])}"
+    )
+    print(
+        f"  Счёт будет ЗАКРЫТ вместе с позициями; откроется новый с бюджетом "
+        f"{ui.fmt_money(config.sandbox_initial_rub)} руб."
+    )
+    if not assume_yes:
+        answer = input("  Подтвердите (YES): ").strip()
+        if answer != "YES":
+            print("  Отменено")
+            return 1
+
+    api.close_sandbox_account(trader.account_id)
+    new_account_id = api.open_sandbox_account()
+    api.pay_in(new_account_id, config.sandbox_initial_rub)
+
+    rotated = [
+        name
+        for name in ("journal.csv", "equity_live.csv", "flows.csv")
+        if (archived := _rotate_report_file(Path(config.reports_dir) / name))
+    ]
+    print(f"  Новый счёт: {new_account_id}, бюджет {ui.fmt_money(config.sandbox_initial_rub)} руб внесён")
+    if rotated:
+        print(f"  Журналы старого счёта заархивированы: {', '.join(rotated)}")
+    print("  Перезапустите бота, чтобы он подхватил новый счёт (например: systemctl restart tbank-bot)")
     return 0
 
 
@@ -557,10 +620,11 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Торговый бот T-Invest API (sandbox) с ML-прогнозом и новостным анализом")
     parser.add_argument(
         "command",
-        choices=["smoke", "download", "news", "train", "backtest", "run", "report", "normalize"],
+        choices=["smoke", "download", "news", "train", "backtest", "run", "report", "normalize", "reset-sandbox"],
     )
     parser.add_argument("--days", type=int, default=None, help="глубина истории в днях (download)")
     parser.add_argument("--iterations", type=int, default=None, help="число итераций цикла (run)")
+    parser.add_argument("--yes", action="store_true", help="не спрашивать подтверждение (reset-sandbox)")
     args = parser.parse_args()
 
     config = Config()
@@ -590,6 +654,8 @@ def main() -> int:
         return cmd_report(config)
     if args.command == "normalize":
         return cmd_normalize(config)
+    if args.command == "reset-sandbox":
+        return cmd_reset_sandbox(config, assume_yes=args.yes)
     return 1
 
 

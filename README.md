@@ -59,7 +59,8 @@ TLS_INSECURE=1
 | `cli.py backtest` | бэктест стратегии с лучшей моделью, отчёты | нет |
 | `cli.py run [--iterations N]` | торговый цикл бота в sandbox | да |
 | `cli.py report` | позиции счёта и журнал сделок | да |
-| `cli.py normalize` | вывести излишек sandbox-счёта сверх бюджета (sandbox) | да |
+| `cli.py normalize` | сверить счёт с бюджетом; излишек не вывести (в API нет вывода из sandbox) | да |
+| `cli.py reset-sandbox [--yes]` | пересоздать sandbox-счёт: закрыть старый, внести бюджет, архивировать журналы | да |
 
 Типовой сценарий: `smoke` → `download --days 720` → `news` → `train` → `backtest` → `run`.
 

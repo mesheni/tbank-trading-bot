@@ -14,7 +14,6 @@ class StubAPI:
     def __init__(self, total: float, cash: float, positions: dict | None = None):
         self.data = {"total_amount_rub": total, "cash_rub": cash, "positions": positions or {}}
         self.pay_ins: list[float] = []
-        self.paid_out = 0.0
 
     def get_accounts(self) -> list[dict]:
         return [{"id": "acc-1"}]
@@ -24,9 +23,6 @@ class StubAPI:
 
     def pay_in(self, account_id: str, amount: float) -> None:
         self.pay_ins.append(amount)
-
-    def pay_out(self, account_id: str, amount: float) -> None:
-        self.paid_out += amount
 
 
 def make_trader(api: StubAPI) -> Trader:
@@ -60,51 +56,103 @@ def test_drawdown_not_refilled():
     assert api.pay_ins == []
 
 
-def make_trader_stub(stub: StubAPI):
+def make_trader_stub(total: float):
     flows: list[tuple[float, str]] = []
 
     def log_flow(amount: float, kind: str, reason: str) -> None:
         flows.append((amount, kind))
 
     ns = SimpleNamespace(
-        account_id="acc-1",
-        portfolio=lambda: stub.get_portfolio("acc-1"),
+        account_id="old-acc",
+        portfolio=lambda: {"total_amount_rub": total, "cash_rub": 0.0, "positions": {"f1": {}}},
         log_flow=log_flow,
     )
     ns.flows = flows
     return ns
 
 
-def test_cmd_normalize_pays_out_excess(tmp_path, monkeypatch):
-    stub = StubAPI(total=1_995_000.0, cash=995_000.0, positions={"f1": {}})
-    monkeypatch.setattr(cli, "make_api", lambda cfg: stub)
-    trader_stub = make_trader_stub(stub)
+class AccountsAPI:
+    def get_accounts(self) -> list[dict]:
+        return [{"id": "old-acc"}]
+
+
+def test_cmd_normalize_reports_excess_and_does_nothing(tmp_path, monkeypatch):
+    # в T-Invest API нет вывода из sandbox: normalize лишь объясняет и отправляет в reset-sandbox
+    monkeypatch.setattr(cli, "make_api", lambda cfg: AccountsAPI())
+    trader_stub = make_trader_stub(1_995_000.0)
     monkeypatch.setattr(trader_mod, "Trader", lambda api, path: trader_stub)
     config = SimpleNamespace(mode="sandbox", reports_dir=tmp_path, sandbox_initial_rub=1_000_000.0)
 
     rc = cli.cmd_normalize(config)
 
-    assert rc == 0
-    assert stub.paid_out == pytest.approx(995_000.0)
-    # компенсирующая пара: restore-запись и вывод — итог по бюджету нулевой
-    assert trader_stub.flows == [
-        (pytest.approx(995_000.0), "adjust"),
-        (pytest.approx(-995_000.0), "withdraw"),
-    ]
+    assert rc == 1
+    assert trader_stub.flows == []
 
 
 def test_cmd_normalize_noop_within_budget(tmp_path, monkeypatch):
-    stub = StubAPI(total=1_000_000.5, cash=500_000.5, positions={"f1": {}})
-    monkeypatch.setattr(cli, "make_api", lambda cfg: stub)
-    trader_stub = make_trader_stub(stub)
+    monkeypatch.setattr(cli, "make_api", lambda cfg: AccountsAPI())
+    trader_stub = make_trader_stub(1_000_000.5)
     monkeypatch.setattr(trader_mod, "Trader", lambda api, path: trader_stub)
     config = SimpleNamespace(mode="sandbox", reports_dir=tmp_path, sandbox_initial_rub=1_000_000.0)
 
     rc = cli.cmd_normalize(config)
 
     assert rc == 0
-    assert stub.paid_out == 0.0
     assert trader_stub.flows == []
+
+
+class ResetAPI:
+    def __init__(self):
+        self.closed: list[str] = []
+        self.paid_in: list[tuple[str, float]] = []
+
+    def get_accounts(self) -> list[dict]:
+        return [{"id": "old-acc"}]
+
+    def close_sandbox_account(self, account_id: str) -> None:
+        self.closed.append(account_id)
+
+    def open_sandbox_account(self) -> str:
+        return "new-acc"
+
+    def pay_in(self, account_id: str, amount: float) -> None:
+        self.paid_in.append((account_id, amount))
+
+
+def test_cmd_reset_sandbox_full_flow(tmp_path, monkeypatch):
+    api_stub = ResetAPI()
+    monkeypatch.setattr(cli, "make_api", lambda cfg: api_stub)
+    monkeypatch.setattr(trader_mod, "Trader", lambda api, path: make_trader_stub(1_995_000.0))
+    monkeypatch.setattr("builtins.input", lambda prompt="": "YES")
+    for name in ("journal.csv", "equity_live.csv"):
+        (tmp_path / name).write_text("x,y\n1,2\n", encoding="utf-8")
+    config = SimpleNamespace(mode="sandbox", reports_dir=tmp_path, sandbox_initial_rub=1_000_000.0)
+
+    rc = cli.cmd_reset_sandbox(config, assume_yes=False)
+
+    assert rc == 0
+    assert api_stub.closed == ["old-acc"]
+    assert api_stub.paid_in == [("new-acc", 1_000_000.0)]
+    # журналы старого счёта заархивированы, на их месте чисто
+    assert not (tmp_path / "journal.csv").exists()
+    assert list(tmp_path.glob("journal_*.csv"))
+    assert not (tmp_path / "equity_live.csv").exists()
+    assert list(tmp_path.glob("equity_live_*.csv"))
+
+
+def test_cmd_reset_sandbox_cancelled_without_yes(tmp_path, monkeypatch):
+    api_stub = ResetAPI()
+    monkeypatch.setattr(cli, "make_api", lambda cfg: api_stub)
+    monkeypatch.setattr(trader_mod, "Trader", lambda api, path: make_trader_stub(1_995_000.0))
+    monkeypatch.setattr("builtins.input", lambda prompt="": "no")
+    config = SimpleNamespace(mode="sandbox", reports_dir=tmp_path, sandbox_initial_rub=1_000_000.0)
+
+    rc = cli.cmd_reset_sandbox(config, assume_yes=False)
+
+    assert rc == 1
+    assert api_stub.closed == []
+    assert api_stub.paid_in == []
+    assert (tmp_path / "journal.csv").exists() is False  # файлов и не было — ничего не тронуто
 
 
 def test_cmd_normalize_refuses_real_mode():
