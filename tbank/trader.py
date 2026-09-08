@@ -47,6 +47,29 @@ class Trader:
         self.api.pay_in(self.account_id, initial_rub)
         return initial_rub
 
+    def log_flow(self, amount_rub: float, kind: str, reason: str) -> None:
+        """Дописывает движение денег в reports/flows.csv — основа P&L без пополнений.
+
+        kind: deposit | withdraw | adjust (bookkeeping-компенсация неучтённого
+        движения). Стартовый бюджет из SANDBOX_INITIAL_RUB не журналируется:
+        он всегда учитывается как база в отчёте.
+        """
+        path = self.journal_path.parent / "flows.csv"
+        self.journal_path.parent.mkdir(parents=True, exist_ok=True)
+        is_new = not path.exists()
+        with open(path, "a", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            if is_new:
+                writer.writerow(["time", "amount_rub", "kind", "reason"])
+            writer.writerow(
+                [
+                    dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
+                    round(amount_rub, 2),
+                    kind,
+                    reason,
+                ]
+            )
+
     def portfolio(self) -> dict:
         return self.api.get_portfolio(self.account_id)
 

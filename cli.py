@@ -323,6 +323,49 @@ def cmd_run(config: Config, max_iterations: int | None) -> int:
     return 0
 
 
+def _load_flows(reports_dir: Path) -> pd.DataFrame:
+    """Журнал движений денег flows.csv: time, amount_rub (±), kind, reason."""
+    path = Path(reports_dir) / "flows.csv"
+    if not path.exists():
+        return pd.DataFrame(columns=["time", "amount_rub", "kind", "reason"])
+    flows = pd.read_csv(path)
+    flows["time"] = pd.to_datetime(flows["time"], utc=True)
+    return flows
+
+
+def _net_invested(initial_rub: float, flows: pd.DataFrame) -> float:
+    """Вложено в торговлю: бюджет ± все движения денег (пополнения и выводы).
+
+    Компенсирующие пары от normalize (adjust + withdraw) в сумме дают ноль,
+    поэтому не искажают базу — только фиксируют момент во времени.
+    """
+    return initial_rub + (float(flows["amount_rub"].sum()) if len(flows) else 0.0)
+
+
+def _period_pnl(
+    equity: pd.DataFrame, flows: pd.DataFrame, cutoff: pd.Timestamp
+) -> tuple[float, float, float, float] | None:
+    """P&L за окно от cutoff: дельта капитала минус движения денег в окне.
+
+    Возвращает (pnl, базовый капитал окна, сумма движений в окне, дней данных).
+    """
+    if equity.empty:
+        return None
+    window = equity[equity["time"] >= cutoff]
+    if window.empty:
+        return None
+    now = equity["time"].iloc[-1]
+    base = float(window["total_rub"].iloc[0])
+    last = float(equity["total_rub"].iloc[-1])
+    moved = 0.0
+    if len(flows):
+        in_window = flows[(flows["time"] >= cutoff) & (flows["time"] <= now)]
+        moved = float(in_window["amount_rub"].sum())
+    pnl = (last - base) - moved
+    coverage_days = (now - window["time"].iloc[0]).total_seconds() / 86400
+    return pnl, base, moved, coverage_days
+
+
 def cmd_report(config: Config) -> int:
     api = make_api(config)
     accounts = api.get_accounts()
@@ -333,15 +376,66 @@ def cmd_report(config: Config) -> int:
     portfolio = api.get_portfolio(account_id)
     total = portfolio["total_amount_rub"]
     initial = config.sandbox_initial_rub
-    pnl = total - initial
+    flows = _load_flows(config.reports_dir)
+    invested = _net_invested(initial, flows)
+    pnl = total - invested
+
+    figi_ticker: dict[str, str] = {}
+    lot_by_ticker: dict[str, int] = {}
+    try:
+        instruments = api.resolve_instruments(config.tickers)
+        for t, inst in instruments.items():
+            figi_ticker[inst["figi"]] = t
+            lot_by_ticker[t] = int(inst.get("lot", 1))
+    except Exception as exc:
+        warn(f"Не удалось разрешить тикеры ({exc}) — позиции покажем по FIGI, лот=1")
 
     print(ui.header(f"СЧЁТ {account_id} · {config.mode}"))
     print(
         f"  Капитал:  {ui.paint(ui.fmt_money(total) + ' руб', ui.BOLD)} | "
-        f"свободно: {ui.fmt_money(portfolio['cash_rub'])} руб | "
-        f"P&L: {ui.fmt_signed(pnl, '{:+,.0f} руб')} "
-        f"({ui.fmt_signed(total / initial - 1)} к старту {ui.fmt_money(initial)})"
+        f"свободно: {ui.fmt_money(portfolio['cash_rub'])} руб"
     )
+    print(
+        f"  Вложено:  {ui.fmt_money(invested)} руб "
+        f"(бюджет {ui.fmt_money(initial)} ± пополнения/выводы из flows.csv)"
+    )
+    pnl_pct = pnl / invested if invested > 1.0 else 0.0
+    print(
+        f"  P&L:      {ui.fmt_signed(pnl, '{:+,.0f} руб')} "
+        f"({ui.fmt_signed(pnl_pct)} от вложенного) — пополнения в прибыль не считают"
+    )
+    if total - invested > max(1000.0, invested * 0.02):
+        warn(
+            f"капитал выше вложенного на {ui.fmt_money(total - invested)} руб, "
+            "но в flows.csv нет записей об этом — похоже, было неучтённое пополнение. "
+            "Выполните `python cli.py normalize`: излишек будет выведен и внесён в учёт."
+        )
+
+    print(ui.header("P&L ПО ПЕРИОДАМ (без учёта пополнений/выводов)"))
+    equity_file = config.reports_dir / "equity_live.csv"
+    equity = None
+    if equity_file.exists():
+        equity = pd.read_csv(equity_file)
+        equity["time"] = pd.to_datetime(equity["time"], utc=True)
+        now = equity["time"].iloc[-1]
+        for label, days in (("день", 1), ("неделя", 7), ("месяц", 30)):
+            res = _period_pnl(equity, flows, now - pd.Timedelta(days=days))
+            if res is None:
+                print(f"  {label:<7} нет данных за окно")
+                continue
+            pnl_p, base, moved, coverage = res
+            pct_p = pnl_p / base if base > 1.0 else 0.0
+            note = ""
+            if coverage < days * 0.98:
+                note += f" (данных {coverage:.1f} дн. из {days})"
+            if abs(moved) > 1.0:
+                note += f" [движение денег в окне: {moved:+,.0f} руб]"
+            print(
+                f"  {label:<7} {ui.fmt_signed(pnl_p, '{:+,.0f} руб')} "
+                f"({ui.fmt_signed(pct_p)} от {ui.fmt_money(base)}){note}"
+            )
+    else:
+        print("  Появится после запуска бота (reports/equity_live.csv).")
 
     print(ui.header("ПОЗИЦИИ"))
     if not portfolio["positions"]:
@@ -354,7 +448,7 @@ def cmd_report(config: Config) -> int:
             pnl_pos = (cur / avg - 1) if avg > 0 and cur > 0 else 0.0
             rows.append(
                 [
-                    figi,
+                    figi_ticker.get(figi, figi),
                     f"{pos['quantity']:.0f} шт",
                     f"{avg:.2f}",
                     f"{cur:.2f}",
@@ -377,28 +471,35 @@ def cmd_report(config: Config) -> int:
             rows = list(_csv.DictReader(f))
         buys = sum(1 for r in rows if r["action"] == "BUY")
         sells = len(rows) - buys
+
+        def commission_of(row: dict) -> float:
+            lot = lot_by_ticker.get(row.get("ticker", ""), 1)
+            return float(row["lots"]) * float(row["price"]) * lot * config.commission_pct
+
+        total_commission = sum(commission_of(r) for r in rows)
         print(f"  Всего {len(rows)} операций: {ui.paint(f'покупок {buys}', ui.GREEN)}, "
-              f"{ui.paint(f'продаж {sells}', ui.RED)}. Последние 10:")
+              f"{ui.paint(f'продаж {sells}', ui.RED)} · "
+              f"комиссия (оценка, тариф {config.commission_pct:.2%}): ~{total_commission:,.0f} руб")
+        print("  Последние 10:")
         for row in rows[-10:]:
             action_color = ui.GREEN if row["action"] == "BUY" else ui.RED
             action = ui.paint(f"{row['action']:<4}", action_color)
             print(f"    {row['time']}  {action} {row['ticker']:<5} {row['lots']} лот(ов) "
-                  f"по {row['price']} · {row['reason']}")
+                  f"по {row['price']} · комиссия ~{commission_of(row):,.0f} руб · {row['reason']}")
     else:
         print("  Журнала сделок ещё нет — появится после первого запуска бота.")
 
     print(ui.header("КРИВАЯ КАПИТАЛА (живой прогон)"))
-    equity_file = config.reports_dir / "equity_live.csv"
-    if equity_file.exists():
-        equity = pd.read_csv(equity_file)
+    if equity is not None:
         print(f"  Точек: {len(equity)} (файл {equity_file.name})")
         print(
             f"  старт:  {equity.iloc[0]['time']} · {ui.fmt_money(equity.iloc[0]['total_rub'])} руб"
         )
+        last_equity = float(equity.iloc[-1]["total_rub"])
+        vs_invested = last_equity / invested - 1.0 if invested > 1.0 else 0.0
         print(
             f"  сейчас: {equity.iloc[-1]['time']} · "
-            f"{ui.fmt_signed(equity.iloc[-1]['total_rub'] / initial - 1)} к старту · "
-            f"{ui.fmt_money(equity.iloc[-1]['total_rub'])} руб"
+            f"{ui.fmt_signed(vs_invested)} к вложенному · {ui.fmt_money(last_equity)} руб"
         )
         if len(equity) > 2:
             peak = equity["total_rub"].max()
@@ -436,6 +537,11 @@ def cmd_normalize(config: Config) -> int:
     )
     if excess > 1.0:
         api.pay_out(trader.account_id, excess)
+        # компенсирующая пара в журнале движений: излишек появился из неучтённого
+        # пополнения, поэтому записываем его «восстановлением учёта» и сразу выводом —
+        # итог по бюджету не меняется, но P&L за периоды остаётся честным
+        trader.log_flow(excess, "adjust", "восстановление учёта: излишек сверх бюджета")
+        trader.log_flow(-excess, "withdraw", "вывод излишка до бюджета")
         print(f"  Выведено {ui.fmt_money(excess)} руб — на счёте снова бюджет")
     elif excess < -1.0:
         print("  На счёте ниже бюджета (просадка) — дефицит сознательно не восполняем")
