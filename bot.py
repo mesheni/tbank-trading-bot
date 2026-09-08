@@ -29,7 +29,16 @@ from notify import Notifier
 from strategy import Decision, PortfolioState, Position, RiskConfig, decide
 import ui
 from tbank.api import TBankAPI
-from tbank.market_data import connect, download_candles, load_candles, load_news, store_news
+from tbank.market_data import (
+    connect,
+    download_candles,
+    load_candles,
+    load_news,
+    load_sentiments,
+    store_instruments,
+    store_news,
+    store_sentiments,
+)
 from tbank.rest import TBankRestClient
 from tbank.trader import Trader, make_journal_row
 
@@ -97,6 +106,23 @@ def write_heartbeat(path: Path) -> None:
     path.write_text(dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"), encoding="utf-8")
 
 
+def ensure_sentiments(conn, news_df: pd.DataFrame, scorer, model_key: str) -> dict[str, float]:
+    """Скоры тональности с кэшем в БД: каждая новость считается один раз.
+
+    Живой цикл и бэктест используют один кэш — после первого прогона
+    тональность не пересчитывается ни при рестартах, ни в офлайн-оценке.
+    """
+    cached = load_sentiments(conn, model_key)
+    missing = [str(n) for n in news_df["news_id"] if str(n) not in cached]
+    if missing:
+        to_score = news_df[news_df["news_id"].astype(str).isin(missing)]
+        fresh = batch_score_news(to_score, scorer)
+        if fresh:
+            store_sentiments(conn, model_key, fresh)
+            cached.update(fresh)
+    return cached
+
+
 class TradingBot:
     def __init__(self, config: Config, risk: RiskConfig | None = None):
         config.validate()
@@ -108,6 +134,7 @@ class TradingBot:
             min_abs_return=config.min_abs_return,
             news_sentiment_gate=config.news_sentiment_gate,
             commission_pct=config.commission_pct,
+            slippage_pct=config.slippage_pct,
             reversal_exit_mult=config.reversal_exit_mult,
         )
         self.client = TBankRestClient(config.token, config.mode)
@@ -124,12 +151,12 @@ class TradingBot:
         self.instruments = self.api.resolve_instruments(config.tickers)
         if not self.instruments:
             raise RuntimeError("Ни один тикер не разрешён в инструмент")
+        store_instruments(self.conn, self.instruments)  # кэш лотов/uid для офлайн-команд
 
         self.embedder = NewsEmbedder(config.embedding_model, enabled=config.nlp_embedder)
         self.sentiment = make_sentiment(config.sentiment_model, preference=config.nlp_sentiment)
 
         self.artifacts: dict[str, ModelArtifact] = {}
-        self.news_sentiments: dict[str, dict[str, float]] = {}
         self._news_updated_at: dt.datetime | None = None
         self._running = False
 
@@ -183,9 +210,7 @@ class TradingBot:
         )
         if news_df.empty:
             return AgendaScore()
-        sentiments = self.news_sentiments.setdefault(ticker, {})
-        for news_id, score in batch_score_news(news_df, self.sentiment).items():
-            sentiments.setdefault(news_id, score)
+        sentiments = ensure_sentiments(self.conn, news_df, self.sentiment, self._sentiment_model_key())
         return score_agenda(
             news_df,
             sentiments,
@@ -194,6 +219,13 @@ class TradingBot:
             half_life_hours=self.config.news_half_life_hours,
             embedder=self.embedder if self.embedder.available else None,
         )
+
+    def _sentiment_model_key(self) -> str:
+        """Ключ кэша скоров: разные модели тональности не смешиваются."""
+        name = getattr(self.sentiment, "name", "")
+        if name == "lexicon":
+            return "lexicon"
+        return f"transformers:{self.config.sentiment_model}"
 
     def _artifact(self, ticker: str) -> ModelArtifact:
         artifact = self.artifacts.get(ticker)

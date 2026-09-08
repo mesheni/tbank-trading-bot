@@ -42,7 +42,14 @@ from models.registry import (
 from stats_utils import n_test_points
 from strategy import RiskConfig
 from tbank.api import TBankAPI
-from tbank.market_data import connect, download_candles, load_candles, load_news, store_news
+from tbank.market_data import (
+    connect,
+    download_candles,
+    load_candles,
+    load_news,
+    store_instruments,
+    store_news,
+)
 from tbank.rest import TBankRestClient
 
 
@@ -143,6 +150,7 @@ def cmd_download(config: Config, days: int) -> int:
     api = make_api(config)
     instruments = api.resolve_instruments(config.tickers)
     conn = connect(config.db_path)
+    store_instruments(conn, instruments)  # лоты/uid для офлайн-команд (backtest)
     for ticker, instrument in instruments.items():
         print(f"Выгрузка {ticker} ({config.candle_interval}, {days} дней)...")
         n = download_candles(api, conn, instrument["figi"], config.candle_interval, days_back=days, ticker=ticker)
@@ -269,8 +277,18 @@ def cmd_backtest(config: Config, days: int | None = None) -> int:
         take_profit_pct=config.take_profit_pct,
         min_abs_return=config.min_abs_return,
         commission_pct=config.commission_pct,
+        slippage_pct=config.slippage_pct,
         reversal_exit_mult=config.reversal_exit_mult,
     )
+    # тональность нужна и офлайн: скоры кэшируются в БД, живой цикл их разделяет
+    from bot import ensure_sentiments
+    from nlp.agenda import sentiment_series
+    from nlp.sentiment import make_sentiment
+    from tbank.market_data import load_instrument
+
+    scorer = make_sentiment(config.sentiment_model, preference=config.nlp_sentiment)
+    model_key = "lexicon" if getattr(scorer, "name", "") == "lexicon" else f"transformers:{config.sentiment_model}"
+
     for ticker in config.tickers:
         df = load_candles(conn, ticker, config.candle_interval)
         if df.empty:
@@ -284,14 +302,32 @@ def cmd_backtest(config: Config, days: int | None = None) -> int:
             continue
         features = ensure_news_columns(build_features(df, config.forecast_horizon))
 
+        instrument = load_instrument(conn, ticker)
+        lot_size = int(instrument["lot"]) if instrument else 1
+        if not instrument:
+            warn(f"{ticker}: тикера нет в кэше instruments — считаю лот=1 (заполнит download/smoke/run)")
+
         # порог входа как в боте: max(MIN_ABS_RETURN, рекомендация модели)
         eff_risk = replace(
             risk,
             min_abs_return=max(risk.min_abs_return, artifact.threshold or 0.0),
         )
-        print(
-            ui.header(f"{ticker} · модель {artifact.kind} · порог входа {eff_risk.min_abs_return:.4f}")
-        )
+        header = f"{ticker} · модель {artifact.kind} · порог входа {eff_risk.min_abs_return:.4f} · лот {lot_size}"
+
+        # историческая серия сентимента: новостные фильтры валидируются на истории
+        sent_series = None
+        uid = (instrument or {}).get("uid") or ""
+        news_df = load_news(conn, uid) if uid else pd.DataFrame()
+        if not news_df.empty:
+            sentiments = ensure_sentiments(conn, news_df, scorer, model_key)
+            sent_series = sentiment_series(
+                df.index, news_df, sentiments,
+                window_hours=48.0, half_life_hours=config.news_half_life_hours,
+            )
+            header += f" · новости: {len(news_df)} шт."
+        else:
+            header += " · новости: нет ряда (фильтр нейтрален)"
+        print(ui.header(header))
 
         # walk-forward предсказания лучшей моделью: только на прошлом, без утечки
         # (артефактная модель обучена на всей истории — для оценки на ней непригодна)
@@ -305,14 +341,17 @@ def cmd_backtest(config: Config, days: int | None = None) -> int:
             )
         preds_test = preds
 
-        result = run_backtest(df, preds_test, eff_risk, ticker=ticker)
+        result = run_backtest(
+            df, preds_test, eff_risk, ticker=ticker, lot_size=lot_size, sentiment=sent_series
+        )
         path = save_report(result, config.reports_dir, f"{ticker}_{config.candle_interval}_h{config.forecast_horizon}")
         m = result.metrics
         print(
             f"  Доходность {ui.fmt_signed(m['total_return'])} | "
             f"sharpe {ui.fmt_signed(m['sharpe'], '{:+.2f}')} | "
             f"просадка {ui.fmt_signed(m['max_drawdown'])} | "
-            f"сделок {m['n_trades']} | win-rate {m['win_rate']:.0%}"
+            f"сделок {m['n_trades']} | win-rate {m['win_rate']:.0%} | "
+            f"комиссии {m.get('total_commission', 0):,.0f} руб"
         )
         if m["n_trades"] == 0:
             warn("сделок нет: прогнозы модели не превышали порог входа (консервативно, деньги целы)")

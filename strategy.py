@@ -32,6 +32,7 @@ class RiskConfig:
     min_abs_return: float = 0.004
     news_sentiment_gate: float = -0.35
     commission_pct: float = 0.0004
+    slippage_pct: float = 0.0002
     # выход «прогноз развернулся» — при пересечении порога, в reversal_exit_mult
     # раз шире входного: симметричный порог заставлял закрываться на каждом
     # слабом колебании прогноза и тут же перекупать (churn, издержки съедали доходность)

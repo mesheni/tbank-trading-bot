@@ -110,3 +110,28 @@ def batch_score_news(news_df: pd.DataFrame, scorer) -> dict[str, float]:
         text = " ".join(x for x in (str(row.get("title", "")), str(row.get("text", ""))) if x != "nan")
         out[str(row["news_id"])] = float(scorer.score(text))
     return out
+
+
+def sentiment_series(
+    index,
+    news_df: pd.DataFrame,
+    sentiment_by_id: dict[str, float],
+    window_hours: float = 48.0,
+    half_life_hours: float = 24.0,
+) -> pd.Series:
+    """Историческая серия скоров повестки по меткам баров — для офлайн-бэктеста.
+
+    На каждом баре считает ту же score_agenda, что и живой цикл, с «текущим
+    моментом» = метка бара (без эмбеддера: темы для сигнала не нужны).
+    Позволяет валидировать новостные фильтры стратегии на истории.
+    """
+    if news_df is None or news_df.empty or len(index) == 0:
+        return pd.Series(dtype=float)
+    values = {}
+    for ts in index:
+        agenda = score_agenda(
+            news_df, sentiment_by_id, pd.Timestamp(ts),
+            window_hours=window_hours, half_life_hours=half_life_hours,
+        )
+        values[ts] = agenda.sentiment
+    return pd.Series(values, index=list(index), dtype=float)

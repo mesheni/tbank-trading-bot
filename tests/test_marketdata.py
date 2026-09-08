@@ -122,3 +122,29 @@ def test_chunked_window_boundaries():
         days = 1095
         n_chunks = -(-days // meta["chunk"])
         assert n_chunks * meta["chunk"] >= days
+
+
+def test_instruments_cache_roundtrip(tmp_path):
+    from tbank.market_data import load_instrument, store_instruments
+
+    conn = connect(tmp_path / "t.sqlite")
+    store_instruments(conn, {"SBER": {"ticker": "SBER", "figi": "F1", "uid": "U1", "name": "Сбербанк", "lot": 10, "class_code": "TQBR"}})
+    inst = load_instrument(conn, "SBER")
+    assert inst["lot"] == 10 and inst["uid"] == "U1" and inst["figi"] == "F1"
+    assert load_instrument(conn, "NOPE") is None
+
+    # обновление лота перезаписывает кэш
+    store_instruments(conn, {"SBER": {"ticker": "SBER", "figi": "F1", "uid": "U1", "lot": 100}})
+    assert load_instrument(conn, "SBER")["lot"] == 100
+    conn.close()
+
+
+def test_sentiment_cache_roundtrip(tmp_path):
+    from tbank.market_data import load_sentiments, store_sentiments
+
+    conn = connect(tmp_path / "t.sqlite")
+    store_sentiments(conn, "lexicon", {"n1": 0.5, "n2": -0.25})
+    assert load_sentiments(conn, "lexicon") == {"n1": 0.5, "n2": -0.25}
+    # скоры разных моделей не смешиваются
+    assert load_sentiments(conn, "transformers:X") == {}
+    conn.close()

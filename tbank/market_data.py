@@ -66,6 +66,29 @@ def connect(db_path) -> sqlite3.Connection:
             )
             """
         )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS instruments (
+            ticker TEXT PRIMARY KEY,
+            figi TEXT NOT NULL,
+            uid TEXT,
+            name TEXT,
+            lot INTEGER DEFAULT 1,
+            class_code TEXT,
+            updated_at TEXT
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS news_sentiment (
+            news_id TEXT NOT NULL,
+            model TEXT NOT NULL,
+            score REAL NOT NULL,
+            PRIMARY KEY (news_id, model)
+        )
+        """
+    )
     return conn
 
 
@@ -188,3 +211,63 @@ def load_news(
         if since is not None:
             df = df[df["pub_dt"] >= since]
     return df
+
+
+# ---------- Кэш инструментов ----------
+
+def store_instruments(conn: sqlite3.Connection, instruments: dict[str, dict]) -> int:
+    """Актуализирует кэш инструментов (лот/uid нужны офлайн-командам, например backtest)."""
+    now = dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
+    payload = [
+        (
+            ticker,
+            inst.get("figi", ""),
+            inst.get("uid", ""),
+            inst.get("name", ""),
+            int(inst.get("lot", 1) or 1),
+            inst.get("class_code", ""),
+            now,
+        )
+        for ticker, inst in instruments.items()
+    ]
+    conn.executemany(
+        "INSERT OR REPLACE INTO instruments (ticker, figi, uid, name, lot, class_code, updated_at)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?)",
+        payload,
+    )
+    conn.commit()
+    return len(payload)
+
+
+def load_instrument(conn: sqlite3.Connection, ticker: str) -> dict | None:
+    """Инструмент из кэша или None, если тикер не выгружался."""
+    row = conn.execute(
+        "SELECT ticker, figi, uid, name, lot, class_code FROM instruments WHERE ticker = ?",
+        (ticker,),
+    ).fetchone()
+    if row is None:
+        return None
+    return {
+        "ticker": row[0], "figi": row[1], "uid": row[2],
+        "name": row[3], "lot": int(row[4] or 1), "class_code": row[5],
+    }
+
+
+# ---------- Скоры тональности ----------
+
+def store_sentiments(conn: sqlite3.Connection, model: str, scores: dict[str, float]) -> int:
+    """Кэширует скоры тональности новостей: считаются один раз на новость."""
+    payload = [(news_id, model, float(score)) for news_id, score in scores.items()]
+    conn.executemany(
+        "INSERT OR REPLACE INTO news_sentiment (news_id, model, score) VALUES (?, ?, ?)",
+        payload,
+    )
+    conn.commit()
+    return len(payload)
+
+
+def load_sentiments(conn: sqlite3.Connection, model: str) -> dict[str, float]:
+    rows = conn.execute(
+        "SELECT news_id, score FROM news_sentiment WHERE model = ?", (model,)
+    ).fetchall()
+    return {news_id: float(score) for news_id, score in rows}
