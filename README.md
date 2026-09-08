@@ -62,6 +62,10 @@ TLS_INSECURE=1
 
 Типовой сценарий: `smoke` → `download --days 720` → `news` → `train` → `backtest` → `run`.
 
+> Команды ниже приведены для Windows (`.venv\Scripts\python`). На Linux-сервере путь к
+> интерпретатору другой — `.venv/bin/python`, например:
+> `cd /root/tbank-trading-bot && .venv/bin/python cli.py report` (подробнее — [DEPLOY.md](DEPLOY.md)).
+
 > Запуск на удалённом сервере 24/7 (Linux VPS, systemd, cron-переобучение, мониторинг) —
 > пошаговая инструкция в [DEPLOY.md](DEPLOY.md).
 

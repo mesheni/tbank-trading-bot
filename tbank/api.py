@@ -118,7 +118,7 @@ class TBankAPI:
     # ---------- Инструменты ----------
 
     def resolve_instruments(self, tickers: list[str]) -> dict[str, dict]:
-        """Тикер -> {figi, uid, name, lot, class_code}. Берём акции базового списка."""
+        """Тикер -> {ticker, figi, uid, name, lot, class_code}. Берём акции базового списка."""
         data = self.client.post(
             f"{self.INSTRUMENTS}/Shares",
             {"instrumentStatus": "INSTRUMENT_STATUS_BASE"},
@@ -131,6 +131,7 @@ class TBankAPI:
                 if share.get("apiTradeAvailableFlag") is False and share.get("buyAvailableFlag") is False:
                     continue
                 found[ticker] = {
+                    "ticker": ticker,
                     "figi": share.get("figi", ""),
                     "uid": share.get("uid", ""),
                     "name": share.get("name", ""),

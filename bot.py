@@ -308,7 +308,7 @@ class TradingBot:
         positions = {}
         for figi, pos in raw["positions"].items():
             instrument = next((i for i in self.instruments.values() if i["figi"] == figi), None)
-            ticker = instrument["ticker"] if instrument else figi
+            ticker = (instrument.get("ticker") or figi) if instrument else figi
             if pos["quantity"] > 0:
                 positions[figi] = Position(
                     figi, ticker, int(pos["quantity"]), int(instrument.get("lot", 1)) if instrument else 1,
