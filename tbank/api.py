@@ -115,6 +115,13 @@ class TBankAPI:
         }
         self.client.post(f"{self.SANDBOX}/SandboxPayIn", payload)
 
+    def pay_out(self, account_id: str, amount_rub: float) -> None:
+        payload = {
+            "accountId": account_id,
+            "amount": float_to_quotation_rub(amount_rub),
+        }
+        self.client.post(f"{self.SANDBOX}/SandboxPayOut", payload)
+
     # ---------- Инструменты ----------
 
     def resolve_instruments(self, tickers: list[str]) -> dict[str, dict]:

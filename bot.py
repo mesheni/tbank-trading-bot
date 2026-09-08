@@ -281,6 +281,9 @@ class TradingBot:
     def run_forever(self, max_iterations: int | None = None) -> None:
         self._running = True
         iteration = 0
+        # бюджет вносится один раз на старте и только на пустой счёт:
+        # в цикле никаких пополнений — бот торгует строго данным бюджетом
+        self.trader.initialize_balance(self.config.sandbox_initial_rub)
         log.info(
             "Бот запущен: mode=%s tickers=%s interval=%s horizon=%d",
             self.config.mode, ",".join(self.instruments), self.config.candle_interval, self.config.forecast_horizon,
@@ -294,7 +297,6 @@ class TradingBot:
                     continue
 
                 try:
-                    self.trader.ensure_balance(50_000.0, self.config.sandbox_initial_rub)
                     self.update_news()
                     portfolio = self._load_portfolio()
                     for ticker, instrument in self.instruments.items():

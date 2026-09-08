@@ -1,4 +1,4 @@
-"""CLI торгового бота: download / news / train / backtest / run / report / smoke.
+"""CLI торгового бота: download / news / train / backtest / run / report / normalize / smoke.
 
 Примеры:
     python cli.py smoke                 # проверка токена, счёта и API
@@ -8,6 +8,7 @@
     python cli.py backtest              # бэктест стратегии с лучшей моделью
     python cli.py run                   # торговый цикл в sandbox
     python cli.py report                # состояние счёта и журнал сделок
+    python cli.py normalize             # вывести излишек sandbox-счёта сверх бюджета
 """
 from __future__ import annotations
 
@@ -409,12 +410,49 @@ def cmd_report(config: Config) -> int:
     return 0
 
 
+def cmd_normalize(config: Config) -> int:
+    """Приводит sandbox-счёт к бюджету: выводит излишек сверх SANDBOX_INITIAL_RUB.
+
+    Нужна после ошибочных пополнений (раньше бот доливал кэш в цикле) или ручных
+    экспериментов. Дефицит (просадку ниже бюджета) сознательно не восполняет.
+    """
+    if config.mode != "sandbox":
+        print("[!!] Команда normalize доступна только в режиме sandbox", file=sys.stderr)
+        return 2
+    api = make_api(config)
+    accounts = api.get_accounts()
+    if not accounts:
+        print("[!!] Sandbox-счёт не найден — нечего нормализовать")
+        return 2
+    from tbank.trader import Trader
+
+    trader = Trader(api, Path(config.reports_dir) / "journal.csv")
+    portfolio = trader.portfolio()
+    total = portfolio["total_amount_rub"]
+    excess = total - config.sandbox_initial_rub
+    print(
+        f"  Счёт {trader.account_id}: {ui.fmt_money(total)} руб "
+        f"(кэш {ui.fmt_money(portfolio['cash_rub'])}, бюджет {ui.fmt_money(config.sandbox_initial_rub)})"
+    )
+    if excess > 1.0:
+        api.pay_out(trader.account_id, excess)
+        print(f"  Выведено {ui.fmt_money(excess)} руб — на счёте снова бюджет")
+    elif excess < -1.0:
+        print("  На счёте ниже бюджета (просадка) — дефицит сознательно не восполняем")
+    else:
+        print("  Счёт в пределах бюджета ±1 руб — ничего не делаем")
+    return 0
+
+
 OFFLINE_COMMANDS = {"train", "backtest"}
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Торговый бот T-Invest API (sandbox) с ML-прогнозом и новостным анализом")
-    parser.add_argument("command", choices=["smoke", "download", "news", "train", "backtest", "run", "report"])
+    parser.add_argument(
+        "command",
+        choices=["smoke", "download", "news", "train", "backtest", "run", "report", "normalize"],
+    )
     parser.add_argument("--days", type=int, default=None, help="глубина истории в днях (download)")
     parser.add_argument("--iterations", type=int, default=None, help="число итераций цикла (run)")
     args = parser.parse_args()
@@ -444,6 +482,8 @@ def main() -> int:
         return cmd_run(config, args.iterations)
     if args.command == "report":
         return cmd_report(config)
+    if args.command == "normalize":
+        return cmd_normalize(config)
     return 1
 
 

@@ -15,7 +15,7 @@ SELL = "ORDER_DIRECTION_SELL"
 
 
 class Trader:
-    """Работа со счётом sandbox: гарантированный аккаунт, балансовый минимум, сделки, журнал."""
+    """Работа со счётом sandbox: гарантированный аккаунт, разовый стартовый бюджет, сделки, журнал."""
 
     def __init__(self, api: TBankAPI, journal_path: Path):
         self.api = api
@@ -29,16 +29,23 @@ class Trader:
         log.info("Sandbox-счёт не найден, открываем новый")
         return self.api.open_sandbox_account()
 
-    def ensure_balance(self, min_rub: float, top_up_to: float) -> float:
+    def initialize_balance(self, initial_rub: float) -> float:
+        """Разовое наполнение счёта бюджетом: только если счёт полностью пуст.
+
+        Живой счёт (есть деньги или позиции) никогда не трогаем — бот торгует
+        строго данным бюджетом, убыток и прибыль остаются внутри него.
+        """
         portfolio = self.portfolio()
-        cash = portfolio["cash_rub"]
-        if cash < min_rub:
-            add = top_up_to - cash
-            if add > 0:
-                log.info("Баланс %.0f руб < минимум %.0f: пополняем на %.0f", cash, min_rub, add)
-                self.api.pay_in(self.account_id, add)
-                cash += add
-        return cash
+        total = portfolio["total_amount_rub"]
+        if total >= 1.0:
+            log.info(
+                "Счёт не пуст: %.0f руб (кэш %.0f, позиций %d) — бюджет не пополняем",
+                total, portfolio["cash_rub"], len(portfolio["positions"]),
+            )
+            return total
+        log.info("Счёт пуст: вносим стартовый бюджет %.0f руб", initial_rub)
+        self.api.pay_in(self.account_id, initial_rub)
+        return initial_rub
 
     def portfolio(self) -> dict:
         return self.api.get_portfolio(self.account_id)
