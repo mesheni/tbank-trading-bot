@@ -135,6 +135,8 @@ class TBankAPI:
         # автоперевод лимитной заявки в рыночную при отказе брокера (400);
         # для real-режима рекомендуется отключить (ORDER_FALLBACK_TO_MARKET=0)
         self.order_market_fallback = order_market_fallback
+        # опциональный колбэк уведомлений: вызывается с текстом при fallback
+        self.on_market_fallback = None
 
     # ---------- Счета ----------
 
@@ -199,8 +201,12 @@ class TBankAPI:
             log.warning("Инструменты не найдены в базовом списке акций: %s", ", ".join(sorted(missing)))
         return found
 
-    def trading_schedules(self, figi: str, days: int = 7) -> list[tuple[dt.datetime, dt.datetime]]:
-        """Интервалы [начало, конец] торгов по инструменту на ближайшие дни (MSK)."""
+    def trading_schedules(self, figi: str = "", days: int = 7) -> list[tuple[dt.datetime, dt.datetime]]:
+        """Интервалы [начало, конец] торгов на ближайшие дни (MSK).
+
+        figi не влияет на запрос (расписание приходит по биржам), параметр оставлен
+        для совместимости подписи с proto-контрактом.
+        """
         now = dt.datetime.now(dt.timezone.utc)
         data = self.client.post(
             f"{self.INSTRUMENTS}/TradingSchedules",
@@ -357,6 +363,14 @@ class TBankAPI:
                 payload["orderType"] = "ORDER_TYPE_MARKET"
                 payload.pop("price", None)
                 data = self.client.post(f"{self.ORDERS}/PostOrder", payload)
+                if self.on_market_fallback is not None:
+                    try:
+                        self.on_market_fallback(
+                            f"{instrument_id}: лимитная заявка отклонена ({exc.details[:200]}), "
+                            f"исполнена рыночная на {quantity_lots} лот(ов)"
+                        )
+                    except Exception:
+                        pass
             else:
                 raise
         return parse_order_state(data, fallback_price=price)

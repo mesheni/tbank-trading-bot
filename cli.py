@@ -8,12 +8,15 @@
     python cli.py backtest              # бэктест стратегии с лучшей моделью
     python cli.py run                   # торговый цикл в sandbox
     python cli.py report                # состояние счёта и журнал сделок
+    python cli.py watchdog --restart    # проверка живости бота (для cron)
+    python cli.py digest                # письмо-дайджест состояния (для cron)
     python cli.py normalize             # проверить счёт на соответствие бюджету
     python cli.py reset-sandbox         # пересоздать sandbox-счёт с бюджетом
 """
 from __future__ import annotations
 
 import argparse
+import csv
 import datetime as dt
 import json
 import logging
@@ -481,10 +484,8 @@ def cmd_report(config: Config) -> int:
     print(ui.header("СДЕЛКИ"))
     journal = config.reports_dir / "journal.csv"
     if journal.exists():
-        import csv as _csv
-
         with open(journal, encoding="utf-8") as f:
-            rows = list(_csv.DictReader(f))
+            rows = list(csv.DictReader(f))
         buys = sum(1 for r in rows if r["action"] == "BUY")
         sells = len(rows) - buys
 
@@ -525,6 +526,176 @@ def cmd_report(config: Config) -> int:
     else:
         print("  Пока нет данных — появится после запуска бота (reports/equity_live.csv).")
     return 0
+
+
+def _last_activity(reports_dir: Path) -> tuple[dt.datetime | None, str]:
+    """Самая свежая отметка живости: heartbeat или последняя точка equity_live.csv."""
+    stamps: list[tuple[dt.datetime, str]] = []
+    heartbeat = Path(reports_dir) / "heartbeat"
+    if heartbeat.exists():
+        try:
+            stamps.append(
+                (dt.datetime.fromisoformat(heartbeat.read_text(encoding="utf-8").strip()), "heartbeat")
+            )
+        except ValueError:
+            pass
+    equity = Path(reports_dir) / "equity_live.csv"
+    if equity.exists():
+        try:
+            with open(equity, encoding="utf-8") as f:
+                rows = list(csv.reader(f))
+            for row in reversed(rows[1:]):  # последняя строка с данными
+                if row and row[0]:
+                    stamps.append(
+                        (pd.to_datetime(row[0], utc=True).to_pydatetime(), "equity_live.csv")
+                    )
+                    break
+        except (ValueError, OSError):
+            pass
+    if not stamps:
+        return None, ""
+    return max(stamps, key=lambda item: item[0])
+
+
+def cmd_watchdog(config: Config, max_stale_min: int, restart: bool) -> int:
+    """Живость бота: в открытую сессию heartbeat/equity должны обновляться каждый цикл.
+
+    Регрессия 07.09: ошибка внутри итерации не убивала процесс — бот «тихо умирал»,
+    equity замолкал, systemd ничего не перезапускал. Watchdog запускается cron'ом:
+    при устаревших отметках шлёт письмо (не чаще раза в час) и по --restart
+    перезапускает юнит tbank-bot.
+    """
+    from bot import SessionCalendar
+    from notify import Notifier
+
+    reports = Path(config.reports_dir)
+    in_session = SessionCalendar(make_api(config)).active()
+    if not in_session:
+        print("Вне торговой сессии MOEX — живость не проверяется (и это нормально)")
+        return 0
+
+    now = dt.datetime.now(dt.timezone.utc)
+    last, source = _last_activity(reports)
+    if last is not None:
+        stale_min = (now - last).total_seconds() / 60
+    else:
+        stale_min = float("inf")
+
+    if stale_min <= max_stale_min:
+        print(f"OK: {source} обновлён {stale_min:.1f} мин назад (порог {max_stale_min} мин)")
+        return 0
+
+    note = (
+        f"нет ни heartbeat, ни equity_live.csv в {reports}"
+        if last is None
+        else f"{source} молчит {stale_min:.0f} мин (порог {max_stale_min})"
+    )
+    body = (
+        f"Бот не подаёт признаков жизни во время открытой сессии MOEX.\n{note}.\n"
+        f"Время проверки: {now.isoformat(timespec='seconds')}.\n"
+    )
+    if restart:
+        import subprocess
+
+        proc = subprocess.run(["systemctl", "restart", "tbank-bot"], capture_output=True, text=True)
+        outcome = "ок" if proc.returncode == 0 else f"ошибка: {(proc.stderr or '').strip()[:200]}"
+        body += f"systemctl restart tbank-bot: {outcome}\n"
+        print(f"Перезапуск tbank-bot: {outcome}")
+
+    notifier = Notifier.from_config(config)
+    marker = reports / "watchdog_last_alert"
+    alerted_recently = False
+    if marker.exists():
+        try:
+            alerted_recently = dt.datetime.fromisoformat(
+                marker.read_text(encoding="utf-8").strip()
+            ) > now - dt.timedelta(hours=1)
+        except ValueError:
+            alerted_recently = False
+    if not alerted_recently and notifier.send("бот завис (watchdog)", body):
+        marker.write_text(now.isoformat(timespec="seconds"), encoding="utf-8")
+    warn(f"живость: {note}")
+    return 1
+
+
+def compose_digest(config: Config) -> str:
+    """Текст письма-дайджеста: капитал, P&L по периодам, позиции, последние сделки."""
+    api = make_api(config)
+    accounts = api.get_accounts()
+    if not accounts:
+        return "Счетов нет (в sandbox выполните: python cli.py smoke)"
+    account_id = accounts[0]["id"]
+    portfolio = api.get_portfolio(account_id)
+    total = portfolio["total_amount_rub"]
+    flows = _load_flows(config.reports_dir)
+    invested = _net_invested(config.sandbox_initial_rub, flows)
+    pnl = total - invested
+    pnl_pct = pnl / invested if invested > 1.0 else 0.0
+    lines = [
+        f"Счёт {account_id} · режим {config.mode}",
+        f"Капитал: {total:,.0f} руб · свободно: {portfolio['cash_rub']:,.0f} руб",
+        f"Вложено: {invested:,.0f} руб · P&L: {pnl:+,.0f} руб ({pnl_pct:+.1%})",
+    ]
+
+    equity_file = Path(config.reports_dir) / "equity_live.csv"
+    if equity_file.exists():
+        equity = pd.read_csv(equity_file)
+        equity["time"] = pd.to_datetime(equity["time"], utc=True)
+        now = equity["time"].iloc[-1]
+        for label, days in (("день", 1), ("неделя", 7)):
+            res = _period_pnl(equity, flows, now - pd.Timedelta(days=days))
+            if res is None:
+                continue
+            pnl_p, base, moved, coverage = res
+            lines.append(f"P&L {label}: {pnl_p:+,.0f} руб от базы {base:,.0f}")
+
+    if portfolio["positions"]:
+        figi_ticker = {}
+        try:
+            figi_ticker = {
+                inst["figi"]: t for t, inst in api.resolve_instruments(config.tickers).items()
+            }
+        except Exception:
+            pass
+        lines.append("")
+        lines.append("Позиции:")
+        for figi, pos in portfolio["positions"].items():
+            avg, cur = pos["average_position_price"], pos["current_price"]
+            pnl_pos = (cur / avg - 1) if avg > 0 and cur > 0 else 0.0
+            lines.append(
+                f"  {figi_ticker.get(figi, figi)}: {pos['quantity']:.0f} шт × {avg:.2f} → {cur:.2f} ({pnl_pos:+.1%})"
+            )
+    else:
+        lines.append("Открытых позиций нет")
+
+    journal = Path(config.reports_dir) / "journal.csv"
+    if journal.exists():
+        with open(journal, encoding="utf-8") as f:
+            rows = list(csv.DictReader(f))
+        lines.append("")
+        lines.append(f"Последние сделки (всего {len(rows)}):")
+        for row in rows[-5:]:
+            lines.append(
+                f"  {row['time']} {row['action']} {row['ticker']} {row['lots']} лот. × {row['price']} — {row['reason']}"
+            )
+    return "\n".join(lines)
+
+
+def cmd_digest(config: Config) -> int:
+    """Письмо-дайджест состояния счёта (для cron после закрытия сессии)."""
+    from notify import Notifier
+
+    body = compose_digest(config)
+    notifier = Notifier.from_config(config)
+    if not notifier.enabled:
+        print(body)
+        warn("SMTP не настроен (NOTIFY_EMAIL_TO, SMTP_HOST/USER/PASSWORD) — письмо не отправлено, текст выше")
+        return 1
+    if notifier.send("дайджест дня", body):
+        ok("Дайджест отправлен")
+        return 0
+    warn("Не удалось отправить дайджест")
+    return 1
 
 
 def cmd_normalize(config: Config) -> int:
@@ -635,11 +806,22 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Торговый бот T-Invest API (sandbox) с ML-прогнозом и новостным анализом")
     parser.add_argument(
         "command",
-        choices=["smoke", "download", "news", "train", "backtest", "run", "report", "normalize", "reset-sandbox"],
+        choices=[
+            "smoke", "download", "news", "train", "backtest", "run",
+            "report", "watchdog", "digest", "normalize", "reset-sandbox",
+        ],
     )
     parser.add_argument("--days", type=int, default=None, help="глубина истории в днях (download)")
     parser.add_argument("--iterations", type=int, default=None, help="число итераций цикла (run)")
     parser.add_argument("--yes", action="store_true", help="не спрашивать подтверждение (reset-sandbox)")
+    parser.add_argument(
+        "--max-stale-min", type=int, default=20,
+        help="порог устаревания отметок живости, минут (watchdog)",
+    )
+    parser.add_argument(
+        "--restart", action="store_true",
+        help="перезапустить systemd-юнит tbank-bot при зависании (watchdog)",
+    )
     args = parser.parse_args()
 
     config = Config()
@@ -667,6 +849,10 @@ def main() -> int:
         return cmd_run(config, args.iterations)
     if args.command == "report":
         return cmd_report(config)
+    if args.command == "watchdog":
+        return cmd_watchdog(config, args.max_stale_min, args.restart)
+    if args.command == "digest":
+        return cmd_digest(config)
     if args.command == "normalize":
         return cmd_normalize(config)
     if args.command == "reset-sandbox":

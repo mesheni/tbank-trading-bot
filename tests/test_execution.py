@@ -152,9 +152,12 @@ def filled_state(lots: int, price: float, order_id: str = "ord-1") -> dict:
 
 
 def make_step_bot(trader: FakeTrader) -> TradingBot:
+    from notify import Notifier, SmtpConfig
+
     bot = TradingBot.__new__(TradingBot)
     bot.config = SimpleNamespace(min_model_dir_acc=0.5)
     bot.risk = RiskConfig()
+    bot.notifier = Notifier(SmtpConfig())  # уведомления выключены
     bot.instruments = {"AAA": {"ticker": "AAA", "figi": "F1", "lot": 10}}
     bot.artifacts = {"AAA": ModelArtifact(kind="naive_zero", horizon=1, metrics={"directional_acc": 0.9})}
     candles = pd.DataFrame(

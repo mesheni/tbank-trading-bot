@@ -25,6 +25,7 @@ from models.registry import ModelArtifact, load_artifact, model_factories
 from nlp.agenda import AgendaScore, batch_score_news, score_agenda
 from nlp.embedder import NewsEmbedder
 from nlp.sentiment import make_sentiment
+from notify import Notifier
 from strategy import Decision, PortfolioState, Position, RiskConfig, decide
 import ui
 from tbank.api import TBankAPI
@@ -36,6 +37,40 @@ log = logging.getLogger(__name__)
 
 # Расписание MOEX по умолчанию (если TradingSchedules недоступен): основная сессия
 DEFAULT_SESSION = (dt.time(9, 50), dt.time(18, 50))
+
+
+class SessionCalendar:
+    """Торговый календарь MOEX: интервалы из TradingSchedules + фиксированный фолбэк.
+
+    Используется и живым циклом, и watchdog-командой; расписание обновляется
+    раз в 6 часов, при недоступности API действует сессия пн-пт 09:50-18:50 МСК.
+    """
+
+    REFRESH_HOURS = 6
+
+    def __init__(self, api: TBankAPI | None = None):
+        self.api = api
+        self._intervals: list[tuple[dt.datetime, dt.datetime]] = []
+        self._checked_at: dt.datetime | None = None
+
+    def active(self, now: dt.datetime | None = None) -> bool:
+        now = now or dt.datetime.now(MSK)
+        if (
+            self.api is not None
+            and (self._checked_at is None or now - self._checked_at > dt.timedelta(hours=self.REFRESH_HOURS))
+        ):
+            try:
+                self._intervals = self.api.trading_schedules()
+            except Exception as exc:
+                log.warning("Расписание торгов недоступно (%s), используется фиксированное", exc)
+                self._intervals = []
+            self._checked_at = now
+
+        if not self._intervals:
+            start = dt.datetime.combine(now.date(), DEFAULT_SESSION[0], tzinfo=MSK)
+            end = dt.datetime.combine(now.date(), DEFAULT_SESSION[1], tzinfo=MSK)
+            return start <= now <= end and now.weekday() < 5
+        return any(start <= now <= end for start, end in self._intervals)
 
 
 def log_equity(path: Path, total: float, cash: float, positions_value: float) -> None:
@@ -56,6 +91,12 @@ def log_equity(path: Path, total: float, cash: float, positions_value: float) ->
         )
 
 
+def write_heartbeat(path: Path) -> None:
+    """Отметка «живой итерации» — её свежесть проверяет cli.py watchdog."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"), encoding="utf-8")
+
+
 class TradingBot:
     def __init__(self, config: Config, risk: RiskConfig | None = None):
         config.validate()
@@ -73,6 +114,12 @@ class TradingBot:
         self.api = TBankAPI(self.client, order_market_fallback=config.order_fallback_to_market)
         self.trader = Trader(self.api, Path(config.reports_dir) / "journal.csv")
         self.conn = connect(config.db_path)
+        self.calendar = SessionCalendar(self.api)
+        self.notifier = Notifier.from_config(config)
+        # алерт при автопереводе лимитной заявки в рыночную (см. api.post_order)
+        self.api.on_market_fallback = lambda note: self.notifier.send_throttled(
+            "market-fallback", "лимитная заявка ушла рыночной", note
+        )
 
         self.instruments = self.api.resolve_instruments(config.tickers)
         if not self.instruments:
@@ -83,29 +130,13 @@ class TradingBot:
 
         self.artifacts: dict[str, ModelArtifact] = {}
         self.news_sentiments: dict[str, dict[str, float]] = {}
-        self._session_intervals: list[tuple[dt.datetime, dt.datetime]] = []
-        self._session_checked_at: dt.datetime | None = None
         self._news_updated_at: dt.datetime | None = None
         self._running = False
 
     # ---------- Сессия ----------
 
     def in_trading_session(self, now: dt.datetime | None = None) -> bool:
-        now = now or dt.datetime.now(MSK)
-        if self._session_checked_at is None or now - self._session_checked_at > dt.timedelta(hours=6):
-            figi = next(iter(self.instruments.values()))["figi"]
-            try:
-                self._session_intervals = self.api.trading_schedules(figi)
-            except Exception as exc:
-                log.warning("Расписание торгов недоступно (%s), используется фиксированное", exc)
-                self._session_intervals = []
-            self._session_checked_at = now
-
-        if not self._session_intervals:
-            start = dt.datetime.combine(now.date(), DEFAULT_SESSION[0], tzinfo=MSK)
-            end = dt.datetime.combine(now.date(), DEFAULT_SESSION[1], tzinfo=MSK)
-            return start <= now <= end and now.weekday() < 5
-        return any(start <= now <= end for start, end in self._session_intervals)
+        return self.calendar.active(now)
 
     # ---------- Данные и сигналы ----------
 
@@ -258,12 +289,27 @@ class TradingBot:
                     "%s: заявка не исполнена (статус %s) — позиция не открывается",
                     ticker, state.get("status") or "неизвестен",
                 )
+                self.notifier.send_throttled(
+                    f"order-not-filled:{ticker}", f"заявка BUY {ticker} не исполнена",
+                    f"Статус: {state.get('status') or 'неизвестен'}\n"
+                    f"Запрошено {decision.lots} лот(ов) по {price:.2f}\nПричина решения: {decision.reason}",
+                )
             else:
                 if executed < decision.lots:
                     log.warning("%s: частичное исполнение покупки: %d из %d лотов", ticker, executed, decision.lots)
+                    self.notifier.send_throttled(
+                        f"partial-fill:{ticker}", f"частичная покупка {ticker}",
+                        f"Исполнено {executed} из {decision.lots} лотов по {exec_price:.2f}\n"
+                        f"Причина решения: {decision.reason}",
+                    )
                 portfolio.positions[figi] = Position(figi, ticker, executed, lot, exec_price)
                 self.trader.log_trade(
                     make_journal_row(ticker, "BUY", executed, exec_price, decision.reason, str(state.get("order_id", "")))
+                )
+                self.notifier.send(
+                    f"BUY {ticker}: {executed} лот(ов) × {exec_price:.2f}",
+                    f"Прогноз: {r_hat:+.5f} · новости: {news_score:+.2f}\nПричина: {decision.reason}\n"
+                    f"Заявка: {state.get('order_id', '')} (статус {state.get('status')})",
                 )
         elif decision.action == "SELL" and figi in portfolio.positions:
             position = portfolio.positions[figi]
@@ -275,11 +321,21 @@ class TradingBot:
                     "%s: продажа не исполнена (статус %s) — позиция остаётся",
                     ticker, state.get("status") or "неизвестен",
                 )
+                self.notifier.send_throttled(
+                    f"order-not-filled:{ticker}", f"заявка SELL {ticker} не исполнена",
+                    f"Статус: {state.get('status') or 'неизвестен'}\n"
+                    f"Пробовали продать {position.lots} лот(ов) по {price:.2f}\nПричина решения: {decision.reason}",
+                )
             else:
                 if executed < position.lots:
                     log.warning(
                         "%s: частичная продажа: %d из %d лотов, остаток держим",
                         ticker, executed, position.lots,
+                    )
+                    self.notifier.send_throttled(
+                        f"partial-fill:{ticker}", f"частичная продажа {ticker}",
+                        f"Исполнено {executed} из {position.lots} лотов по {exec_price:.2f}\n"
+                        f"Причина решения: {decision.reason}",
                     )
                     portfolio.positions[figi] = Position(
                         figi, ticker, position.lots - executed, lot, position.avg_price
@@ -288,6 +344,11 @@ class TradingBot:
                     del portfolio.positions[figi]
                 self.trader.log_trade(
                     make_journal_row(ticker, "SELL", executed, exec_price, decision.reason, str(state.get("order_id", "")))
+                )
+                self.notifier.send(
+                    f"SELL {ticker}: {executed} лот(ов) × {exec_price:.2f}",
+                    f"Причина: {decision.reason}\nЗаявка: {state.get('order_id', '')} "
+                    f"(статус {state.get('status')})",
                 )
 
     def run_forever(self, max_iterations: int | None = None) -> None:
@@ -316,6 +377,10 @@ class TradingBot:
                             self.step_ticker(ticker, instrument, portfolio)
                         except Exception as exc:
                             log.exception("%s: шаг не выполнен: %s", ticker, exc)
+                            self.notifier.send_throttled(
+                                f"step-error:{ticker}", f"ошибка шага {ticker}",
+                                f"{type(exc).__name__}: {exc}\n(не чаще 1 письма в 30 минут)",
+                            )
 
                     snapshot = self.trader.portfolio()
                     positions_value = snapshot["total_amount_rub"] - snapshot["cash_rub"]
@@ -325,6 +390,7 @@ class TradingBot:
                         snapshot["cash_rub"],
                         positions_value,
                     )
+                    write_heartbeat(Path(self.config.reports_dir) / "heartbeat")
                     pnl_pct = snapshot["total_amount_rub"] / self.config.sandbox_initial_rub - 1.0
                     log.info(
                         "%s Итерация %d · капитал %s руб · P&L %s · позиций: %d",
@@ -336,6 +402,11 @@ class TradingBot:
                     )
                 except Exception as exc:
                     log.exception("Ошибка итерации: %s", exc)
+                    self.notifier.send_throttled(
+                        "iteration-error", "ошибка итерации бота",
+                        f"{type(exc).__name__}: {exc}\n(не чаще 1 письма в 30 минут; "
+                        "живость бота проверяет cli.py watchdog)",
+                    )
 
                 if max_iterations is None or iteration < max_iterations:
                     time.sleep(self.config.loop_interval_sec)

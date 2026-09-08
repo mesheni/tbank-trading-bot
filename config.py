@@ -74,6 +74,14 @@ class Config:
     # автоперевод отклонённой лимитной заявки в рыночную; для real рекомендовано 0
     order_fallback_to_market: bool = field(default_factory=lambda: _env_bool("ORDER_FALLBACK_TO_MARKET", True))
 
+    # --- Уведомления (email/SMTP, см. notify.py) ---
+    notify_email_to: str = field(default_factory=lambda: os.getenv("NOTIFY_EMAIL_TO", ""))
+    smtp_host: str = field(default_factory=lambda: os.getenv("SMTP_HOST", ""))
+    smtp_port: int = field(default_factory=lambda: _env_int("SMTP_PORT", 465))
+    smtp_user: str = field(default_factory=lambda: os.getenv("SMTP_USER", ""))
+    smtp_password: str = field(default_factory=lambda: os.getenv("SMTP_PASSWORD", ""))
+    smtp_from: str = field(default_factory=lambda: os.getenv("SMTP_FROM", ""))
+
     # --- Пути ---
     db_path: Path = field(default_factory=lambda: BASE_DIR / os.getenv("DB_PATH", "data/market.sqlite"))
     models_dir: Path = field(default_factory=lambda: BASE_DIR / os.getenv("MODELS_DIR", "models_artifacts"))
