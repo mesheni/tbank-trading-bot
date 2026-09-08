@@ -145,13 +145,19 @@ def _metrics(equity: pd.Series, trades: list[dict], initial_cash: float, candles
 
 
 def _bars_per_year(candles: pd.DataFrame) -> float:
+    """Баров в календарном году по фактическому среднему шагу индекса.
+
+    Шаг между крайними точками учитывает пропуски (ночи, выходные), поэтому
+    формула сама подстраивается под режим торгов: с вечерними и выходными
+    сессиями MOEX часовых баров ~7000/год, при классическом графике 247×8.5ч
+    получилось бы ~2100 — жёсткие предположения здесь занижали CAGR в ~4 раза.
+    """
     if len(candles) < 2:
-        return 252.0
+        return 2100.0
     seconds_per_bar = (candles.index[-1] - candles.index[0]).total_seconds() / (len(candles) - 1)
-    # торговый год MOEX ~ 247 сессий; дневной бар ~ 8.5ч торговли
-    if seconds_per_bar >= 20 * 3600:
-        return 247.0
-    return 247.0 * (8.5 * 3600) / max(seconds_per_bar, 1.0)
+    if seconds_per_bar <= 0:
+        return 2100.0
+    return 365.25 * 24 * 3600 / seconds_per_bar
 
 
 def save_report(result: BacktestResult, reports_dir: Path, name: str) -> Path:

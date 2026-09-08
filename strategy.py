@@ -32,6 +32,10 @@ class RiskConfig:
     min_abs_return: float = 0.004
     news_sentiment_gate: float = -0.35
     commission_pct: float = 0.0004
+    # выход «прогноз развернулся» — при пересечении порога, в reversal_exit_mult
+    # раз шире входного: симметричный порог заставлял закрываться на каждом
+    # слабом колебании прогноза и тут же перекупать (churn, издержки съедали доходность)
+    reversal_exit_mult: float = 2.0
 
 
 @dataclass
@@ -88,7 +92,7 @@ def decide(
         return Decision("SELL", position.lots, f"стоп-лосс {pnl_pct:+.2%}", price)
     if pnl_pct >= risk.take_profit_pct:
         return Decision("SELL", position.lots, f"тейк-профит {pnl_pct:+.2%}", price)
-    if predicted_return < -risk.min_abs_return:
+    if predicted_return < -risk.reversal_exit_mult * risk.min_abs_return:
         return Decision("SELL", position.lots, f"прогноз развернулся {predicted_return:+.4f}", price)
     if news_sentiment < risk.news_sentiment_gate * 1.5:
         return Decision("SELL", position.lots, f"новости резко негативны {news_sentiment:+.2f}", price)

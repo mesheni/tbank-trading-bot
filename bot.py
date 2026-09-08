@@ -67,6 +67,7 @@ class TradingBot:
             min_abs_return=config.min_abs_return,
             news_sentiment_gate=config.news_sentiment_gate,
             commission_pct=config.commission_pct,
+            reversal_exit_mult=config.reversal_exit_mult,
         )
         self.client = TBankRestClient(config.token, config.mode)
         self.api = TBankAPI(self.client)
@@ -163,14 +164,30 @@ class TradingBot:
             embedder=self.embedder if self.embedder.available else None,
         )
 
-    def predict(self, ticker: str, candles: pd.DataFrame, agenda: AgendaScore) -> tuple[float, float]:
-        """Возвращает (прогноз доходности на горизонт, новостной скор)."""
+    def _artifact(self, ticker: str) -> ModelArtifact:
         artifact = self.artifacts.get(ticker)
         if artifact is None:
             artifact = load_artifact(
                 self.config.models_dir, ticker, self.config.candle_interval, self.config.forecast_horizon
             )
             self.artifacts[ticker] = artifact
+        return artifact
+
+    def _model_allowed(self, ticker: str, artifact: ModelArtifact) -> bool:
+        """Гейт качества модели: без подтверждённого направления — новых входов нет.
+
+        Открытые позиции обслуживаются как обычно (стопы/тейки/выход по развороту);
+        гейт блокирует только открытие новых позиций. Модели без замеренной
+        directional_acc (NaN) тоже не допускаются: нет доказательств преимущества.
+        """
+        dir_acc = artifact.metrics.get("directional_acc")
+        if dir_acc is None or pd.isna(dir_acc):
+            return False
+        return float(dir_acc) >= self.config.min_model_dir_acc
+
+    def predict(self, ticker: str, candles: pd.DataFrame, agenda: AgendaScore) -> tuple[float, float]:
+        """Возвращает (прогноз доходности на горизонт, новостной скор)."""
+        artifact = self._artifact(ticker)
 
         features = ensure_news_columns(build_features(candles, self.config.forecast_horizon))
 
@@ -205,6 +222,17 @@ class TradingBot:
 
     def step_ticker(self, ticker: str, instrument: dict, portfolio: PortfolioState) -> None:
         figi = instrument["figi"]
+        artifact = self._artifact(ticker)
+        if figi not in portfolio.positions and not self._model_allowed(ticker, artifact):
+            dir_acc = artifact.metrics.get("directional_acc")
+            log.info(
+                "%-5s пропуск: модель %s, dir_acc=%s < %.2f (MIN_MODEL_DIR_ACC) — новых входов нет",
+                ticker,
+                artifact.kind,
+                "n/a" if dir_acc is None or pd.isna(dir_acc) else f"{dir_acc:.3f}",
+                self.config.min_model_dir_acc,
+            )
+            return
         lot = int(instrument.get("lot", 1))
         candles = self.refresh_candles(figi, ticker)
         agenda = self.ticker_agenda(instrument, ticker)
@@ -212,7 +240,6 @@ class TradingBot:
         price = float(candles["close"].iloc[-1])
 
         # порог входа: не ниже конфига и не ниже рекомендованного моделью (издержки/масштаб)
-        artifact = self.artifacts.get(ticker)
         risk = self.risk
         if artifact is not None and artifact.threshold > risk.min_abs_return:
             risk = replace(self.risk, min_abs_return=artifact.threshold)

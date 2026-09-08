@@ -259,6 +259,7 @@ def cmd_backtest(config: Config, days: int | None = None) -> int:
         take_profit_pct=config.take_profit_pct,
         min_abs_return=config.min_abs_return,
         commission_pct=config.commission_pct,
+        reversal_exit_mult=config.reversal_exit_mult,
     )
     for ticker in config.tickers:
         df = load_candles(conn, ticker, config.candle_interval)

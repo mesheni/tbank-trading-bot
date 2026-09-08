@@ -4,6 +4,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 from bot import TradingBot
+from models.registry import ModelArtifact
 from strategy import PortfolioState
 
 OZON_FIGI = "BBG00Y5RXXXX"
@@ -14,6 +15,32 @@ def make_bot(instruments: dict, raw_portfolio: dict) -> TradingBot:
     bot.instruments = instruments
     bot.trader = SimpleNamespace(portfolio=lambda: raw_portfolio)
     return bot
+
+
+def make_gate_bot(min_dir_acc: float = 0.5) -> TradingBot:
+    bot = TradingBot.__new__(TradingBot)
+    bot.config = SimpleNamespace(min_model_dir_acc=min_dir_acc)
+    return bot
+
+
+def test_model_gate_blocks_weak_directional_accuracy():
+    # регрессия первого live-прогона: OZON торговался моделью persistence с dir_acc 0.488
+    bot = make_gate_bot()
+    artifact = ModelArtifact(kind="persistence", horizon=1, metrics={"directional_acc": 0.488})
+    assert bot._model_allowed("OZON", artifact) is False
+
+
+def test_model_gate_blocks_missing_or_nan_metric():
+    bot = make_gate_bot()
+    assert bot._model_allowed("T", ModelArtifact(kind="arima", horizon=1, metrics={})) is False
+    nan = ModelArtifact(kind="ets", horizon=1, metrics={"directional_acc": float("nan")})
+    assert bot._model_allowed("T", nan) is False
+
+
+def test_model_gate_allows_confirmed_edge():
+    bot = make_gate_bot()
+    artifact = ModelArtifact(kind="lgbm", horizon=1, metrics={"directional_acc": 0.547})
+    assert bot._model_allowed("SBER", artifact) is True
 
 
 def raw_portfolio(positions: dict) -> dict:

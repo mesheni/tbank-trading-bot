@@ -52,6 +52,10 @@ class Config:
     take_profit_pct: float = field(default_factory=lambda: _env_float("TAKE_PROFIT_PCT", 0.05))
     min_abs_return: float = field(default_factory=lambda: _env_float("MIN_ABS_RETURN", 0.004))
     news_sentiment_gate: float = field(default_factory=lambda: _env_float("NEWS_SENTIMENT_GATE", -0.35))
+    # во сколько раз порог выхода «прогноз развернулся» шире входного (анти-churn)
+    reversal_exit_mult: float = field(default_factory=lambda: _env_float("REVERSAL_EXIT_MULT", 2.0))
+    # гейт качества модели для live: новые входы только при directional_acc >= порога
+    min_model_dir_acc: float = field(default_factory=lambda: _env_float("MIN_MODEL_DIR_ACC", 0.5))
 
     # --- Издержки (для бэктеста) ---
     commission_pct: float = field(default_factory=lambda: _env_float("COMMISSION_PCT", 0.0004))

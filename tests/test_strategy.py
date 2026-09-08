@@ -68,6 +68,14 @@ def test_model_reversal_exit(risk):
     assert "развернулся" in d.reason
 
 
+def test_mild_reversal_holds(risk):
+    # лёгкий разворот (в пределах анти-churn полосы −2×порога) не закрывает позицию
+    position = Position("FG", "SBER", lots=10, lot_size=10, avg_price=250.0)
+    portfolio = PortfolioState(cash=0, equity=1_000_000, positions={"FG": position})
+    d = decide("SBER", "FG", 250.5, -0.005, 0.0, portfolio, lot_size=10, risk=risk)
+    assert d.action == "HOLD"
+
+
 def test_hold_in_band(risk):
     position = Position("FG", "SBER", lots=10, lot_size=10, avg_price=250.0)
     portfolio = PortfolioState(cash=0, equity=1_000_000, positions={"FG": position})

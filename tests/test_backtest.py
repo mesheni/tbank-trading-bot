@@ -3,11 +3,17 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from backtest import run_backtest
+from backtest import _bars_per_year, run_backtest
 from features import build_features
 from models.baseline import MovingAverageReturn, NaiveZero
 from models.registry import walk_forward_baselines
 from strategy import RiskConfig
+
+
+def test_bars_per_year_follows_calendar_cadence(candles):
+    # непрерывные часовые бары -> ~8766/год; прежняя формула 247x8.5ч давала ~2100
+    # и занижала CAGR/Sharpe на данных с вечерними и выходными сессиями MOEX
+    assert _bars_per_year(candles) == pytest.approx(365.25 * 24, rel=0.01)
 
 
 @pytest.fixture

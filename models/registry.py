@@ -172,15 +172,17 @@ def evaluate_all(
 
 
 def _bars_per_year(candles: pd.DataFrame) -> float:
-    """Число баров в году по фактическому шагу индекса (для годового Sharpe)."""
+    """Число баров в календарном году по фактическому шагу индекса (для годового Sharpe).
+
+    Шаг измеряется по крайним точкам с учётом пропусков: при вечерних и
+    выходных сессиях MOEX часовых баров ~7000/год, а не ~2100 (247×8.5ч).
+    """
     if len(candles) < 2:
         return 2100.0
     seconds_per_bar = (candles.index[-1] - candles.index[0]).total_seconds() / (len(candles) - 1)
-    if seconds_per_bar >= 20 * 3600:
-        return 247.0
-    if seconds_per_bar >= 3600:
-        return 247.0 * 8.5
-    return 247.0 * 8.5 * 3600 / max(seconds_per_bar, 1.0)
+    if seconds_per_bar <= 0:
+        return 2100.0
+    return 365.25 * 24 * 3600 / seconds_per_bar
 
 
 @dataclass
