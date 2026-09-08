@@ -15,22 +15,24 @@ log = logging.getLogger(__name__)
 
 
 def quotation_to_float(quotation: dict | None) -> float:
-    """{\"units\": \"260\", \"nano\": 500000000} -> 260.5"""
+    """{\"units\": \"260\", \"nano\": 500000000} -> 260.5.
+
+    В proto-контракте Quotation знак несут оба поля (для -260.5 оба отрицательны),
+    поэтому value = units + nano/1e9 без отдельных веток по знаку.
+    """
     if not quotation:
         return 0.0
-    units = int(quotation.get("units", 0))
-    nano = int(quotation.get("nano", 0))
-    sign = -1.0 if units < 0 else 1.0
-    return units + sign * nano / 1e9
+    return int(quotation.get("units", 0)) + int(quotation.get("nano", 0)) / 1e9
 
 
 def float_to_quotation(value: float) -> dict:
-    units = int(value)
-    nano = int(round((value - units) * 1e9))
+    sign = -1 if value < 0 else 1
+    units = int(abs(value))
+    nano = int(round((abs(value) - units) * 1e9))
     if nano >= int(1e9):
         units += 1
         nano -= int(1e9)
-    return {"units": str(units), "nano": nano}
+    return {"units": str(sign * units), "nano": sign * nano}
 
 
 def float_to_quotation_rub(value: float) -> dict:

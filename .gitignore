@@ -12,3 +12,4 @@ reports/
 var/
 .pytest_cache/
 .vs/
+.zcode/

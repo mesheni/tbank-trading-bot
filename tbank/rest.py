@@ -191,13 +191,6 @@ class TBankRestClient:
                 time.sleep(wait)
             self._last_request_ts = time.monotonic()
 
-    def _throttle(self) -> None:
-        with self._lock:
-            wait = self._min_interval - (time.monotonic() - self._last_request_ts)
-            if wait > 0:
-                time.sleep(wait)
-            self._last_request_ts = time.monotonic()
-
     def post(self, service_method: str, payload: dict | None = None) -> dict:
         """POST /rest/<Service>/<Method>. Возвращает JSON-ответ или {}."""
         url = f"{self.host}/rest/{service_method}"

@@ -27,14 +27,16 @@ import ui
 from backtest import run_backtest, save_report
 from config import Config
 from features import build_features, ensure_news_columns
-from models.baseline import ARIMAReturn, ETSReturn, MovingAverageReturn, NaiveZero, PersistenceReturn
 from models.registry import (
+    artifact_path,
     evaluate_all,
     load_artifact,
+    model_factories,
     train_and_save,
     walk_forward_baselines,
     walk_forward_lgbm,
 )
+from stats_utils import n_test_points
 from strategy import RiskConfig
 from tbank.api import TBankAPI
 from tbank.market_data import connect, download_candles, load_candles, load_news, store_news
@@ -268,7 +270,12 @@ def cmd_backtest(config: Config, days: int | None = None) -> int:
         if df.empty:
             print(f"[!!] {ticker}: нет свечей в {config.db_path} — выполните `python cli.py download`")
             continue
-        artifact = load_artifact(config.models_dir, ticker, config.candle_interval, config.forecast_horizon)
+        artifact = None
+        try:
+            artifact = load_artifact(config.models_dir, ticker, config.candle_interval, config.forecast_horizon)
+        except FileNotFoundError as exc:
+            warn(f"{ticker}: {exc}")
+            continue
         features = ensure_news_columns(build_features(df, config.forecast_horizon))
 
         # порог входа как в боте: max(MIN_ABS_RETURN, рекомендация модели)
@@ -282,20 +289,13 @@ def cmd_backtest(config: Config, days: int | None = None) -> int:
 
         # walk-forward предсказания лучшей моделью: только на прошлом, без утечки
         # (артефактная модель обучена на всей истории — для оценки на ней непригодна)
-        test_points = features.index[int(len(features) * 0.75):]
+        test_points = features.index[-n_test_points(len(features)):]
         if artifact.kind == "lgbm":
             preds = walk_forward_lgbm(features, test_points, config.forecast_horizon)
         else:
-            factories = {
-                "naive_zero": NaiveZero,
-                "persistence": lambda: PersistenceReturn(config.forecast_horizon),
-                "ma5_ret": lambda: MovingAverageReturn(config.forecast_horizon, k=5),
-                "arima": lambda: ARIMAReturn(config.forecast_horizon),
-                "ets": lambda: ETSReturn(config.forecast_horizon),
-            }
             preds = walk_forward_baselines(
                 df["close"], features["target"], config.forecast_horizon,
-                factories[artifact.kind], test_points, refit_every=48,
+                model_factories(config.forecast_horizon)[artifact.kind], test_points, refit_every=48,
             )
         preds_test = preds
 
@@ -319,7 +319,19 @@ def cmd_backtest(config: Config, days: int | None = None) -> int:
 def cmd_run(config: Config, max_iterations: int | None) -> int:
     from bot import TradingBot
 
+    # артефакты обязательны: без модели бот не может прогнозировать
+    missing = [
+        t for t in config.tickers
+        if not artifact_path(config.models_dir, t, config.candle_interval, config.forecast_horizon).exists()
+    ]
+    if missing:
+        warn(f"Нет артефактов моделей для: {', '.join(missing)} — выполните `python cli.py train`")
     bot = TradingBot(config)
+    for ticker in missing:
+        bot.instruments.pop(ticker, None)
+    if not bot.instruments:
+        warn("Ни одного тикера с моделью — запуск невозможен. Сначала: python cli.py train")
+        return 2
     bot.run_forever(max_iterations=max_iterations)
     return 0
 

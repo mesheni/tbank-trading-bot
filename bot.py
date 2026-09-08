@@ -20,8 +20,8 @@ import pandas as pd
 
 from backtest import RiskConfig  # noqa: F401  (реэкспорт для удобства)
 from config import MSK, Config
-from features import TARGET, add_news_features, build_features, ensure_news_columns
-from models.registry import ModelArtifact, load_artifact
+from features import build_features, ensure_news_columns
+from models.registry import ModelArtifact, load_artifact, model_factories
 from nlp.agenda import AgendaScore, batch_score_news, score_agenda
 from nlp.embedder import NewsEmbedder
 from nlp.sentiment import make_sentiment
@@ -195,22 +195,7 @@ class TradingBot:
             last = features.iloc[-1]
             r_hat = artifact.model.predict_row(last)
         else:
-            from models.baseline import (
-                ARIMAReturn,
-                ETSReturn,
-                MovingAverageReturn,
-                NaiveZero,
-                PersistenceReturn,
-            )
-
-            factories = {
-                "naive_zero": NaiveZero,
-                "persistence": lambda: PersistenceReturn(self.config.forecast_horizon),
-                "ma5_ret": lambda: MovingAverageReturn(self.config.forecast_horizon, k=5),
-                "arima": lambda: ARIMAReturn(self.config.forecast_horizon),
-                "ets": lambda: ETSReturn(self.config.forecast_horizon),
-            }
-            factory = factories.get(artifact.kind)
+            factory = model_factories(self.config.forecast_horizon).get(artifact.kind)
             if factory is None:
                 raise ValueError(f"Неизвестный вид модели: {artifact.kind}")
             model = factory()

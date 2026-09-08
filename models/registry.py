@@ -24,6 +24,7 @@ from features import (
 )
 from .baseline import ARIMAReturn, ETSReturn, MovingAverageReturn, NaiveZero, PersistenceReturn
 from .boosting import LGBMReturnModel
+from stats_utils import bars_per_year, n_test_points
 
 log = logging.getLogger(__name__)
 
@@ -32,6 +33,18 @@ METRIC_KEYS = ("rmse", "mae", "directional_acc", "strategy_sharpe", "n_points")
 # Модель «предсказывать ноль» не может дать торговый сигнал — из выбора лучшей исключается,
 # но в таблице остаётся как эталон RMSE.
 NON_SELECTABLE = ("naive_zero",)
+
+
+def model_factories(horizon: int) -> dict:
+    """Имя бейзлайна -> фабрика модели. Единый источник для train/backtest/live:
+    имя из артефакта обязано резолвиться здесь, без дублирования словарей."""
+    return {
+        "naive_zero": NaiveZero,
+        "persistence": lambda: PersistenceReturn(horizon),
+        "ma5_ret": lambda: MovingAverageReturn(horizon, k=5),
+        "arima": lambda: ARIMAReturn(horizon),
+        "ets": lambda: ETSReturn(horizon),
+    }
 
 
 @dataclass
@@ -133,17 +146,17 @@ def evaluate_all(
     """Сравнивает все модели на одинаковых тестовых точках. Возвращает таблицу метрик."""
     features = ensure_news_columns(build_features(candles, horizon))
 
-    n_test = max(30, int(len(features) * test_frac))
+    n_test = n_test_points(len(features), test_frac)
     test_points = features.index[-n_test:]
     facts = features[TARGET].reindex(test_points)
     close = candles["close"]
 
     results: dict[str, WalkForwardResult] = {}
-    bars_per_year = _bars_per_year(candles)
+    bars_yr = bars_per_year(candles)
 
     def register(name: str, preds: pd.Series):
         results[name] = WalkForwardResult(
-            preds, facts, _metrics(preds.to_numpy(), facts.to_numpy(), bars_per_year)
+            preds, facts, _metrics(preds.to_numpy(), facts.to_numpy(), bars_yr)
         )
 
     register("naive_zero", walk_forward_baselines(close, facts, horizon, NaiveZero, test_points, 1))
@@ -169,20 +182,6 @@ def evaluate_all(
     metrics = pd.DataFrame({name: r.metrics for name, r in results.items()}).T
     metrics = metrics.sort_values("strategy_sharpe", ascending=False, na_position="last")
     return metrics, results
-
-
-def _bars_per_year(candles: pd.DataFrame) -> float:
-    """Число баров в календарном году по фактическому шагу индекса (для годового Sharpe).
-
-    Шаг измеряется по крайним точкам с учётом пропусков: при вечерних и
-    выходных сессиях MOEX часовых баров ~7000/год, а не ~2100 (247×8.5ч).
-    """
-    if len(candles) < 2:
-        return 2100.0
-    seconds_per_bar = (candles.index[-1] - candles.index[0]).total_seconds() / (len(candles) - 1)
-    if seconds_per_bar <= 0:
-        return 2100.0
-    return 365.25 * 24 * 3600 / seconds_per_bar
 
 
 @dataclass
@@ -289,8 +288,13 @@ def train_and_save(
     return artifact
 
 
+def artifact_path(artifacts_dir: Path, ticker: str, interval: str, horizon: int) -> Path:
+    """Путь к файлу артефакта модели (единый формат имени для train/live/CLI)."""
+    return Path(artifacts_dir) / f"model_{ticker}_{interval}_h{horizon}.joblib"
+
+
 def load_artifact(artifacts_dir: Path, ticker: str, interval: str, horizon: int) -> ModelArtifact:
-    path = artifacts_dir / f"model_{ticker}_{interval}_h{horizon}.joblib"
+    path = artifact_path(artifacts_dir, ticker, interval, horizon)
     if not path.exists():
         raise FileNotFoundError(
             f"Артефакт модели не найден: {path}. Сначала выполните команду train."

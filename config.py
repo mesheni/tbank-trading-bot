@@ -47,7 +47,7 @@ class Config:
     history_days: int = field(default_factory=lambda: _env_int("HISTORY_DAYS", 720))
 
     # --- Риск-менеджмент ---
-    max_position_pct: float = field(default_factory=lambda: _env_float("MAX_POSITION_PCT", 0.25))
+    max_position_pct: float = field(default_factory=lambda: _env_float("MAX_POSITION_PCT", 0.20))
     stop_loss_pct: float = field(default_factory=lambda: _env_float("STOP_LOSS_PCT", 0.03))
     take_profit_pct: float = field(default_factory=lambda: _env_float("TAKE_PROFIT_PCT", 0.05))
     min_abs_return: float = field(default_factory=lambda: _env_float("MIN_ABS_RETURN", 0.004))

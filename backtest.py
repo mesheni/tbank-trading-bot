@@ -13,6 +13,7 @@ import numpy as np
 import pandas as pd
 
 from strategy import PortfolioState, Position, RiskConfig, calc_cost, decide
+from stats_utils import bars_per_year
 
 
 @dataclass
@@ -113,11 +114,11 @@ def _metrics(equity: pd.Series, trades: list[dict], initial_cash: float, candles
         return {}
     total_return = float(equity.iloc[-1] / initial_cash - 1.0)
 
-    bars_per_year = _bars_per_year(candles)
+    bars = bars_per_year(candles)
     bar_returns = equity.pct_change().dropna()
     sharpe = 0.0
     if bar_returns.std() > 1e-12:
-        sharpe = float(bar_returns.mean() / bar_returns.std() * np.sqrt(bars_per_year))
+        sharpe = float(bar_returns.mean() / bar_returns.std() * np.sqrt(bars))
 
     running_max = equity.cummax()
     drawdown = equity / running_max - 1.0
@@ -131,7 +132,7 @@ def _metrics(equity: pd.Series, trades: list[dict], initial_cash: float, candles
             wins += 1
     win_rate = wins / len(sells) if sells else 0.0
 
-    years = max(1e-9, len(equity) / bars_per_year)
+    years = max(1e-9, len(equity) / bars)
     cagr = (1.0 + total_return) ** (1 / years) - 1.0 if total_return > -1 else -1.0
 
     return {
@@ -142,22 +143,6 @@ def _metrics(equity: pd.Series, trades: list[dict], initial_cash: float, candles
         "n_trades": len(trades),
         "win_rate": win_rate,
     }
-
-
-def _bars_per_year(candles: pd.DataFrame) -> float:
-    """Баров в календарном году по фактическому среднему шагу индекса.
-
-    Шаг между крайними точками учитывает пропуски (ночи, выходные), поэтому
-    формула сама подстраивается под режим торгов: с вечерними и выходными
-    сессиями MOEX часовых баров ~7000/год, при классическом графике 247×8.5ч
-    получилось бы ~2100 — жёсткие предположения здесь занижали CAGR в ~4 раза.
-    """
-    if len(candles) < 2:
-        return 2100.0
-    seconds_per_bar = (candles.index[-1] - candles.index[0]).total_seconds() / (len(candles) - 1)
-    if seconds_per_bar <= 0:
-        return 2100.0
-    return 365.25 * 24 * 3600 / seconds_per_bar
 
 
 def save_report(result: BacktestResult, reports_dir: Path, name: str) -> Path:

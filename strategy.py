@@ -26,7 +26,7 @@ class PortfolioState:
 
 @dataclass
 class RiskConfig:
-    max_position_pct: float = 0.25
+    max_position_pct: float = 0.20
     stop_loss_pct: float = 0.03
     take_profit_pct: float = 0.05
     min_abs_return: float = 0.004
