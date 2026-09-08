@@ -80,13 +80,14 @@ def test_walk_forward_lgbm_block_equals_pointwise(candles):
     blocked = walk_forward_lgbm(features, test_points, horizon=1, refit_every=3)
 
     # эталон: поточечно, refit на тех же границах блоков
+    # (срез обучения повторяет purging из walk_forward_lgbm: horizon+1 строк с хвоста)
     from models.boosting import LGBMReturnModel
 
     model = LGBMReturnModel(horizon=1)
     test_list = list(test_points)
     for start in range(0, len(test_list), 3):
         block = test_list[start : start + 3]
-        train = features.loc[: block[0]].iloc[:-1]
+        train = features.loc[: block[0]].iloc[: -(1 + 1)]
         if len(train) >= 200:
             model.fit(train)
         if model.model is not None:  # пока бустера нет — честный NaN, не 0.0

@@ -136,6 +136,7 @@ class TradingBot:
             commission_pct=config.commission_pct,
             slippage_pct=config.slippage_pct,
             reversal_exit_mult=config.reversal_exit_mult,
+            max_total_exposure_pct=config.max_total_exposure_pct,
         )
         self.client = TBankRestClient(config.token, config.mode)
         self.api = TBankAPI(self.client, order_market_fallback=config.order_fallback_to_market)
@@ -159,6 +160,8 @@ class TradingBot:
         self.artifacts: dict[str, ModelArtifact] = {}
         self._news_updated_at: dt.datetime | None = None
         self._running = False
+        # kill-switch по просадке: False = новых входов нет, выходы работают
+        self._entries_allowed = True
 
     # ---------- Сессия ----------
 
@@ -268,9 +271,16 @@ class TradingBot:
 
     # ---------- Исполнение ----------
 
-    def step_ticker(self, ticker: str, instrument: dict, portfolio: PortfolioState) -> None:
+    def step_ticker(
+        self, ticker: str, instrument: dict, portfolio: PortfolioState, entries_allowed: bool = True
+    ) -> None:
         figi = instrument["figi"]
         artifact = self._artifact(ticker)
+        if not entries_allowed and figi not in portfolio.positions:
+            # kill-switch: просадка глубже MAX_DRAWDOWN_PCT — капитал сохраняем,
+            # открытые позиции обслуживаются (стопы/тейки/разворот), новых входов нет
+            log.info("%-5s kill-switch: новых входов нет (просадка сверх порога)", ticker)
+            return
         if figi not in portfolio.positions and not self._model_allowed(ticker, artifact):
             dir_acc = artifact.metrics.get("directional_acc")
             log.info(
@@ -404,9 +414,10 @@ class TradingBot:
                 try:
                     self.update_news()
                     portfolio = self._load_portfolio()
+                    self._check_kill_switch(portfolio.equity)
                     for ticker, instrument in self.instruments.items():
                         try:
-                            self.step_ticker(ticker, instrument, portfolio)
+                            self.step_ticker(ticker, instrument, portfolio, self._entries_allowed)
                         except Exception as exc:
                             log.exception("%s: шаг не выполнен: %s", ticker, exc)
                             self.notifier.send_throttled(
@@ -446,6 +457,26 @@ class TradingBot:
             self._running = False
             self.conn.close()
             log.info("Бот остановлен")
+
+    def _check_kill_switch(self, equity: float) -> None:
+        """Просадка глубже MAX_DRAWDOWN_PCT — навсегда (до перезапуска) запретить входы."""
+        if self._entries_allowed and equity < self.config.sandbox_initial_rub * (
+            1.0 - self.config.max_drawdown_pct
+        ):
+            self._entries_allowed = False
+            dd = 1.0 - equity / self.config.sandbox_initial_rub
+            log.error(
+                "KILL-SWITCH: капитал %.0f руб — просадка %.1f%% превышает MAX_DRAWDOWN_PCT (%.0f%%). "
+                "Новые входы запрещены; стопы/тейки продолжают работать. Вернуть торговлю: "
+                "поднять порог в .env и перезапустить бота.",
+                equity, dd * 100, self.config.max_drawdown_pct * 100,
+            )
+            self.notifier.send(
+                "kill-switch: просадка сверх порога",
+                f"Капитал {equity:,.0f} руб — просадка {dd:.1%} при пороге "
+                f"{self.config.max_drawdown_pct:.0%}.\nНовые входы запрещены до перезапуска бота; "
+                f"открытые позиции обслуживаются.",
+            )
 
     def _load_portfolio(self) -> PortfolioState:
         raw = self.trader.portfolio()

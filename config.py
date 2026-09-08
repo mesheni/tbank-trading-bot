@@ -63,6 +63,17 @@ class Config:
     reversal_exit_mult: float = field(default_factory=lambda: _env_float("REVERSAL_EXIT_MULT", 2.0))
     # гейт качества модели для live: новые входы только при directional_acc >= порога
     min_model_dir_acc: float = field(default_factory=lambda: _env_float("MIN_MODEL_DIR_ACC", 0.5))
+    # kill-switch по просадке: при капитале ниже бюджета*(1-MAX_DRAWDOWN_PCT)
+    # новые входы запрещаются (стопы/тейки продолжают работать) до перезапуска
+    max_drawdown_pct: float = field(default_factory=lambda: _env_float("MAX_DRAWDOWN_PCT", 0.15))
+    # лимит совокупной стоимости позиций к портфелю (none/off — без лимита)
+    max_total_exposure_pct: float | None = field(
+        default_factory=lambda: (
+            None
+            if os.getenv("MAX_TOTAL_EXPOSURE_PCT", "").strip().lower() in {"", "none", "off"}
+            else _env_float("MAX_TOTAL_EXPOSURE_PCT", 0.8)
+        )
+    )
 
     # --- Издержки (для бэктеста) ---
     commission_pct: float = field(default_factory=lambda: _env_float("COMMISSION_PCT", 0.0004))

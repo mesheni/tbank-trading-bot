@@ -196,6 +196,11 @@ def _metrics(equity: pd.Series, trades: list[dict], initial_cash: float, candles
     realized_pnl = float(sum(t["pnl"] for t in sells))
     total_commission = float(sum(t.get("commission") or 0.0 for t in trades))
 
+    # бенчмарк: купить и держать тот же инструмент на том же тестовом окне
+    benchmark = 0.0
+    if len(candles) >= 2 and float(candles["close"].iloc[0]) > 0:
+        benchmark = float(candles["close"].iloc[-1]) / float(candles["close"].iloc[0]) - 1.0
+
     years = max(1e-9, len(equity) / bars)
     cagr = (1.0 + total_return) ** (1 / years) - 1.0 if total_return > -1 else -1.0
 
@@ -208,6 +213,7 @@ def _metrics(equity: pd.Series, trades: list[dict], initial_cash: float, candles
         "win_rate": win_rate,
         "realized_pnl": realized_pnl,
         "total_commission": total_commission,
+        "benchmark_buyhold": benchmark,
     }
 
 
@@ -228,6 +234,8 @@ def save_report(result: BacktestResult, reports_dir: Path, name: str) -> Path:
         f"| Win rate | {m.get('win_rate', 0):.1%} |",
         f"| Реализованный P&L | {m.get('realized_pnl', 0):+,.0f} |",
         f"| Комиссии (всего) | {m.get('total_commission', 0):,.0f} |",
+        f"| Buy&hold того же окна | {m.get('benchmark_buyhold', 0):+.2%} |",
+        f"| Стратегия минус бенчмарк | {m.get('total_return', 0) - m.get('benchmark_buyhold', 0):+.2%} |",
         "",
         "## Кривая капитала",
     ]

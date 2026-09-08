@@ -28,7 +28,7 @@ from stats_utils import bars_per_year, n_test_points
 
 log = logging.getLogger(__name__)
 
-METRIC_KEYS = ("rmse", "mae", "directional_acc", "strategy_sharpe", "n_points")
+METRIC_KEYS = ("rmse", "mae", "directional_acc", "strategy_sharpe", "strategy_sharpe_net", "n_points")
 
 # Модель «предсказывать ноль» не может дать торговый сигнал — из выбора лучшей исключается,
 # но в таблице остаётся как эталон RMSE.
@@ -54,7 +54,7 @@ class WalkForwardResult:
     metrics: dict = field(default_factory=dict)
 
 
-def _metrics(pred: np.ndarray, fact: np.ndarray, bars_per_year: float = 2100.0) -> dict:
+def _metrics(pred: np.ndarray, fact: np.ndarray, bars_per_year: float = 2100.0, round_trip_cost: float = 0.0012) -> dict:
     mask = ~np.isnan(fact)
     pred, fact = pred[mask], fact[mask]
     if len(pred) == 0:
@@ -69,11 +69,20 @@ def _metrics(pred: np.ndarray, fact: np.ndarray, bars_per_year: float = 2100.0) 
     strategy_ret = np.sign(pred) * fact
     std = strategy_ret.std()
     strategy_sharpe = float(strategy_ret.mean() / std * np.sqrt(bars_per_year)) if std > 1e-12 else 0.0
+    # то же, но за вычетом издержек: каждая смена знака позиции — круг сделки
+    signs = np.sign(pred)
+    flips = np.abs(np.diff(signs, prepend=0.0)) / 2.0
+    net_ret = strategy_ret - flips * round_trip_cost
+    std_net = net_ret.std()
+    strategy_sharpe_net = (
+        float(net_ret.mean() / std_net * np.sqrt(bars_per_year)) if std_net > 1e-12 else 0.0
+    )
     return {
         "rmse": float(np.sqrt(np.mean((pred - fact) ** 2))),
         "mae": float(np.mean(np.abs(pred - fact))),
         "directional_acc": directional_acc,
         "strategy_sharpe": strategy_sharpe,
+        "strategy_sharpe_net": strategy_sharpe_net,
         "n_points": int(len(pred)),
     }
 
@@ -120,13 +129,16 @@ def walk_forward_lgbm(
     внутри блока модель та же, как и при поточечном варианте, результат идентичен.
     Используется и в evaluate_all, и в cmd_backtest — финальная артефактная модель
     обучена на всей истории, поэтому для оценки на её собственных данных непригодна.
+
+    Purging: таргет строки t использует close[t+horizon], поэтому из хвоста
+    обучающего среза выкинуты horizon+1 строк — метки не пересекаются с тестом.
     """
     lgbm = LGBMReturnModel(horizon=horizon, use_news_features=use_news)
     preds = pd.Series(np.nan, index=test_points, dtype=float)
     test_list = list(test_points)
     for start in range(0, len(test_list), refit_every):
         block = test_list[start : start + refit_every]
-        train = features.loc[: block[0]].iloc[:-1]
+        train = features.loc[: block[0]].iloc[: -(horizon + 1)]
         if len(train) >= min_train:
             lgbm.fit(train)
         if lgbm.model is not None:
@@ -142,6 +154,7 @@ def evaluate_all(
     test_frac: float = 0.25,
     refit_every: int = 48,
     use_news: bool = False,
+    round_trip_cost: float = 0.0012,
 ) -> tuple[pd.DataFrame, dict[str, WalkForwardResult]]:
     """Сравнивает все модели на одинаковых тестовых точках. Возвращает таблицу метрик."""
     features = ensure_news_columns(build_features(candles, horizon))
@@ -156,7 +169,7 @@ def evaluate_all(
 
     def register(name: str, preds: pd.Series):
         results[name] = WalkForwardResult(
-            preds, facts, _metrics(preds.to_numpy(), facts.to_numpy(), bars_yr)
+            preds, facts, _metrics(preds.to_numpy(), facts.to_numpy(), bars_yr, round_trip_cost)
         )
 
     register("naive_zero", walk_forward_baselines(close, facts, horizon, NaiveZero, test_points, 1))
@@ -180,7 +193,7 @@ def evaluate_all(
     register("lgbm", walk_forward_lgbm(features, test_points, horizon, refit_every, use_news))
 
     metrics = pd.DataFrame({name: r.metrics for name, r in results.items()}).T
-    metrics = metrics.sort_values("strategy_sharpe", ascending=False, na_position="last")
+    metrics = metrics.sort_values("strategy_sharpe_net", ascending=False, na_position="last")
     return metrics, results
 
 
@@ -222,23 +235,35 @@ def train_and_save(
     test_frac: float = 0.25,
     cost_floor: float = 0.0012,
 ) -> ModelArtifact:
-    """cost_floor — издержки за круг сделки (комиссия + проскальзывание ×2), доли."""
-    metrics, results = evaluate_all(candles, horizon, test_frac=test_frac)
+    """cost_floor — издержки за круг сделки (комиссия + проскальзывание ×2), доли.
+
+    Лучшая модель выбирается по strategy_sharpe_net — Sharpe «в сторону прогноза»
+    за вычетом издержек на смену позиции: модель с положительным брутто-Sharpe,
+    но постоянными переворотами невыгодна и отбраковывается.
+    """
+    metrics, results = evaluate_all(candles, horizon, test_frac=test_frac, round_trip_cost=cost_floor)
 
     selectable = metrics.drop(index=[m for m in NON_SELECTABLE if m in metrics.index])
-    best_name = selectable["strategy_sharpe"].idxmax()
-    best_sharpe = float(selectable.loc[best_name, "strategy_sharpe"])
+    scores = selectable["strategy_sharpe_net"].astype(float).fillna(float("-inf"))
+    if scores.isin([float("-inf")]).all():
+        raise ValueError(
+            f"{ticker}: ни у одной модели нет замеренного strategy_sharpe_net — "
+            "тестовый период слишком короткий или данные пустые"
+        )
+    best_name = scores.idxmax()
+    best_sharpe = float(scores.loc[best_name])
     log.info(
-        "Лучшая модель: %s (strategy_sharpe=%.2f, dir_acc=%s, rmse=%.5f)",
+        "Лучшая модель: %s (strategy_sharpe_net=%.2f, брутто=%.2f, dir_acc=%s, rmse=%.5f)",
         best_name,
         best_sharpe,
+        float(selectable.loc[best_name, "strategy_sharpe"]),
         "n/a" if pd.isna(selectable.loc[best_name, "directional_acc"]) else f"{selectable.loc[best_name, 'directional_acc']:.3f}",
         selectable.loc[best_name, "rmse"],
     )
     if best_sharpe <= 0:
         log.warning(
-            "ВНИМАНИЕ: ни одна модель не показала положительной доходности на тестовом периоде "
-            "(лучший strategy_sharpe=%.2f). Бот будет торговать редко или не торговать — это "
+            "ВНИМАНИЕ: ни одна модель не показала положительной доходности после издержек "
+            "(лучший strategy_sharpe_net=%.2f). Бот будет торговать редко или не торговать — это "
             "защитное поведение, а не ошибка. Попробуйте другой таймфрейм/горизонт или "
             "дополнительные признаки.", best_sharpe,
         )

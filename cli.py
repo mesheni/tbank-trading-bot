@@ -184,7 +184,7 @@ def cmd_news(config: Config) -> int:
 
 
 def _render_metrics_table(metrics: pd.DataFrame, best: str) -> str:
-    """Таблица сравнения моделей: лучшая строка выделена, sharpe окрашен по знаку."""
+    """Таблица сравнения моделей: лучшая строка выделена, sharpe/net окрашены по знаку."""
 
     def fmt_num(v: float, fmt: str, na: str = "--") -> str:
         return na if pd.isna(v) else fmt.format(v)
@@ -199,6 +199,7 @@ def _render_metrics_table(metrics: pd.DataFrame, best: str) -> str:
                 fmt_num(m["mae"], "{:.5f}"),
                 fmt_num(m["directional_acc"], "{:.1%}"),
                 fmt_num(m["strategy_sharpe"], "{:+.2f}"),
+                fmt_num(m["strategy_sharpe_net"], "{:+.2f}"),
                 f"{int(m['n_points']):d}",
             ]
         )
@@ -207,8 +208,8 @@ def _render_metrics_table(metrics: pd.DataFrame, best: str) -> str:
         name = metrics.index[r]
         if name == best:
             return ui.paint(text, ui.BRIGHT_GREEN, ui.BOLD)
-        if c == 5:  # колонка sharpe
-            v = metrics.iloc[r]["strategy_sharpe"]
+        if c in (5, 6):  # колонки sharpe / net sharpe
+            v = metrics.iloc[r][["strategy_sharpe", "strategy_sharpe_net"][c - 5]]
             if pd.isna(v):
                 return text
             if v > 0:
@@ -219,9 +220,9 @@ def _render_metrics_table(metrics: pd.DataFrame, best: str) -> str:
         return text
 
     return ui.render_table(
-        ["", "модель", "rmse", "mae", "dir_acc", "sharpe", "точек"],
+        ["", "модель", "rmse", "mae", "dir_acc", "sharpe", "net", "точек"],
         rows,
-        aligns=["c", "l", "r", "r", "r", "r", "r"],
+        aligns=["c", "l", "r", "r", "r", "r", "r", "r"],
         paint_cell=cell_paint,
     )
 
@@ -241,18 +242,19 @@ def cmd_train(config: Config) -> int:
             continue
         trained.append(ticker)
         print(ui.header(f"{ticker} · {len(df)} свечей · горизонт {config.forecast_horizon} бар(а)"))
-        metrics, _ = evaluate_all(df, config.forecast_horizon)
-        # train_and_save выбирает лучшую модель и пишет порог; таблица печатаем до/после логов
-        print(_render_metrics_table(metrics.sort_values("strategy_sharpe", ascending=False, na_position="last"), metrics["strategy_sharpe"].idxmax()))
+        round_trip = 2 * (config.commission_pct + config.slippage_pct)
+        metrics, _ = evaluate_all(df, config.forecast_horizon, round_trip_cost=round_trip)
+        # таблицу печатаем до/после логов train_and_save; выбор там — по net sharpe
+        print(_render_metrics_table(metrics, metrics["strategy_sharpe_net"].idxmax()))
         artifact = train_and_save(
             df, config.forecast_horizon, config.models_dir, ticker, config.candle_interval,
             cost_floor=2 * (config.commission_pct + config.slippage_pct),
         )
         summary[ticker] = {"best": artifact.kind, **artifact.metrics}
         best = ui.paint(artifact.kind, ui.BRIGHT_GREEN, ui.BOLD)
-        sharpe = ui.fmt_signed(artifact.metrics.get("strategy_sharpe", 0.0), "{:+.2f}")
+        sharpe = ui.fmt_signed(artifact.metrics.get("strategy_sharpe_net", 0.0), "{:+.2f}")
         print(
-            f"  Лучшая модель: {best} (strategy_sharpe {sharpe}) · "
+            f"  Лучшая модель: {best} (net sharpe {sharpe}) · "
             f"порог входа {ui.paint(f'{artifact.threshold:.4f}', ui.CYAN)}\n"
         )
     conn.close()
@@ -279,6 +281,7 @@ def cmd_backtest(config: Config, days: int | None = None) -> int:
         commission_pct=config.commission_pct,
         slippage_pct=config.slippage_pct,
         reversal_exit_mult=config.reversal_exit_mult,
+        max_total_exposure_pct=config.max_total_exposure_pct,
     )
     # тональность нужна и офлайн: скоры кэшируются в БД, живой цикл их разделяет
     from bot import ensure_sentiments
@@ -352,6 +355,11 @@ def cmd_backtest(config: Config, days: int | None = None) -> int:
             f"просадка {ui.fmt_signed(m['max_drawdown'])} | "
             f"сделок {m['n_trades']} | win-rate {m['win_rate']:.0%} | "
             f"комиссии {m.get('total_commission', 0):,.0f} руб"
+        )
+        print(
+            f"  Buy&hold того же окна: {ui.fmt_signed(m.get('benchmark_buyhold', 0))} · "
+            f"стратегия минус бенчмарк: "
+            f"{ui.fmt_signed(m.get('total_return', 0) - m.get('benchmark_buyhold', 0))}"
         )
         if m["n_trades"] == 0:
             warn("сделок нет: прогнозы модели не превышали порог входа (консервативно, деньги целы)")
@@ -562,9 +570,42 @@ def cmd_report(config: Config) -> int:
             print(
                 f"  максимум: {ui.fmt_money(peak)} руб | минимум: {ui.fmt_money(equity['total_rub'].min())} руб"
             )
+        _print_benchmark(config, equity, vs_invested)
     else:
         print("  Пока нет данных — появится после запуска бота (reports/equity_live.csv).")
     return 0
+
+
+def _print_benchmark(config: Config, equity: pd.DataFrame, bot_return: float) -> None:
+    """Бенчмарк: buy&hold равных весов тех же тикеров за период живой кривой (локальная БД свечей)."""
+    from tbank.market_data import connect as db_connect
+
+    try:
+        conn = db_connect(config.db_path)
+    except Exception as exc:
+        print(f"  Бенчмарк недоступен (БД: {exc})")
+        return
+    start, end = equity["time"].iloc[0], equity["time"].iloc[-1]
+    returns: list[float] = []
+    try:
+        for ticker in config.tickers:
+            df = load_candles(conn, ticker, config.candle_interval)
+            if df.empty:
+                continue
+            window = df.loc[(df.index >= start) & (df.index <= end), "close"]
+            if len(window) >= 2 and float(window.iloc[0]) > 0:
+                returns.append(float(window.iloc[-1]) / float(window.iloc[0]) - 1.0)
+    finally:
+        conn.close()
+    if not returns:
+        print("  Бенчмарк: нет свечей в локальной БД за период (выполните download)")
+        return
+    buyhold = sum(returns) / len(returns)
+    print(
+        f"  vs buy&hold ({len(returns)} тикеров, равные веса, без комиссий): "
+        f"{ui.fmt_signed(buyhold)} · бот {ui.fmt_signed(bot_return)} · "
+        f"разница {ui.fmt_signed(bot_return - buyhold)}"
+    )
 
 
 def _last_activity(reports_dir: Path) -> tuple[dt.datetime | None, str]:

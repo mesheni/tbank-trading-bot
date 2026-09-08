@@ -33,6 +33,9 @@ class RiskConfig:
     news_sentiment_gate: float = -0.35
     commission_pct: float = 0.0004
     slippage_pct: float = 0.0002
+    # лимит совокупной стоимости всех позиций к портфелю (None — не ограничивать);
+    # режет корреляционные кластеры: 5 позиций по 20% — это уже 100% рынка в лонге
+    max_total_exposure_pct: float | None = None
     # выход «прогноз развернулся» — при пересечении порога, в reversal_exit_mult
     # раз шире входного: симметричный порог заставлял закрываться на каждом
     # слабом колебании прогноза и тут же перекупать (churn, издержки съедали доходность)
@@ -75,9 +78,18 @@ def decide(
         if news_sentiment < risk.news_sentiment_gate:
             return Decision("HOLD", 0, f"новостной фильтр: sentiment={news_sentiment:+.2f}", price)
         budget = portfolio.equity * risk.max_position_pct
+        capped_by_exposure = False
+        if risk.max_total_exposure_pct is not None:
+            open_value = max(0.0, portfolio.equity - portfolio.cash)  # стоимость текущих позиций
+            room = portfolio.equity * risk.max_total_exposure_pct - open_value
+            if room < budget:
+                budget, capped_by_exposure = room, True
         lots = int(budget / (price * lot_size))
         if lots < 1:
-            return Decision("HOLD", 0, "недостаточно средств на 1 лот", price)
+            reason = (
+                "лимит совокупной экспозиции" if capped_by_exposure else "недостаточно средств на 1 лот"
+            )
+            return Decision("HOLD", 0, reason, price)
         max_affordable = int(portfolio.cash / (price * lot_size))
         lots = min(lots, max_affordable)
         if lots < 1:
