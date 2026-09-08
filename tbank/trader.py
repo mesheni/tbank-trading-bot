@@ -4,6 +4,7 @@ from __future__ import annotations
 import csv
 import datetime as dt
 import logging
+import time
 from pathlib import Path
 
 from .api import TBankAPI
@@ -12,6 +13,9 @@ log = logging.getLogger(__name__)
 
 BUY = "ORDER_DIRECTION_BUY"
 SELL = "ORDER_DIRECTION_SELL"
+
+# финальные статусы: заявка доработала; new/partiallyfill ещё могут исполниться дальше
+FINAL_STATUSES = {"fill", "cancelled", "rejected"}
 
 
 class Trader:
@@ -74,10 +78,34 @@ class Trader:
         return self.api.get_portfolio(self.account_id)
 
     def buy(self, instrument_id: str, lots: int, price: float) -> dict:
-        return self.api.post_order(self.account_id, instrument_id, lots, BUY, price=price)
+        return self._execute(instrument_id, lots, BUY, price)
 
     def sell(self, instrument_id: str, lots: int, price: float | None = None) -> dict:
-        return self.api.post_order(self.account_id, instrument_id, lots, SELL, price=price)
+        return self._execute(instrument_id, lots, SELL, price)
+
+    def _execute(self, instrument_id: str, lots: int, direction: str, price: float | None) -> dict:
+        """Ставит заявку и возвращает нормализованный результат исполнения.
+
+        Рыночные заявки песочницы обычно исполняются мгновенно; если статус ещё
+        не финальный (new/partiallyfill), дозапрашиваем GetOrderState несколько раз,
+        чтобы не считать исполнением то, что ещё висит на бирже.
+        """
+        state = self.api.post_order(self.account_id, instrument_id, lots, direction, price=price)
+        attempts = 0
+        while state["status"] not in FINAL_STATUSES and attempts < 3 and state["order_id"]:
+            attempts += 1
+            time.sleep(2.0)
+            try:
+                state = self.api.get_order_state(self.account_id, state["order_id"])
+            except Exception as exc:
+                log.warning("GetOrderState %s не удался (%s) — работаем с последним статусом", state["order_id"], exc)
+                break
+        if state["status"] not in FINAL_STATUSES:
+            log.warning(
+                "Заявка %s осталась в статусе %s (исполнено %d/%d лотов)",
+                state["order_id"], state["status"], state["lots_executed"], state["lots_requested"],
+            )
+        return state
 
     def log_trade(self, row: dict) -> None:
         self.journal_path.parent.mkdir(parents=True, exist_ok=True)

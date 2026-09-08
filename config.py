@@ -32,6 +32,13 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None or raw == "":
+        return default
+    return raw.strip().lower() not in {"0", "false", "off", "no"}
+
+
 @dataclass
 class Config:
     # --- API ---
@@ -64,6 +71,8 @@ class Config:
     # --- Бот ---
     loop_interval_sec: int = field(default_factory=lambda: _env_int("LOOP_INTERVAL_SEC", 300))
     sandbox_initial_rub: float = field(default_factory=lambda: _env_float("SANDBOX_INITIAL_RUB", 1_000_000))
+    # автоперевод отклонённой лимитной заявки в рыночную; для real рекомендовано 0
+    order_fallback_to_market: bool = field(default_factory=lambda: _env_bool("ORDER_FALLBACK_TO_MARKET", True))
 
     # --- Пути ---
     db_path: Path = field(default_factory=lambda: BASE_DIR / os.getenv("DB_PATH", "data/market.sqlite"))

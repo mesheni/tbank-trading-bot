@@ -76,6 +76,50 @@ def parse_portfolio(data: dict) -> dict:
     }
 
 
+def parse_order_state(
+    data: dict,
+    executed_price_is_total: bool = False,
+    fallback_price: float | None = None,
+) -> dict:
+    """Нормализует PostOrderResponse / OrderState в результат исполнения.
+
+    Внимание, семантика различается по контрактам (orders.proto):
+      * PostOrderResponse.executedOrderPrice — средняя цена ОДНОЙ бумаги;
+      * OrderState.executedOrderPrice — произведение средней цены на лоты,
+        но OrderState дополнительно несёт averagePositionPrice (цена за бумагу).
+    Порядок выбора средней цены: подходящее поле контракта -> другое поле -> цена заявки.
+    """
+    raw_status = str(data.get("executionReportStatus") or "")
+    status = raw_status.rsplit("_", 1)[-1].lower()  # fill|partiallyfill|new|cancelled|rejected
+    lots_requested = int(data.get("lotsRequested") or 0)
+    lots_executed = int(data.get("lotsExecuted") or 0)
+    executed_price = quotation_to_float(data.get("executedOrderPrice"))
+    avg_position_price = quotation_to_float(data.get("averagePositionPrice"))
+
+    if executed_price_is_total:
+        avg_exec_price = avg_position_price or (
+            executed_price / lots_executed if lots_executed > 0 and executed_price > 0 else 0.0
+        )
+    else:
+        avg_exec_price = executed_price or avg_position_price
+    if avg_exec_price <= 0 and fallback_price:
+        avg_exec_price = float(fallback_price)
+
+    commission = quotation_to_float(data.get("executedCommission")) or quotation_to_float(
+        data.get("initialCommission")
+    )
+    return {
+        "order_id": str(data.get("orderId") or ""),
+        "status": status,
+        "lots_requested": lots_requested,
+        "lots_executed": lots_executed,
+        "avg_exec_price": avg_exec_price,
+        "commission": commission,
+        "total_amount": quotation_to_float(data.get("totalOrderAmount")),
+        "message": str(data.get("message") or ""),
+    }
+
+
 class TBankAPI:
     """Обёртки над методами API, единые для prod и sandbox."""
 
@@ -86,8 +130,11 @@ class TBankAPI:
     ORDERS = "tinkoff.public.invest.api.contract.v1.OrdersService"
     OPERATIONS = "tinkoff.public.invest.api.contract.v1.OperationsService"
 
-    def __init__(self, client: TBankRestClient):
+    def __init__(self, client: TBankRestClient, order_market_fallback: bool = True):
         self.client = client
+        # автоперевод лимитной заявки в рыночную при отказе брокера (400);
+        # для real-режима рекомендуется отключить (ORDER_FALLBACK_TO_MARKET=0)
+        self.order_market_fallback = order_market_fallback
 
     # ---------- Счета ----------
 
@@ -300,13 +347,26 @@ class TBankAPI:
         if price is not None and order_type == "ORDER_TYPE_LIMIT":
             payload["price"] = float_to_quotation(price)
         try:
-            return self.client.post(f"{self.ORDERS}/PostOrder", payload)
+            data = self.client.post(f"{self.ORDERS}/PostOrder", payload)
         except APIError as exc:
-            if exc.status == 400 and order_type == "ORDER_TYPE_LIMIT":
+            if exc.status == 400 and order_type == "ORDER_TYPE_LIMIT" and self.order_market_fallback:
+                log.warning(
+                    "Лимитная заявка %s отклонена (%s) — переподача рыночной",
+                    instrument_id, exc.details[:200] or exc.message,
+                )
                 payload["orderType"] = "ORDER_TYPE_MARKET"
                 payload.pop("price", None)
-                return self.client.post(f"{self.ORDERS}/PostOrder", payload)
-            raise
+                data = self.client.post(f"{self.ORDERS}/PostOrder", payload)
+            else:
+                raise
+        return parse_order_state(data, fallback_price=price)
+
+    def get_order_state(self, account_id: str, order_id: str) -> dict:
+        """OrdersService/GetOrderState: статус заявки (в т.ч. после частичного исполнения)."""
+        data = self.client.post(
+            f"{self.ORDERS}/GetOrderState", {"accountId": account_id, "orderId": order_id}
+        )
+        return parse_order_state(data, executed_price_is_total=True)
 
     def get_portfolio(self, account_id: str) -> dict:
         data = self.client.post(f"{self.OPERATIONS}/GetPortfolio", {"accountId": account_id})

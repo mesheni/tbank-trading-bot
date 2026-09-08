@@ -70,7 +70,7 @@ class TradingBot:
             reversal_exit_mult=config.reversal_exit_mult,
         )
         self.client = TBankRestClient(config.token, config.mode)
-        self.api = TBankAPI(self.client)
+        self.api = TBankAPI(self.client, order_market_fallback=config.order_fallback_to_market)
         self.trader = Trader(self.api, Path(config.reports_dir) / "journal.csv")
         self.conn = connect(config.db_path)
 
@@ -250,18 +250,45 @@ class TradingBot:
         )
 
         if decision.action == "BUY":
-            order = self.trader.buy(figi, decision.lots, price)
-            portfolio.positions[figi] = Position(figi, ticker, decision.lots, lot, price)
-            self.trader.log_trade(
-                make_journal_row(ticker, "BUY", decision.lots, price, decision.reason, str(order.get("orderId", "")))
-            )
+            state = self.trader.buy(figi, decision.lots, price)
+            executed = max(0, int(state.get("lots_executed") or 0))
+            exec_price = float(state.get("avg_exec_price") or 0.0) or price
+            if executed <= 0:
+                log.warning(
+                    "%s: заявка не исполнена (статус %s) — позиция не открывается",
+                    ticker, state.get("status") or "неизвестен",
+                )
+            else:
+                if executed < decision.lots:
+                    log.warning("%s: частичное исполнение покупки: %d из %d лотов", ticker, executed, decision.lots)
+                portfolio.positions[figi] = Position(figi, ticker, executed, lot, exec_price)
+                self.trader.log_trade(
+                    make_journal_row(ticker, "BUY", executed, exec_price, decision.reason, str(state.get("order_id", "")))
+                )
         elif decision.action == "SELL" and figi in portfolio.positions:
-            lots = portfolio.positions[figi].lots
-            order = self.trader.sell(figi, lots, price)
-            del portfolio.positions[figi]
-            self.trader.log_trade(
-                make_journal_row(ticker, "SELL", lots, price, decision.reason, str(order.get("orderId", "")))
-            )
+            position = portfolio.positions[figi]
+            state = self.trader.sell(figi, position.lots, price)
+            executed = max(0, min(int(state.get("lots_executed") or 0), position.lots))
+            exec_price = float(state.get("avg_exec_price") or 0.0) or price
+            if executed <= 0:
+                log.warning(
+                    "%s: продажа не исполнена (статус %s) — позиция остаётся",
+                    ticker, state.get("status") or "неизвестен",
+                )
+            else:
+                if executed < position.lots:
+                    log.warning(
+                        "%s: частичная продажа: %d из %d лотов, остаток держим",
+                        ticker, executed, position.lots,
+                    )
+                    portfolio.positions[figi] = Position(
+                        figi, ticker, position.lots - executed, lot, position.avg_price
+                    )
+                else:
+                    del portfolio.positions[figi]
+                self.trader.log_trade(
+                    make_journal_row(ticker, "SELL", executed, exec_price, decision.reason, str(state.get("order_id", "")))
+                )
 
     def run_forever(self, max_iterations: int | None = None) -> None:
         self._running = True
@@ -325,7 +352,8 @@ class TradingBot:
             ticker = (instrument.get("ticker") or figi) if instrument else figi
             if pos["quantity"] > 0:
                 positions[figi] = Position(
-                    figi, ticker, int(pos["quantity"]), int(instrument.get("lot", 1)) if instrument else 1,
+                    # дробные количества (корп. действия) округляются до целых лотов/штук
+                    figi, ticker, int(round(pos["quantity"])), int(instrument.get("lot", 1)) if instrument else 1,
                     pos["average_position_price"] or pos["current_price"],
                 )
         return PortfolioState(cash=raw["cash_rub"], equity=raw["total_amount_rub"], positions=positions)

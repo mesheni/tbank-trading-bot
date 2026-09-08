@@ -79,7 +79,10 @@ def warn(message: str) -> None:
 
 
 def make_api(config: Config) -> TBankAPI:
-    return TBankAPI(TBankRestClient(config.token, config.mode))
+    return TBankAPI(
+        TBankRestClient(config.token, config.mode),
+        order_market_fallback=config.order_fallback_to_market,
+    )
 
 
 def cmd_smoke(config: Config) -> int:
