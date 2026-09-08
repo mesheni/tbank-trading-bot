@@ -178,6 +178,28 @@ tmux new -s bot '.venv/bin/python cli.py run 2>&1 | tee -a var/bot.log'
 
 (суббота 06:00 — если сервер живёт в MSK; иначе переведите на ночь по Москве).
 
+### 3.6.1 Эксперимент с горизонтом прогноза (H=4)
+
+Отбор модели и пороги зависят от горизонта, поэтому сравнение H=1 vs H=4 — это отдельный
+прогон обучения/бэктеста с сохранением результатов:
+
+```bash
+cd /root/tbank-trading-bot
+systemctl stop tbank-bot
+sed -i 's/^FORECAST_HORIZON=.*/FORECAST_HORIZON=4/' .env
+.venv/bin/python cli.py train >> var/h4_train.log 2>&1
+.venv/bin/python cli.py backtest >> var/h4_backtest.log 2>&1
+cp reports/train_summary.json reports/train_summary_h4.json   # зафиксировать результат
+# возврат к рабочему горизонту:
+sed -i 's/^FORECAST_HORIZON=.*/FORECAST_HORIZON=1/' .env
+.venv/bin/python cli.py train && systemctl start tbank-bot
+```
+
+Сравните `train_summary_h4.json` с `train_summary.json` (strategy_sharpe_net, directional_acc)
+и отчёты `reports/backtest_*_h4.md` против `*_h1.md` — в них же строка «Buy&hold того же окна».
+Артефакты h1 и h4 хранятся рядом (имена содержат `_h1`/`_h4`), но live-бот читает только тот,
+что соответствует текущему `FORECAST_HORIZON` в `.env`.
+
 ### 3.7 Опционально: нейросетевой NLP (transformers + torch)
 
 По умолчанию тональность считается офлайн-лексиконом, кластеризация повестки отключена.
@@ -220,17 +242,51 @@ echo '/swapfile none swap sw 0 0' >> /etc/fstab
 Совсем убрать нейронку из окружения: `.venv/bin/pip uninstall -y torch transformers sentence-transformers` —
 код сам вернётся к лексикону.
 
-### 3.8 Мониторинг
+### 3.8 Мониторинг: report, watchdog и email-уведомления
 
 | Что | Команда / файл |
 |---|---|
-| Капитал, P&L, позиции, сделки | `/root/tbank-trading-bot/.venv/bin/python cli.py report` |
+| Капитал, P&L, позиции, сделки, vs buy&hold | `/root/tbank-trading-bot/.venv/bin/python cli.py report` |
 | Кривая капитала | `reports/equity_live.csv` (растёт после каждой итерации) |
+| Отметка живости | `reports/heartbeat` (обновляется каждой успешной итерацией) |
 | Журнал сделок с причинами | `reports/journal.csv` |
 | Живой лог | `journalctl -u tbank-bot -f` |
 | Состояние сервиса | `systemctl status tbank-bot --no-pager` |
 
 Удобно забирать `reports/*.csv` на локальную машину по scp и смотреть в Excel.
+
+#### Email-уведомления (SMTP)
+
+Бот шлёт письма о сделках, ошибках и срабатывании защит — Telegram из РФ недоступен,
+поэтому канал обычная почта (Яндекс/Mail.ru, пароль приложения). В `.env`:
+
+```ini
+NOTIFY_EMAIL_TO=trader@example.com
+SMTP_HOST=smtp.yandex.ru
+SMTP_PORT=465
+SMTP_USER=bot@yandex.ru
+SMTP_PASSWORD=пароль-приложения   # не пароль аккаунта!
+```
+
+Пустой `NOTIFY_EMAIL_TO` — уведомления выключены, бот работает как раньше.
+Пароль приложения: Яндекс → «Безопасность» → «Пароли приложений».
+
+#### Watchdog: защита от «тихой смерти»
+
+Регрессия 07.09: ошибка внутри итерации не убивала процесс — бот жил, но не торговал,
+и только `equity_live.csv` молчал. Watchdog проверяет свежесть `heartbeat`/`equity_live`
+в открытую сессию и умеет перезапускать сервис. Cron root (`crontab -e`):
+
+```
+# каждые 10 минут: живость бота (+автоперезапуск при зависании)
+*/10 * * * * cd /root/tbank-trading-bot && .venv/bin/python cli.py watchdog --restart >> var/watchdog.log 2>&1
+# дайджест дня после закрытия основной сессии MOEX (19:10 МСК, сервер в MSK)
+10 19 * * 1-5 cd /root/tbank-trading-bot && .venv/bin/python cli.py digest >> var/digest.log 2>&1
+```
+
+Письмо о зависании отправляется не чаще раза в час (метка `reports/watchdog_last_alert`).
+`--restart` можно убрать, если автоперезапуск не нужен. Вне торговой сессии watchdog
+молча выходит с кодом 0.
 
 ### 3.9 Опционально: изоляция под отдельным пользователем (не root)
 
@@ -323,5 +379,7 @@ systemctl restart tbank-bot
 3. Проект в `/root/tbank-trading-bot`, venv пересоздан на месте, `.env` с токеном, `chmod 600`.
 4. `cli.py smoke` → `download` → `news` → `train` → `backtest`.
 5. systemd-юнит (root, `/root/...` пути, без `User=`) → `daemon-reload` → `enable --now` → `journalctl -f`.
-6. Cron root: еженедельные `download` + `train` + `systemctl restart tbank-bot`.
-7. Раз в день: `cli.py report` (или смотреть `journal.csv` / `equity_live.csv`).
+6. Cron root: еженедельные `download` + `train` + `systemctl restart tbank-bot`; watchdog
+   каждые 10 минут и дневной дайджест (§3.8); при желании — SMTP-уведомления в `.env`.
+7. Раз в день: письмо-дайджест (если настроен) или `cli.py report` (или смотреть
+   `journal.csv` / `equity_live.csv`).
