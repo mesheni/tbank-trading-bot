@@ -40,6 +40,8 @@ class RiskConfig:
     # раз шире входного: симметричный порог заставлял закрываться на каждом
     # слабом колебании прогноза и тут же перекупать (churn, издержки съедали доходность)
     reversal_exit_mult: float = 2.0
+    # минимальная комиссия брокера за заявку, руб (0 — не учитывать; берётся в бэктесте)
+    commission_min_rub: float = 0.0
 
 
 @dataclass
@@ -110,6 +112,17 @@ def decide(
     if news_sentiment < risk.news_sentiment_gate * 1.5:
         return Decision("SELL", position.lots, f"новости резко негативны {news_sentiment:+.2f}", price)
     return Decision("HOLD", 0, f"держим, pnl {pnl_pct:+.2%}", price)
+
+
+def is_affordable(price: float, lot_size: int, equity: float, max_position_pct: float) -> bool:
+    """Помещается ли один лот в бюджет позиции (долю капитала).
+
+    Используется для сужения вселенной на малых счетах: бумага, чей лот дороже
+    бюджета позиции, не купится никогда — её можно исключить заранее.
+    """
+    if price <= 0 or lot_size <= 0:
+        return False
+    return price * lot_size <= equity * max_position_pct + 1e-9
 
 
 def calc_cost(price: float, lots: int, lot_size: int, commission_pct: float) -> float:

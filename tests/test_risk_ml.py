@@ -109,6 +109,7 @@ def make_kill_switch_bot() -> TradingBot:
 
     bot = TradingBot.__new__(TradingBot)
     bot.config = SimpleNamespace(sandbox_initial_rub=1_000_000.0, max_drawdown_pct=0.15)
+    bot._budget_rub = None  # не установлен: kill-switch откатывается к sandbox_initial_rub
     bot.notifier = Notifier(SmtpConfig())  # выключен: send() тихо вернёт False
     bot._entries_allowed = True
     return bot

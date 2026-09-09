@@ -1,10 +1,11 @@
 """Walk-forward бэктест стратегии на исторических свечах с прогнозами модели.
 
-Учитывает комиссию, проскальзывание (из RiskConfig), стоп-лосс/тейк-профит
-по экстремумам бара (гэп сквозь стоп исполняется по цене открытия), новостной
-фильтр (если передана историческая серия сентимента). Сделки закрываются FIFO,
-в trades_*.csv попадают комиссия и реализованный P&L каждой сделки.
-Лонг-онли, один инструмент за прогон (портфель бота — сумма независимых прогонов).
+Учитывает комиссию (процент и минимум за заявку), проскальзывание (из RiskConfig),
+стоп-лосс/тейк-профит по экстремумам бара (гэп сквозь стоп исполняется по цене
+открытия), новостной фильтр (если передана историческая серия сентимента).
+Сделки закрываются FIFO, в trades_*.csv попадают комиссия и реализованный P&L
+каждой сделки. Лонг-онли, один инструмент за прогон (портфель бота — сумма
+независимых прогонов).
 """
 from __future__ import annotations
 
@@ -50,6 +51,7 @@ def run_backtest(
     equity_points: dict[pd.Timestamp, float] = {}
     trades: list[dict] = []
     commission = risk.commission_pct
+    commission_min = risk.commission_min_rub
     slip = risk.slippage_pct
 
     def open_lots() -> int:
@@ -67,7 +69,7 @@ def run_backtest(
         nonlocal cash
         exec_price = price * (1 + slip)
         cost = exec_price * lots * lot_size
-        fee = cost * commission
+        fee = max(cost * commission, commission_min)
         if cost + fee > cash + 1e-9:
             return
         cash -= cost + fee
@@ -97,11 +99,13 @@ def run_backtest(
             if segments[0][0] == 0:
                 segments.pop(0)
         proceeds = exec_price * to_close * lot_size
-        sell_fee = proceeds * commission
+        sell_fee = max(proceeds * commission, commission_min)
         cash += proceeds - sell_fee
         sync_position()
         # комиссия строки — только стороны продажи (вход учтён своей строкой);
-        # pnl — нетто-экономика круга: минус комиссии обеих сторон
+        # pnl — нетто-экономика круга: минус комиссии обеих сторон.
+        # buy_fees в FIFO — пропорциональная книга учёта: при минимальной комиссии
+        # и частичных закрытиях P&L строки оценочный, кэш считается точно.
         net_pnl = pnl - (buy_fees + sell_fee)
         trades.append(
             _trade(

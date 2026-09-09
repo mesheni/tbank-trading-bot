@@ -19,14 +19,14 @@ from pathlib import Path
 import pandas as pd
 
 from backtest import RiskConfig  # noqa: F401  (реэкспорт для удобства)
-from config import MSK, Config
+from config import MIN_TRADABLE_EQUITY_RUB, MSK, Config
 from features import build_features, ensure_news_columns
 from models.registry import ModelArtifact, load_artifact, model_factories
 from nlp.agenda import AgendaScore, batch_score_news, score_agenda
 from nlp.embedder import NewsEmbedder
 from nlp.sentiment import make_sentiment
 from notify import Notifier
-from strategy import Decision, PortfolioState, Position, RiskConfig, decide
+from strategy import Decision, PortfolioState, Position, RiskConfig, decide, is_affordable
 import ui
 from tbank.api import TBankAPI
 from tbank.market_data import (
@@ -135,6 +135,7 @@ class TradingBot:
             news_sentiment_gate=config.news_sentiment_gate,
             commission_pct=config.commission_pct,
             slippage_pct=config.slippage_pct,
+            commission_min_rub=config.commission_min_rub,
             reversal_exit_mult=config.reversal_exit_mult,
             max_total_exposure_pct=config.max_total_exposure_pct,
         )
@@ -162,6 +163,8 @@ class TradingBot:
         self._running = False
         # kill-switch по просадке: False = новых входов нет, выходы работают
         self._entries_allowed = True
+        # бюджет счёта (якорь kill-switch и P&L); уточняется при старте цикла
+        self._budget_rub: float | None = getattr(config, "account_budget_rub", None)
 
     # ---------- Сессия ----------
 
@@ -398,7 +401,9 @@ class TradingBot:
         iteration = 0
         # бюджет вносится один раз на старте и только на пустой счёт:
         # в цикле никаких пополнений — бот торгует строго данным бюджетом
-        self.trader.initialize_balance(self.config.sandbox_initial_rub)
+        self.trader.initialize_balance(self.config.budget_rub)
+        # профиль капитала и вселенная фиксируются на запуск (см. _setup_capital_profile)
+        self._setup_capital_profile()
         log.info(
             "Бот запущен: mode=%s tickers=%s interval=%s horizon=%d",
             self.config.mode, ",".join(self.instruments), self.config.candle_interval, self.config.forecast_horizon,
@@ -434,7 +439,7 @@ class TradingBot:
                         positions_value,
                     )
                     write_heartbeat(Path(self.config.reports_dir) / "heartbeat")
-                    pnl_pct = snapshot["total_amount_rub"] / self.config.sandbox_initial_rub - 1.0
+                    pnl_pct = snapshot["total_amount_rub"] / self._budget_rub - 1.0
                     log.info(
                         "%s Итерация %d · капитал %s руб · P&L %s · позиций: %d",
                         ui.paint_log("==", ui.CYAN),
@@ -460,11 +465,10 @@ class TradingBot:
 
     def _check_kill_switch(self, equity: float) -> None:
         """Просадка глубже MAX_DRAWDOWN_PCT — навсегда (до перезапуска) запретить входы."""
-        if self._entries_allowed and equity < self.config.sandbox_initial_rub * (
-            1.0 - self.config.max_drawdown_pct
-        ):
+        anchor = self._budget_rub if self._budget_rub is not None else self.config.sandbox_initial_rub
+        if self._entries_allowed and equity < anchor * (1.0 - self.config.max_drawdown_pct):
             self._entries_allowed = False
-            dd = 1.0 - equity / self.config.sandbox_initial_rub
+            dd = 1.0 - equity / anchor
             log.error(
                 "KILL-SWITCH: капитал %.0f руб — просадка %.1f%% превышает MAX_DRAWDOWN_PCT (%.0f%%). "
                 "Новые входы запрещены; стопы/тейки продолжают работать. Вернуть торговлю: "
@@ -474,9 +478,90 @@ class TradingBot:
             self.notifier.send(
                 "kill-switch: просадка сверх порога",
                 f"Капитал {equity:,.0f} руб — просадка {dd:.1%} при пороге "
-                f"{self.config.max_drawdown_pct:.0%}.\nНовые входы запрещены до перезапуска бота; "
+                f"{self.config.max_drawdown_pct:.0%} (бюджет {anchor:,.0f} руб).\n"
+                f"Новые входы запрещены до перезапуска бота; "
                 f"открытые позиции обслуживаются.",
             )
+
+    def _setup_capital_profile(self) -> None:
+        """Режим работы под размер счёта: профиль капитала + доступная вселенная.
+
+        Вызывается один раз на запуск (смена режима — правка .env и рестарт).
+        Профиль подбирает долю позиции и лимит экспозиции под капитал; из вселенной
+        исключаются бумаги, чей 1 лот не влезает в бюджет позиции. Kill-switch и
+        P&L дальше считаются от бюджета счёта, а не от значения по умолчанию.
+        """
+        equity = self._load_portfolio().equity
+        budget = self.config.account_budget_rub
+        if budget is None:
+            budget = self.config.sandbox_initial_rub if self.config.is_sandbox else equity
+        self._budget_rub = float(budget)
+
+        profile = self.config.apply_profile(equity)
+        self.risk = RiskConfig(
+            max_position_pct=self.config.max_position_pct,
+            stop_loss_pct=self.config.stop_loss_pct,
+            take_profit_pct=self.config.take_profit_pct,
+            min_abs_return=self.config.min_abs_return,
+            news_sentiment_gate=self.config.news_sentiment_gate,
+            commission_pct=self.config.commission_pct,
+            slippage_pct=self.config.slippage_pct,
+            commission_min_rub=self.config.commission_min_rub,
+            reversal_exit_mult=self.config.reversal_exit_mult,
+            max_total_exposure_pct=self.config.max_total_exposure_pct,
+        )
+        log.info(
+            "Профиль капитала %s: позиция до %.0f%% капитала, экспозиция до %.0f%%, бюджет %s руб",
+            profile,
+            self.config.max_position_pct * 100,
+            (self.config.max_total_exposure_pct or 0) * 100,
+            ui.fmt_money(self._budget_rub),
+        )
+        if equity < MIN_TRADABLE_EQUITY_RUB:
+            log.warning(
+                "Капитал %.0f руб ниже разумного минимума (~%s руб): целые лоты MOEX "
+                "не помещаются в бюджет позиции — сделок почти не будет",
+                equity,
+                ui.fmt_money(MIN_TRADABLE_EQUITY_RUB),
+            )
+
+        # вселенная: инструменты, чей 1 лот влезает в бюджет позиции
+        # (цена — последняя закрытая свеча из кэша БД)
+        dropped: list[str] = []
+        kept: dict[str, dict] = {}
+        for ticker, instrument in self.instruments.items():
+            df = load_candles(self.conn, ticker, self.config.candle_interval)
+            price = float(df["close"].iloc[-1]) if not df.empty else 0.0
+            lot = int(instrument.get("lot", 1))
+            if price > 0 and not is_affordable(price, lot, equity, self.config.max_position_pct):
+                dropped.append(
+                    f"{ticker} (лот {ui.fmt_money(price * lot)} руб > "
+                    f"бюджет {ui.fmt_money(equity * self.config.max_position_pct)} руб)"
+                )
+            else:
+                kept[ticker] = instrument
+        total = len(self.instruments)
+        if dropped and kept:
+            self.instruments = kept
+            log.warning(
+                "Профиль %s: исключены инструменты, чей лот дороже бюджета позиции: %s",
+                profile,
+                "; ".join(dropped),
+            )
+        self.notifier.send_throttled(
+            "capital-profile",
+            f"режим {profile}: капитал {equity:,.0f} руб",
+            f"Профиль капитала: {profile}\n"
+            f"Позиция до {self.config.max_position_pct:.0%} капитала, "
+            f"экспозиция до {(self.config.max_total_exposure_pct or 0):.0%}.\n"
+            f"Торгуем {len(self.instruments)} из {total} тикеров"
+            + (
+                f"\nИсключены (лот дороже бюджета): {', '.join(d.split(' ')[0] for d in dropped)}"
+                if dropped
+                else ""
+            )
+            + f"\nБюджет (якорь kill-switch): {self._budget_rub:,.0f} руб",
+        )
 
     def _load_portfolio(self) -> PortfolioState:
         raw = self.trader.portfolio()

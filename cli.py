@@ -5,7 +5,9 @@
     python cli.py download --days 720   # выгрузка истории свечей
     python cli.py news                  # выгрузка новостей
     python cli.py train                 # сравнение моделей, выбор лучшей
+    python cli.py train --capital 30000 # то же, но с фильтром тикеров по лоту под капитал
     python cli.py backtest              # бэктест стратегии с лучшей моделью
+    python cli.py backtest --capital 30000  # бэктест на счёте 30 тыс. руб
     python cli.py run                   # торговый цикл в sandbox
     python cli.py report                # состояние счёта и журнал сделок
     python cli.py watchdog --restart    # проверка живости бота (для cron)
@@ -28,7 +30,7 @@ import pandas as pd
 
 import ui
 from backtest import run_backtest, save_report
-from config import Config
+from config import CAPITAL_PROFILES, Config, resolve_capital_profile
 from features import build_features, ensure_news_columns
 from models.registry import (
     artifact_path,
@@ -40,17 +42,23 @@ from models.registry import (
     walk_forward_lgbm,
 )
 from stats_utils import n_test_points
-from strategy import RiskConfig
+from strategy import RiskConfig, is_affordable
 from tbank.api import TBankAPI
 from tbank.market_data import (
     connect,
     download_candles,
     load_candles,
+    load_instrument,
     load_news,
     store_instruments,
     store_news,
 )
 from tbank.rest import TBankRestClient
+
+
+def _sandbox_budget(config) -> float:
+    """Бюджет песочницы: ACCOUNT_BUDGET_RUB, если задан, иначе SANDBOX_INITIAL_RUB."""
+    return getattr(config, "account_budget_rub", None) or config.sandbox_initial_rub
 
 
 class ColorFormatter(logging.Formatter):
@@ -227,10 +235,23 @@ def _render_metrics_table(metrics: pd.DataFrame, best: str) -> str:
     )
 
 
-def cmd_train(config: Config) -> int:
+def cmd_train(config: Config, capital: float | None = None) -> int:
     conn = connect(config.db_path)
     summary = {}
     trained = []
+    # учёт капитала: тикеры, чей 1 лот не влезает в бюджет позиции при данном
+    # капитале, не обучаются — стратегия всё равно не сможет купить ни одного лота
+    capital_profile = None
+    pos_pct = None
+    if capital:
+        capital_profile = resolve_capital_profile(capital)
+        pos_pct = CAPITAL_PROFILES[capital_profile]["max_position_pct"]
+        print(
+            ui.header(
+                f"Капитал {ui.fmt_money(capital)} руб · профиль {capital_profile} "
+                f"· позиция до {pos_pct:.0%} капитала"
+            )
+        )
     for ticker in config.tickers:
         df = load_candles(conn, ticker, config.candle_interval)
         if df.empty:
@@ -240,6 +261,21 @@ def cmd_train(config: Config) -> int:
             warn(f"{ticker}: всего {len(df)} свечей — мало для обучения (нужно >= 500), пропускаем. "
                  f"Возможно, бумага торгуется недавно.")
             continue
+        if capital:
+            instrument = load_instrument(conn, ticker)
+            if not instrument:
+                warn(f"{ticker}: тикера нет в кэше instruments — фильтр по лоту пропущен "
+                     f"(заполнит download/smoke/run)")
+            else:
+                lot_size = int(instrument["lot"])
+                price = float(df["close"].iloc[-1])
+                if not is_affordable(price, lot_size, capital, pos_pct):
+                    warn(
+                        f"{ticker}: 1 лот {ui.fmt_money(price * lot_size)} руб дороже бюджета позиции "
+                        f"{ui.fmt_money(capital * pos_pct)} руб при капитале {ui.fmt_money(capital)} руб "
+                        f"— пропускаем"
+                    )
+                    continue
         trained.append(ticker)
         print(ui.header(f"{ticker} · {len(df)} свечей · горизонт {config.forecast_horizon} бар(а)"))
         round_trip = 2 * (config.commission_pct + config.slippage_pct)
@@ -259,9 +295,12 @@ def cmd_train(config: Config) -> int:
         )
     conn.close()
     if summary:
+        payload: dict = {"tickers": summary}
+        if capital:
+            payload |= {"capital_rub": capital, "profile": capital_profile}
         config.reports_dir.mkdir(parents=True, exist_ok=True)
         (config.reports_dir / "train_summary.json").write_text(
-            json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8"
+            json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
         )
         print(
             f"Итого обучено: {len(summary)}/{len(config.tickers)}. "
@@ -271,8 +310,10 @@ def cmd_train(config: Config) -> int:
     return 1 if not summary else 0
 
 
-def cmd_backtest(config: Config, days: int | None = None) -> int:
+def cmd_backtest(config: Config, days: int | None = None, capital: float | None = None) -> int:
     conn = connect(config.db_path)
+    # капитал бэктеста: --capital или 1 млн по умолчанию (как в run_backtest)
+    initial_cash = capital if capital else 1_000_000.0
     risk = RiskConfig(
         max_position_pct=config.max_position_pct,
         stop_loss_pct=config.stop_loss_pct,
@@ -280,6 +321,7 @@ def cmd_backtest(config: Config, days: int | None = None) -> int:
         min_abs_return=config.min_abs_return,
         commission_pct=config.commission_pct,
         slippage_pct=config.slippage_pct,
+        commission_min_rub=config.commission_min_rub,
         reversal_exit_mult=config.reversal_exit_mult,
         max_total_exposure_pct=config.max_total_exposure_pct,
     )
@@ -287,7 +329,6 @@ def cmd_backtest(config: Config, days: int | None = None) -> int:
     from bot import ensure_sentiments
     from nlp.agenda import sentiment_series
     from nlp.sentiment import make_sentiment
-    from tbank.market_data import load_instrument
 
     scorer = make_sentiment(config.sentiment_model, preference=config.nlp_sentiment)
     model_key = "lexicon" if getattr(scorer, "name", "") == "lexicon" else f"transformers:{config.sentiment_model}"
@@ -316,6 +357,8 @@ def cmd_backtest(config: Config, days: int | None = None) -> int:
             min_abs_return=max(risk.min_abs_return, artifact.threshold or 0.0),
         )
         header = f"{ticker} · модель {artifact.kind} · порог входа {eff_risk.min_abs_return:.4f} · лот {lot_size}"
+        if capital:
+            header += f" · капитал {ui.fmt_money(capital)} руб"
 
         # историческая серия сентимента: новостные фильтры валидируются на истории
         sent_series = None
@@ -345,9 +388,13 @@ def cmd_backtest(config: Config, days: int | None = None) -> int:
         preds_test = preds
 
         result = run_backtest(
-            df, preds_test, eff_risk, ticker=ticker, lot_size=lot_size, sentiment=sent_series
+            df, preds_test, eff_risk, ticker=ticker, lot_size=lot_size, sentiment=sent_series,
+            initial_cash=initial_cash,
         )
-        path = save_report(result, config.reports_dir, f"{ticker}_{config.candle_interval}_h{config.forecast_horizon}")
+        name = f"{ticker}_{config.candle_interval}_h{config.forecast_horizon}"
+        if capital:
+            name += f"_c{capital:g}"
+        path = save_report(result, config.reports_dir, name)
         m = result.metrics
         print(
             f"  Доходность {ui.fmt_signed(m['total_return'])} | "
@@ -441,7 +488,7 @@ def cmd_report(config: Config) -> int:
     account_id = accounts[0]["id"]
     portfolio = api.get_portfolio(account_id)
     total = portfolio["total_amount_rub"]
-    initial = config.sandbox_initial_rub
+    initial = _sandbox_budget(config)
     flows = _load_flows(config.reports_dir)
     invested = _net_invested(initial, flows)
     pnl = total - invested
@@ -708,7 +755,7 @@ def compose_digest(config: Config) -> str:
     portfolio = api.get_portfolio(account_id)
     total = portfolio["total_amount_rub"]
     flows = _load_flows(config.reports_dir)
-    invested = _net_invested(config.sandbox_initial_rub, flows)
+    invested = _net_invested(_sandbox_budget(config), flows)
     pnl = total - invested
     pnl_pct = pnl / invested if invested > 1.0 else 0.0
     lines = [
@@ -799,10 +846,11 @@ def cmd_normalize(config: Config) -> int:
     trader = Trader(api, Path(config.reports_dir) / "journal.csv")
     portfolio = trader.portfolio()
     total = portfolio["total_amount_rub"]
-    excess = total - config.sandbox_initial_rub
+    budget = _sandbox_budget(config)
+    excess = total - budget
     print(
         f"  Счёт {trader.account_id}: {ui.fmt_money(total)} руб "
-        f"(кэш {ui.fmt_money(portfolio['cash_rub'])}, бюджет {ui.fmt_money(config.sandbox_initial_rub)})"
+        f"(кэш {ui.fmt_money(portfolio['cash_rub'])}, бюджет {ui.fmt_money(budget)})"
     )
     if excess > 1.0:
         warn(
@@ -855,7 +903,7 @@ def cmd_reset_sandbox(config: Config, assume_yes: bool = False) -> int:
     )
     print(
         f"  Счёт будет ЗАКРЫТ вместе с позициями; откроется новый с бюджетом "
-        f"{ui.fmt_money(config.sandbox_initial_rub)} руб."
+        f"{ui.fmt_money(_sandbox_budget(config))} руб."
     )
     if not assume_yes:
         answer = input("  Подтвердите (YES): ").strip()
@@ -865,14 +913,14 @@ def cmd_reset_sandbox(config: Config, assume_yes: bool = False) -> int:
 
     api.close_sandbox_account(trader.account_id)
     new_account_id = api.open_sandbox_account()
-    api.pay_in(new_account_id, config.sandbox_initial_rub)
+    api.pay_in(new_account_id, _sandbox_budget(config))
 
     rotated = [
         name
         for name in ("journal.csv", "equity_live.csv", "flows.csv")
         if (archived := _rotate_report_file(Path(config.reports_dir) / name))
     ]
-    print(f"  Новый счёт: {new_account_id}, бюджет {ui.fmt_money(config.sandbox_initial_rub)} руб внесён")
+    print(f"  Новый счёт: {new_account_id}, бюджет {ui.fmt_money(_sandbox_budget(config))} руб внесён")
     if rotated:
         print(f"  Журналы старого счёта заархивированы: {', '.join(rotated)}")
     print("  Перезапустите бота, чтобы он подхватил новый счёт (например: systemctl restart tbank-bot)")
@@ -899,6 +947,10 @@ def main() -> int:
         help="порог устаревания отметок живости, минут (watchdog)",
     )
     parser.add_argument(
+        "--capital", type=float, default=None,
+        help="размер счёта, руб: фильтр тикеров по лоту и бэктест на этой сумме (train, backtest)",
+    )
+    parser.add_argument(
         "--restart", action="store_true",
         help="перезапустить systemd-юнит tbank-bot при зависании (watchdog)",
     )
@@ -922,9 +974,9 @@ def main() -> int:
     if args.command == "news":
         return cmd_news(config)
     if args.command == "train":
-        return cmd_train(config)
+        return cmd_train(config, args.capital)
     if args.command == "backtest":
-        return cmd_backtest(config, args.days)
+        return cmd_backtest(config, args.days, args.capital)
     if args.command == "run":
         return cmd_run(config, args.iterations)
     if args.command == "report":
