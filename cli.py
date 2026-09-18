@@ -1,19 +1,25 @@
-"""CLI торгового бота: download / news / train / backtest / run / report / normalize / smoke.
+"""CLI торгового бота: setup / smoke / download / news / train / backtest / run / report / status.
 
 Примеры:
-    python cli.py smoke                 # проверка токена, счёта и API
-    python cli.py download --days 720   # выгрузка истории свечей
-    python cli.py news                  # выгрузка новостей
-    python cli.py train                 # сравнение моделей, выбор лучшей
-    python cli.py train --capital 30000 # то же, но с фильтром тикеров по лоту под капитал
-    python cli.py backtest              # бэктест стратегии с лучшей моделью
+    python cli.py setup                  # первый запуск: smoke → download → news → train → backtest
+    python cli.py status                 # офлайн-сводка: конфиг, данные, модели, живость
+    python cli.py smoke                  # проверка токена, счёта и API
+    python cli.py download --days 720    # выгрузка истории свечей
+    python cli.py news                   # выгрузка новостей
+    python cli.py train                  # сравнение моделей, выбор лучшей
+    python cli.py train --capital 30000  # то же, но с фильтром тикеров по лоту под капитал
+    python cli.py backtest               # бэктест стратегии с лучшей моделью
     python cli.py backtest --capital 30000  # бэктест на счёте 30 тыс. руб
-    python cli.py run                   # торговый цикл в sandbox
-    python cli.py report                # состояние счёта и журнал сделок
-    python cli.py watchdog --restart    # проверка живости бота (для cron)
-    python cli.py digest                # письмо-дайджест состояния (для cron)
-    python cli.py normalize             # проверить счёт на соответствие бюджету
-    python cli.py reset-sandbox         # пересоздать sandbox-счёт с бюджетом
+    python cli.py run                    # торговый цикл в sandbox
+    python cli.py run --iterations 5     # пробный запуск, 5 итераций
+    python cli.py report                 # состояние счёта и журнал сделок
+    python cli.py watchdog --restart     # проверка живости бота (для cron)
+    python cli.py digest                 # письмо-дайджест состояния (для cron)
+    python cli.py send-test-email        # проверка SMTP-настроек
+    python cli.py normalize              # проверить счёт на соответствие бюджету
+    python cli.py reset-sandbox          # пересоздать sandbox-счёт с бюджетом
+
+Флаги команды: python cli.py <command> --help.
 """
 from __future__ import annotations
 
@@ -22,6 +28,7 @@ import csv
 import datetime as dt
 import json
 import logging
+import logging.handlers
 import sys
 from dataclasses import replace
 from pathlib import Path
@@ -54,6 +61,8 @@ from tbank.market_data import (
     store_news,
 )
 from tbank.rest import TBankRestClient
+
+__VERSION__ = "1.1.0"
 
 
 def _sandbox_budget(config) -> float:
@@ -112,10 +121,11 @@ def cmd_smoke(config: Config) -> int:
         print(f"     - {acc.get('id')} ({acc.get('type')})")
     if config.mode == "sandbox":
         if not accounts:
+            budget = _sandbox_budget(config)
             account_id = api.open_sandbox_account()
             ok(f"Открыт sandbox-счёт: {account_id}")
-            api.pay_in(account_id, 1_000_000)
-            ok("Пополнен на 1 000 000 руб")
+            api.pay_in(account_id, budget)
+            ok(f"Пополнен на {ui.fmt_money(budget)} руб (бюджет из .env)")
         else:
             account_id = accounts[0]["id"]
 
@@ -314,10 +324,10 @@ def cmd_train(config: Config, capital: float | None = None) -> int:
     return 1 if not summary else 0
 
 
-def cmd_backtest(config: Config, days: int | None = None, capital: float | None = None) -> int:
+def cmd_backtest(config: Config, capital: float | None = None) -> int:
     conn = connect(config.db_path)
-    # капитал бэктеста: --capital или 1 млн по умолчанию (как в run_backtest)
-    initial_cash = capital if capital else 1_000_000.0
+    # капитал бэктеста: --capital или бюджет счёта из .env (ACCOUNT_BUDGET_RUB/SANDBOX_INITIAL_RUB)
+    initial_cash = capital if capital else _sandbox_budget(config)
     risk = RiskConfig(
         max_position_pct=config.max_position_pct,
         stop_loss_pct=config.stop_loss_pct,
@@ -337,6 +347,7 @@ def cmd_backtest(config: Config, days: int | None = None, capital: float | None 
     scorer = make_sentiment(config.sentiment_model, preference=config.nlp_sentiment)
     model_key = "lexicon" if getattr(scorer, "name", "") == "lexicon" else f"transformers:{config.sentiment_model}"
 
+    ran = 0
     for ticker in config.tickers:
         df = load_candles(conn, ticker, config.candle_interval)
         if df.empty:
@@ -399,6 +410,7 @@ def cmd_backtest(config: Config, days: int | None = None, capital: float | None 
         if capital:
             name += f"_c{capital:g}"
         path = save_report(result, config.reports_dir, name)
+        ran += 1
         m = result.metrics
         print(
             f"  Доходность {ui.fmt_signed(m['total_return'])} | "
@@ -417,6 +429,9 @@ def cmd_backtest(config: Config, days: int | None = None, capital: float | None 
         print(f"  Отчёт: {ui.paint(str(path), ui.CYAN)}\n")
     conn.close()
     print(f"Все отчёты: {ui.paint(str(config.reports_dir), ui.CYAN)}")
+    if not ran:
+        warn("ни один тикер не прошёл бэктест (нет данных или моделей)")
+        return 1
     return 0
 
 
@@ -437,6 +452,39 @@ def cmd_run(config: Config, max_iterations: int | None) -> int:
         warn("Ни одного тикера с моделью — запуск невозможен. Сначала: python cli.py train")
         return 2
     bot.run_forever(max_iterations=max_iterations)
+    return 0
+
+
+def cmd_setup(config: Config, days: int | None = None, capital: float | None = None) -> int:
+    """Первый запуск одной командой: smoke → download → news → train → backtest.
+
+    Каждый шаг — существующая команда; при сбое установка останавливается
+    с подсказкой, как продолжить вручную с того же места.
+    """
+    steps = [
+        ("smoke", "проверка токена и API", lambda: cmd_smoke(config)),
+        ("download", "выгрузка истории свечей", lambda: cmd_download(config, days or config.history_days)),
+        ("news", "выгрузка новостей", lambda: cmd_news(config)),
+        ("train", "обучение и выбор моделей", lambda: cmd_train(config, capital)),
+        ("backtest", "бэктест стратегии", lambda: cmd_backtest(config, capital)),
+    ]
+    print(ui.header(f"SETUP · режим {config.mode} · {len(steps)} шагов"))
+    for i, (name, title, run) in enumerate(steps, 1):
+        print(f"\n{ui.header(f'ШАГ {i}/{len(steps)} · {title.upper()}')}")
+        rc = run()
+        if rc != 0:
+            warn(f"шаг «{title}» не прошёл (код {rc}) — установка остановлена")
+            print(
+                f"  Исправьте проблему и продолжите вручную: python cli.py {name}, "
+                f"затем оставшиеся шаги: {', '.join(n for n, _, _ in steps[i:])}."
+            )
+            return rc
+    print()
+    ok("Установка завершена: данные загружены, модели обучены, бэктест прошёл")
+    print(
+        "  Пробный запуск: python cli.py run --iterations 5 · постоянный: python cli.py run\n"
+        "  Мониторинг: python cli.py status / report · письмо-дайджест: python cli.py digest"
+    )
     return 0
 
 
@@ -665,6 +713,104 @@ def _print_benchmark(config: Config, equity: pd.DataFrame, bot_return: float) ->
     )
 
 
+def _model_row(config: Config, ticker: str) -> list[str] | None:
+    """Строка таблицы моделей: тип, порог, dir_acc, возраст артефакта; None — модели нет."""
+    path = artifact_path(config.models_dir, ticker, config.candle_interval, config.forecast_horizon)
+    if not path.exists():
+        return None
+    kind, threshold, dir_acc = "--", "--", "--"
+    metrics_path = path.with_name(f"metrics_{ticker}_{config.candle_interval}_h{config.forecast_horizon}.json")
+    try:
+        data = json.loads(metrics_path.read_text(encoding="utf-8"))
+        kind = str(data.get("best", "--"))
+        threshold = f"{float(data.get('threshold', 0.0)):.4f}"
+        acc = (data.get("metrics", {}).get("directional_acc", {}) or {}).get(kind)
+        if acc is not None:
+            dir_acc = f"{float(acc):.1%}"
+    except (OSError, ValueError, TypeError):
+        pass  # артефакт есть, метрики не читаются — покажем хотя бы возраст
+    age_days = (dt.datetime.now() - dt.datetime.fromtimestamp(path.stat().st_mtime)).days
+    age = "сегодня" if age_days == 0 else f"{age_days} дн."
+    return [ticker, kind, threshold, dir_acc, age]
+
+
+def cmd_status(config: Config) -> int:
+    """Офлайн-сводка без обращения к API: конфиг, покрытие данных, модели, живость."""
+    print(ui.header(f"СТАТУС · режим {config.mode} · v{__VERSION__}"))
+
+    print(ui.header("КОНФИГУРАЦИЯ"))
+    exposure = f"{config.max_total_exposure_pct:.0%}" if config.max_total_exposure_pct is not None else "без лимита"
+    print(
+        f"  Профиль капитала: {ui.paint(config.capital_profile, ui.BOLD)} · "
+        f"бюджет {ui.fmt_money(config.budget_rub)} руб\n"
+        f"  Позиция ≤ {config.max_position_pct:.0%} · экспозиция ≤ {exposure} · "
+        f"stop {config.stop_loss_pct:.0%} / take {config.take_profit_pct:.0%}\n"
+        f"  Порог входа ≥ {config.min_abs_return:.2%} · таймфрейм {config.candle_interval} · "
+        f"горизонт {config.forecast_horizon} бар.\n"
+        f"  Тикеров: {len(config.tickers)}"
+    )
+
+    print(ui.header(f"ДАННЫЕ · {config.db_path}"))
+    conn = connect(config.db_path)
+    coverage = conn.execute(
+        "SELECT ticker, COUNT(*), MIN(time), MAX(time) FROM candles "
+        "WHERE interval = ? AND ticker != '' GROUP BY ticker ORDER BY ticker",
+        (config.candle_interval,),
+    ).fetchall()
+    orphan = conn.execute(
+        "SELECT COUNT(*) FROM candles WHERE interval = ? AND ticker = ''",
+        (config.candle_interval,),
+    ).fetchone()[0]
+    news_count = conn.execute("SELECT COUNT(*) FROM news").fetchone()[0]
+    conn.close()
+    if coverage:
+        rows = [[t, f"{n}", str(lo)[:16].replace("T", " "), str(hi)[:16].replace("T", " ")] for t, n, lo, hi in coverage]
+        print(ui.render_table(["тикер", "свечей", "первая", "последняя"], rows, aligns=["l", "r", "l", "l"]))
+    else:
+        print(f"  Свечей нет — выполните `python cli.py download`")
+    if orphan:
+        print(f"  (+{orphan} свечей без тикера — старая БД, не мешают)")
+    print(f"  Новостей в БД: {news_count}" + ("" if news_count else " — выполните `python cli.py news`"))
+    missing_data = [t for t in config.tickers if t not in {row[0] for row in coverage}]
+    if missing_data:
+        warn(f"нет свечей для: {', '.join(missing_data)} — выполните `python cli.py download`")
+
+    print(ui.header(f"МОДЕЛИ · {config.models_dir}"))
+    model_rows, missing_models = [], []
+    for ticker in config.tickers:
+        row = _model_row(config, ticker)
+        if row is None:
+            missing_models.append(ticker)
+        else:
+            model_rows.append(row)
+    if model_rows:
+        print(ui.render_table(
+            ["тикер", "модель", "порог", "dir_acc", "возраст"], model_rows, aligns=["l", "l", "r", "r", "r"],
+        ))
+    if missing_models:
+        warn(f"нет моделей для: {', '.join(missing_models)} — выполните `python cli.py train`")
+    if not model_rows and not missing_models:
+        print("  Тикеры не заданы (TICKERS в .env)")
+
+    print(ui.header("ЖИВОСТЬ"))
+    last, source = _last_activity(config.reports_dir)
+    if last is not None:
+        age_min = (dt.datetime.now(dt.timezone.utc) - last).total_seconds() / 60
+        print(f"  {source}: {age_min:.0f} мин назад ({last.isoformat(timespec='seconds')})")
+    else:
+        print("  Отметок живости нет — бот ещё не запускался (reports/heartbeat, equity_live.csv)")
+    journal = Path(config.reports_dir) / "journal.csv"
+    if journal.exists():
+        with open(journal, encoding="utf-8") as f:
+            rows = list(csv.DictReader(f))
+        if rows:
+            print(f"  Сделок в журнале: {len(rows)}, последняя: {rows[-1]['time']} {rows[-1]['action']} {rows[-1]['ticker']}")
+    else:
+        print("  Журнала сделок нет — появится после первого запуска бота")
+    print(f"  Запуск бота: python cli.py run · состояние счёта: python cli.py report")
+    return 0
+
+
 def _last_activity(reports_dir: Path) -> tuple[dt.datetime | None, str]:
     """Самая свежая отметка живости: heartbeat или последняя точка equity_live.csv."""
     stamps: list[tuple[dt.datetime, str]] = []
@@ -734,10 +880,10 @@ def cmd_watchdog(config: Config, max_stale_min: int, restart: bool) -> int:
     if restart:
         import subprocess
 
-        proc = subprocess.run(["systemctl", "restart", "tbank-bot"], capture_output=True, text=True)
+        proc = subprocess.run(["systemctl", "restart", config.systemd_unit], capture_output=True, text=True)
         outcome = "ок" if proc.returncode == 0 else f"ошибка: {(proc.stderr or '').strip()[:200]}"
-        body += f"systemctl restart tbank-bot: {outcome}\n"
-        print(f"Перезапуск tbank-bot: {outcome}")
+        body += f"systemctl restart {config.systemd_unit}: {outcome}\n"
+        print(f"Перезапуск {config.systemd_unit}: {outcome}")
 
     notifier = Notifier.from_config(config)
     marker = reports / "watchdog_last_alert"
@@ -832,6 +978,26 @@ def cmd_digest(config: Config) -> int:
         ok("Дайджест отправлен")
         return 0
     warn("Не удалось отправить дайджест")
+    return 1
+
+
+def cmd_send_test_email(config: Config) -> int:
+    """Тестовое письмо: проверка SMTP-настроек без запуска бота."""
+    from notify import Notifier
+
+    notifier = Notifier.from_config(config)
+    if not notifier.enabled:
+        warn("SMTP не настроен — заполните NOTIFY_EMAIL_TO и SMTP_HOST/USER/PASSWORD в .env")
+        return 2
+    body = (
+        f"Тестовое письмо tbank-bot v{__VERSION__}.\n"
+        f"Режим: {config.mode}; тикеров: {len(config.tickers)}; таймфрейм: {config.candle_interval}.\n"
+        f"Если письмо пришло — уведомления о сделках, watchdog и дайджесты будут доставляться."
+    )
+    if notifier.send("тест уведомлений", body):
+        ok(f"Тестовое письмо отправлено на {notifier.cfg.to_addr}")
+        return 0
+    warn("Письмо не ушло — проверьте SMTP_HOST/PORT (465=SSL, 587=STARTTLS), SMTP_USER/пароль приложения")
     return 1
 
 
@@ -937,38 +1103,78 @@ def cmd_reset_sandbox(config: Config, assume_yes: bool = False) -> int:
     return 0
 
 
-OFFLINE_COMMANDS = {"train", "backtest"}
+# команды, которым не нужен токен T-Invest (офлайн или только SMTP)
+MODE_ONLY_COMMANDS = {"train", "backtest", "status", "send-test-email"}
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Торговый бот T-Invest API (sandbox) с ML-прогнозом и новостным анализом",
+    )
+    parser.add_argument("--version", action="version", version=f"%(prog)s {__VERSION__}")
+    sub = parser.add_subparsers(dest="command", required=True, metavar="command")
+
+    sub.add_parser("smoke", help="проверка токена, счёта и API (открывает и пополняет sandbox-счёт)")
+
+    p = sub.add_parser("download", help="выгрузка истории свечей в БД")
+    p.add_argument("--days", type=int, default=None, help="глубина истории в днях (по умолчанию HISTORY_DAYS из .env)")
+
+    sub.add_parser("news", help="выгрузка новостей в БД")
+
+    p = sub.add_parser("train", help="сравнение моделей, обучение и выбор лучшей")
+    p.add_argument("--capital", type=float, default=None, help="размер счёта, руб: фильтр тикеров по лоту")
+
+    p = sub.add_parser("backtest", help="бэктест стратегии с лучшей моделью")
+    p.add_argument("--capital", type=float, default=None, help="размер счёта, руб (по умолчанию бюджет из .env)")
+
+    p = sub.add_parser("run", help="торговый цикл (sandbox или real по MODE)")
+    p.add_argument("--iterations", type=int, default=None, help="число итераций цикла (пробный запуск)")
+
+    sub.add_parser("report", help="состояние счёта: P&L, позиции, сделки, кривая капитала")
+    sub.add_parser("status", help="офлайн-сводка: конфиг, данные, модели, живость (без API)")
+
+    p = sub.add_parser("watchdog", help="проверка живости бота (для cron)")
+    p.add_argument("--max-stale-min", type=int, default=20, help="порог устаревания отметок живости, минут")
+    p.add_argument("--restart", action="store_true", help=f"перезапустить systemd-юнит при зависании (имя: SYSTEMD_UNIT)")
+
+    sub.add_parser("digest", help="письмо-дайджест состояния счёта (для cron)")
+    sub.add_parser("send-test-email", help="тестовое письмо: проверка SMTP-настроек")
+    sub.add_parser("normalize", help="проверить счёт на соответствие бюджету (sandbox)")
+
+    p = sub.add_parser("reset-sandbox", help="пересоздать sandbox-счёт с бюджетом")
+    p.add_argument("--yes", action="store_true", help="не спрашивать подтверждение")
+
+    p = sub.add_parser("setup", help="первый запуск: smoke → download → news → train → backtest")
+    p.add_argument("--days", type=int, default=None, help="глубина истории свечей, дней (по умолчанию HISTORY_DAYS)")
+    p.add_argument("--capital", type=float, default=None, help="размер счёта, руб: фильтр тикеров по лоту")
+    return parser
+
+
+def _attach_file_log(config: Config) -> None:
+    """Файловый лог с ротацией (LOG_FILE в .env); без него — только stderr/journald."""
+    if config.log_file is None:
+        return
+    try:
+        config.log_file.parent.mkdir(parents=True, exist_ok=True)
+        handler = logging.handlers.RotatingFileHandler(
+            config.log_file, maxBytes=config.log_max_bytes,
+            backupCount=config.log_backups, encoding="utf-8",
+        )
+        # в файл — без ANSI-цветов и с полной датой (файл живёт дольше суток)
+        handler.setFormatter(
+            logging.Formatter("%(asctime)s %(levelname)-7s %(name)s: %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+        )
+        logging.root.addHandler(handler)
+    except OSError as exc:
+        print(f"[!!] LOG_FILE {config.log_file}: {exc} — пишу только в консоль", file=sys.stderr)
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Торговый бот T-Invest API (sandbox) с ML-прогнозом и новостным анализом")
-    parser.add_argument(
-        "command",
-        choices=[
-            "smoke", "download", "news", "train", "backtest", "run",
-            "report", "watchdog", "digest", "normalize", "reset-sandbox",
-        ],
-    )
-    parser.add_argument("--days", type=int, default=None, help="глубина истории в днях (download)")
-    parser.add_argument("--iterations", type=int, default=None, help="число итераций цикла (run)")
-    parser.add_argument("--yes", action="store_true", help="не спрашивать подтверждение (reset-sandbox)")
-    parser.add_argument(
-        "--max-stale-min", type=int, default=20,
-        help="порог устаревания отметок живости, минут (watchdog)",
-    )
-    parser.add_argument(
-        "--capital", type=float, default=None,
-        help="размер счёта, руб: фильтр тикеров по лоту и бэктест на этой сумме (train, backtest)",
-    )
-    parser.add_argument(
-        "--restart", action="store_true",
-        help="перезапустить systemd-юнит tbank-bot при зависании (watchdog)",
-    )
-    args = parser.parse_args()
+    args = _build_parser().parse_args()
 
     config = Config()
     try:
-        if args.command in OFFLINE_COMMANDS:
+        if args.command in MODE_ONLY_COMMANDS:
             if config.mode not in {"sandbox", "real"}:
                 raise ValueError(f"MODE должен быть sandbox|real, получено: {config.mode}")
         else:
@@ -976,7 +1182,10 @@ def main() -> int:
     except ValueError as exc:
         print(f"[!!] Конфигурация: {exc}", file=sys.stderr)
         return 2
+    _attach_file_log(config)
 
+    if args.command == "setup":
+        return cmd_setup(config, args.days, args.capital)
     if args.command == "smoke":
         return cmd_smoke(config)
     if args.command == "download":
@@ -986,15 +1195,19 @@ def main() -> int:
     if args.command == "train":
         return cmd_train(config, args.capital)
     if args.command == "backtest":
-        return cmd_backtest(config, args.days, args.capital)
+        return cmd_backtest(config, args.capital)
     if args.command == "run":
         return cmd_run(config, args.iterations)
     if args.command == "report":
         return cmd_report(config)
+    if args.command == "status":
+        return cmd_status(config)
     if args.command == "watchdog":
         return cmd_watchdog(config, args.max_stale_min, args.restart)
     if args.command == "digest":
         return cmd_digest(config)
+    if args.command == "send-test-email":
+        return cmd_send_test_email(config)
     if args.command == "normalize":
         return cmd_normalize(config)
     if args.command == "reset-sandbox":

@@ -1,0 +1,22 @@
+# systemd-юнит торгового бота.
+# Установка: deploy/install.sh подставит путь проекта сам (метка __APP_DIR__).
+# Вручную: скопируйте в /etc/systemd/system/tbank-bot.service, замените __APP_DIR__
+# на каталог проекта, затем: systemctl daemon-reload && systemctl enable --now tbank-bot
+[Unit]
+Description=T-Bank sandbox trading bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+WorkingDirectory=__APP_DIR__
+ExecStart=__APP_DIR__/.venv/bin/python cli.py run
+Restart=always
+RestartSec=30
+# Лог пишется в journald (journalctl -u tbank-bot -f).
+# Файловый лог с ротацией проще включить через LOG_FILE=var/bot.log в .env —
+# либо раскомментируйте (без ротации, следите за размером):
+# StandardOutput=append:__APP_DIR__/var/bot.log
+# StandardError=append:__APP_DIR__/var/bot.log
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,16 @@
+# Cron-расписание бота. Установка: `crontab -e` от пользователя, под которым работает
+# сервис (root — по умолчанию), и вставьте нужные строки, поправив путь к проекту
+# (здесь /root/tbank-trading-bot) и имя юнита, если переименовали (SYSTEMD_UNIT).
+# Полное описание: DEPLOY.md §3.6 (переобучение), §3.8 (watchdog, дайджест).
+
+# Еженедельно (суббота 06:00 по времени сервера): обновить историю, переобучить
+# модели, перезапустить бота — он кэширует артефакты в памяти до рестарта.
+0 6 * * 6 cd /root/tbank-trading-bot && .venv/bin/python cli.py download --days 720 >> var/retrain.log 2>&1 && .venv/bin/python cli.py train >> var/retrain.log 2>&1 && systemctl restart tbank-bot >> var/retrain.log 2>&1
+
+# Каждые 10 минут: живость бота в открытую сессию (+автоперезапуск при зависании).
+# Уберите --restart, если автоперезапуск не нужен.
+*/10 * * * * cd /root/tbank-trading-bot && .venv/bin/python cli.py watchdog --restart >> var/watchdog.log 2>&1
+
+# Дайджест дня после закрытия основной сессии MOEX (19:10 МСК — поправьте,
+# если часовой пояс сервера не MSK).
+10 19 * * 1-5 cd /root/tbank-trading-bot && .venv/bin/python cli.py digest >> var/digest.log 2>&1

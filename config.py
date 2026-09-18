@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -9,6 +10,11 @@ from dotenv import load_dotenv
 
 BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR / ".env")
+
+
+def _env_warn(name: str, raw: str, default) -> None:
+    """Опечатка в .env не должна проходить молча (например, '0,2' вместо '0.2')."""
+    print(f"[!] .env: {name}={raw!r} — значение не распознано, использую дефолт {default!r}", file=sys.stderr)
 
 
 def _env_list(name: str, default: list[str]) -> list[str]:
@@ -19,24 +25,42 @@ def _env_list(name: str, default: list[str]) -> list[str]:
 
 
 def _env_float(name: str, default: float) -> float:
+    raw = os.getenv(name)
+    if raw is None or raw == "":
+        return default
     try:
-        return float(os.getenv(name, default))
+        return float(raw)
     except ValueError:
+        _env_warn(name, raw, default)
         return default
 
 
 def _env_int(name: str, default: int) -> int:
-    try:
-        return int(os.getenv(name, default))
-    except ValueError:
+    raw = os.getenv(name)
+    if raw is None or raw == "":
         return default
+    try:
+        return int(raw)
+    except ValueError:
+        _env_warn(name, raw, default)
+        return default
+
+
+_TRUE_VALUES = {"1", "true", "on", "yes"}
+_FALSE_VALUES = {"0", "false", "off", "no"}
 
 
 def _env_bool(name: str, default: bool) -> bool:
     raw = os.getenv(name)
     if raw is None or raw == "":
         return default
-    return raw.strip().lower() not in {"0", "false", "off", "no"}
+    value = raw.strip().lower()
+    if value in _TRUE_VALUES:
+        return True
+    if value in _FALSE_VALUES:
+        return False
+    _env_warn(name, raw, default)
+    return default
 
 
 def _env_float_opt(name: str) -> float | None:
@@ -46,6 +70,7 @@ def _env_float_opt(name: str) -> float | None:
     try:
         return float(raw)
     except ValueError:
+        _env_warn(name, raw, "пропущено")
         return None
 
 
@@ -154,10 +179,17 @@ class Config:
     # lexicon (принудительно офлайн) | transformer (паднуть, если трансформер недоступен)
     nlp_sentiment: str = field(default_factory=lambda: os.getenv("NLP_SENTIMENT", "auto").lower())
     # Эмбеддеры повестки: 0 — отключить (экономит ~450 МБ RAM, кластеризация тем off)
-    nlp_embedder: bool = field(
-        default_factory=lambda: os.getenv("NLP_EMBEDDER", "1").strip().lower()
-        not in {"0", "false", "off", "no"}
+    nlp_embedder: bool = field(default_factory=lambda: _env_bool("NLP_EMBEDDER", True))
+
+    # --- Сервис (systemd / логи) ---
+    # имя systemd-юнита для watchdog --restart (см. deploy/tbank-bot.service)
+    systemd_unit: str = field(default_factory=lambda: os.getenv("SYSTEMD_UNIT", "tbank-bot").strip() or "tbank-bot")
+    # файловый лог с ротацией (пусто — только stderr/journald, как раньше)
+    log_file: Path | None = field(
+        default_factory=lambda: (BASE_DIR / raw) if (raw := os.getenv("LOG_FILE", "").strip()) else None
     )
+    log_max_bytes: int = field(default_factory=lambda: _env_int("LOG_MAX_BYTES", 10 * 1024 * 1024))
+    log_backups: int = field(default_factory=lambda: _env_int("LOG_BACKUPS", 5))
 
     @property
     def is_sandbox(self) -> bool:

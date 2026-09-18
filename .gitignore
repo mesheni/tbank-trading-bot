@@ -9,6 +9,7 @@ __pycache__/
 data/
 models_artifacts/
 reports/
+reports_verify/
 var/
 .pytest_cache/
 .vs/

@@ -54,6 +54,11 @@ copy .env.example .env
 
 ## 3. Запуск на удалённом сервере (Linux VPS) — под root
 
+> **Быстрый путь:** разделы §3.1–3.5 делает одна команда —
+> `sudo deploy/install.sh` (поставит apt-зависимости, создаст venv, скопирует systemd-юнит
+> и включит автозапуск; шаги ниже — то же самое вручную, для понимания и нестандартных случаев).
+> Cron-строки из §3.6/§3.8 лежат готовым файлом в `deploy/tbank-bot.cron`.
+
 > **Важно про venv:** виртуальное окружение хранит абсолютные пути. Если проект переезжает в
 > другой каталог — venv пересоздаётся (`rm -rf .venv && python3 -m venv .venv` + установка
 > зависимостей). Скопированный из другого места venv не работает (`bad interpreter`).
@@ -109,10 +114,18 @@ sudo update-ca-certificates
 Проверка связи:
 
 ```bash
-.venv/bin/python cli.py smoke
+.venv/bin/python cli.py smoke      # или короче: ./tbank.sh smoke
 ```
 
 ### 3.4 Данные и обучение
+
+Всё одной командой (проверка связи → свечи → новости → обучение → бэктест):
+
+```bash
+./tbank.sh setup
+```
+
+или по шагам:
 
 ```bash
 .venv/bin/python cli.py download --days 720
@@ -125,7 +138,18 @@ sudo update-ca-certificates
 
 ### 3.5 Постоянная работа через systemd
 
-Создайте юнит `nano /etc/systemd/system/tbank-bot.service`:
+Готовый юнит лежит в репозитории: `deploy/tbank-bot.service`. Установка вручную:
+
+```bash
+sed "s|__APP_DIR__|/root/tbank-trading-bot|g" deploy/tbank-bot.service > /etc/systemd/system/tbank-bot.service
+mkdir -p /root/tbank-trading-bot/var
+systemctl daemon-reload
+systemctl enable --now tbank-bot
+systemctl status tbank-bot --no-pager   # состояние
+journalctl -u tbank-bot -f              # живой лог (q — выйти)
+```
+
+(то же содержимое, для справки — как выглядит юнит; `deploy/install.sh` делает это сам):
 
 ```ini
 [Unit]
@@ -148,13 +172,15 @@ WantedBy=multi-user.target
 
 Строка `User=` не нужна — сервис работает от root (владельца файлов).
 
-```bash
-mkdir -p /root/tbank-trading-bot/var
-systemctl daemon-reload
-systemctl enable --now tbank-bot
-systemctl status tbank-bot --no-pager   # состояние
-journalctl -u tbank-bot -f              # живой лог (q — выйти)
+Файловый лог с ротацией (альтернатива journald): задайте в `.env`
+
+```ini
+LOG_FILE=var/bot.log        # ротация 10 МБ × 5 файлов (LOG_MAX_BYTES / LOG_BACKUPS)
 ```
+
+— бот сам будет дублировать лог в файл; systemd-параметры `StandardOutput` при этом не нужны.
+Если переименовали юнит — укажите то же имя в `.env` (`SYSTEMD_UNIT=my-bot`), чтобы
+`watchdog --restart` перезапускал правильный сервис.
 
 `Restart=always` переживёт перезагрузку сервера и сетевые сбои: вне торговой сессии бот сам спит,
 ошибки итерации логируются и не останавливают цикл. Остановка: `systemctl stop tbank-bot`.
@@ -170,7 +196,8 @@ tmux new -s bot '.venv/bin/python cli.py run 2>&1 | tee -a var/bot.log'
 ### 3.6 Плановое переобучение (cron)
 
 Раз в неделю ночью: обновить историю → переобучить → перезапустить бота (он кэширует артефакты
-в памяти до рестарта). Cron создаётся в расписании **root** (`crontab -e`), без sudo:
+в памяти до рестарта). Cron создаётся в расписании **root** (`crontab -e`), без sudo.
+Готовые строки (переобучение + watchdog + дайджест) — в `deploy/tbank-bot.cron`:
 
 ```
 0 6 * * 6 cd /root/tbank-trading-bot && .venv/bin/python cli.py download --days 720 >> var/retrain.log 2>&1 && .venv/bin/python cli.py train >> var/retrain.log 2>&1 && systemctl restart tbank-bot >> var/retrain.log 2>&1
@@ -268,11 +295,12 @@ echo '/swapfile none swap sw 0 0' >> /etc/fstab
 
 | Что | Команда / файл |
 |---|---|
+| Сводка без API: конфиг, данные, модели, живость | `./tbank.sh status` |
 | Капитал, P&L, позиции, сделки, vs buy&hold | `/root/tbank-trading-bot/.venv/bin/python cli.py report` |
 | Кривая капитала | `reports/equity_live.csv` (растёт после каждой итерации) |
 | Отметка живости | `reports/heartbeat` (обновляется каждой успешной итерацией) |
 | Журнал сделок с причинами | `reports/journal.csv` |
-| Живой лог | `journalctl -u tbank-bot -f` |
+| Живой лог | `journalctl -u tbank-bot -f` (или файл `var/bot.log` при `LOG_FILE`) |
 | Состояние сервиса | `systemctl status tbank-bot --no-pager` |
 
 Удобно забирать `reports/*.csv` на локальную машину по scp и смотреть в Excel.
@@ -292,6 +320,7 @@ SMTP_PASSWORD=пароль-приложения   # не пароль аккау
 
 Пустой `NOTIFY_EMAIL_TO` — уведомления выключены, бот работает как раньше.
 Пароль приложения: Яндекс → «Безопасность» → «Пароли приложений».
+Проверка настроек одной командой (без запуска бота): `./tbank.sh send-test-email`.
 
 #### Watchdog: защита от «тихой смерти»
 
@@ -397,11 +426,12 @@ systemctl restart tbank-bot
 ## 6. Краткий чек-лист деплоя (root)
 
 1. VPS (лучше в РФ — ниже пинг к API; НУЦ-сертификаты в `certs/`).
-2. `apt install python3-venv python3-pip libgomp1`.
-3. Проект в `/root/tbank-trading-bot`, venv пересоздан на месте, `.env` с токеном, `chmod 600`.
-4. `cli.py smoke` → `download` → `news` → `train` → `backtest`.
-5. systemd-юнит (root, `/root/...` пути, без `User=`) → `daemon-reload` → `enable --now` → `journalctl -f`.
-6. Cron root: еженедельные `download` + `train` + `systemctl restart tbank-bot`; watchdog
-   каждые 10 минут и дневной дайджест (§3.8); при желании — SMTP-уведомления в `.env`.
-7. Раз в день: письмо-дайджест (если настроен) или `cli.py report` (или смотреть
-   `journal.csv` / `equity_live.csv`).
+2. Проект в `/root/tbank-trading-bot`, затем `sudo deploy/install.sh` (apt-зависимости,
+   venv, systemd-юнит, автозапуск) — или шаги 3–5 вручную.
+3. `.env` с токеном, `chmod 600`.
+4. `./tbank.sh setup` — smoke → download → news → train → backtest одной командой.
+5. `systemctl start tbank-bot` → `journalctl -u tbank-bot -f`.
+6. Cron root (готовый файл `deploy/tbank-bot.cron`): еженедельные `download` + `train` +
+   `systemctl restart tbank-bot`; watchdog каждые 10 минут и дневной дайджест (§3.8);
+   при желании — SMTP-уведомления в `.env` (проверка: `./tbank.sh send-test-email`).
+7. Раз в день: письмо-дайджест (если настроен) или `./tbank.sh report` / `./tbank.sh status`.
