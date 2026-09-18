@@ -35,6 +35,19 @@ METRIC_KEYS = ("rmse", "mae", "directional_acc", "strategy_sharpe", "strategy_sh
 NON_SELECTABLE = ("naive_zero",)
 
 
+def selectable_models(metrics: pd.DataFrame) -> pd.DataFrame:
+    """Кандидаты на выбор лучшей модели.
+
+    Кроме эталона naive_zero исключаются модели с неизмеренной directional_acc
+    (NaN): их walk-forward прогнозы нулевые или пустые, информации о направлении
+    нет, а strategy_sharpe_net при этом ровно 0.0 — такой «ноль» выигрывал отбор
+    у моделей с честным отрицательным результатом (регрессия live-прогона
+    09-18.09.2026: best=arima с dir_acc=NaN по всем 16 тикерам заморозил входы).
+    """
+    out = metrics.drop(index=[m for m in NON_SELECTABLE if m in metrics.index])
+    return out[out["directional_acc"].notna()]
+
+
 def model_factories(horizon: int) -> dict:
     """Имя бейзлайна -> фабрика модели. Единый источник для train/backtest/live:
     имя из артефакта обязано резолвиться здесь, без дублирования словарей."""
@@ -243,7 +256,12 @@ def train_and_save(
     """
     metrics, results = evaluate_all(candles, horizon, test_frac=test_frac, round_trip_cost=cost_floor)
 
-    selectable = metrics.drop(index=[m for m in NON_SELECTABLE if m in metrics.index])
+    selectable = selectable_models(metrics)
+    if selectable.empty:
+        raise ValueError(
+            f"{ticker}: ни у одной модели не измерена directional_acc (walk-forward "
+            "прогнозы нулевые или пустые) — артефакт не сохраняется"
+        )
     scores = selectable["strategy_sharpe_net"].astype(float).fillna(float("-inf"))
     if scores.isin([float("-inf")]).all():
         raise ValueError(

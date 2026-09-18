@@ -276,16 +276,20 @@ def cmd_train(config: Config, capital: float | None = None) -> int:
                         f"— пропускаем"
                     )
                     continue
-        trained.append(ticker)
         print(ui.header(f"{ticker} · {len(df)} свечей · горизонт {config.forecast_horizon} бар(а)"))
         round_trip = 2 * (config.commission_pct + config.slippage_pct)
         metrics, _ = evaluate_all(df, config.forecast_horizon, round_trip_cost=round_trip)
         # таблицу печатаем до/после логов train_and_save; выбор там — по net sharpe
         print(_render_metrics_table(metrics, metrics["strategy_sharpe_net"].idxmax()))
-        artifact = train_and_save(
-            df, config.forecast_horizon, config.models_dir, ticker, config.candle_interval,
-            cost_floor=2 * (config.commission_pct + config.slippage_pct),
-        )
+        try:
+            artifact = train_and_save(
+                df, config.forecast_horizon, config.models_dir, ticker, config.candle_interval,
+                cost_floor=2 * (config.commission_pct + config.slippage_pct),
+            )
+        except ValueError as exc:
+            warn(f"{ticker}: {exc} — тикер пропущен, старый артефакт (если был) не тронут")
+            continue
+        trained.append(ticker)
         summary[ticker] = {"best": artifact.kind, **artifact.metrics}
         best = ui.paint(artifact.kind, ui.BRIGHT_GREEN, ui.BOLD)
         sharpe = ui.fmt_signed(artifact.metrics.get("strategy_sharpe_net", 0.0), "{:+.2f}")
@@ -559,10 +563,16 @@ def cmd_report(config: Config) -> int:
             avg = pos["average_position_price"]
             cur = pos["current_price"]
             pnl_pos = (cur / avg - 1) if avg > 0 and cur > 0 else 0.0
+            # API отдаёт количество в штуках; лоты показываем рядом, чтобы
+            # расхождение «штуки vs лоты» было видно сразу
+            name = figi_ticker.get(figi, figi)
+            lot = lot_by_ticker.get(name)
+            lots_str = f"{pos['quantity'] / lot:.0f}" if lot else "--"
             rows.append(
                 [
-                    figi_ticker.get(figi, figi),
+                    name,
                     f"{pos['quantity']:.0f} шт",
+                    lots_str,
                     f"{avg:.2f}",
                     f"{cur:.2f}",
                     ui.fmt_signed(pnl_pos),
@@ -570,9 +580,9 @@ def cmd_report(config: Config) -> int:
             )
 
         print(ui.render_table(
-            ["инструмент", "кол-во", "ср. цена", "текущая", "PnL"],
+            ["инструмент", "кол-во", "лотов", "ср. цена", "текущая", "PnL"],
             rows,
-            aligns=["l", "r", "r", "r", "r"],
+            aligns=["l", "r", "r", "r", "r", "r"],
         ))
 
     print(ui.header("СДЕЛКИ"))

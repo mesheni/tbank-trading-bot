@@ -35,6 +35,22 @@ def test_arima_and_ets_small(candles):
     assert np.isfinite(ets.predict())
 
 
+def test_arima_ets_forecast_with_microsecond_datetime_index(candles):
+    # регрессия live-прогона 09-18.09.2026: pandas 2.x отдаёт из SQLite индекс
+    # datetime64[us], statsmodels на нём молча валит forecast/fit («No supported
+    # index is available») — ARIMA и ETS возвращали сплошные 0.0, у всех моделей
+    # dir_acc становился NaN, а «нулевые» модели выигрывали отбор
+    close = candles["close"].iloc[-400:].copy()
+    close.index = close.index.astype("datetime64[us, UTC]")
+    assert str(close.index.dtype) == "datetime64[us, UTC]"
+
+    arima = ARIMAReturn(horizon=1, p_max=1, q_max=1).fit(close)
+    assert arima.predict() != 0.0
+
+    ets = ETSReturn(horizon=1).fit(close)
+    assert ets.predict() != 0.0
+
+
 def test_lgbm_fit_predict(candles):
     features = build_features(candles, horizon=1)
     for col in ("news_sentiment_24h", "news_sentiment_72h", "news_count_24h"):
@@ -125,6 +141,56 @@ def test_train_never_selects_naive_zero(tmp_path, candles):
 
     loaded = load_artifact(tmp_path, "TEST", "hour", 1)
     assert loaded.threshold == artifact.threshold
+
+
+def _degenerate_metrics() -> pd.DataFrame:
+    """Таблица как из live-прогона 09-18.09.2026: у arima/ets/naive_zero walk-forward
+    прогнозы сплошные нули (dir_acc NaN, net sharpe ровно 0.0), у остальных —
+    честный отрицательный net sharpe."""
+    return pd.DataFrame(
+        {
+            "rmse": {"naive_zero": 0.006, "arima": 0.006, "ets": 0.006, "lgbm": 0.005},
+            "mae": {"naive_zero": 0.004, "arima": 0.004, "ets": 0.004, "lgbm": 0.003},
+            "directional_acc": {"naive_zero": np.nan, "arima": np.nan, "ets": np.nan, "lgbm": 0.51},
+            "strategy_sharpe": {"naive_zero": 0.0, "arima": 0.0, "ets": 0.0, "lgbm": 0.2},
+            "strategy_sharpe_net": {"naive_zero": 0.0, "arima": 0.0, "ets": 0.0, "lgbm": -0.3},
+            "n_points": {"naive_zero": 100.0, "arima": 100.0, "ets": 100.0, "lgbm": 100.0},
+        }
+    )
+
+
+def test_selection_ignores_zero_prediction_models_with_nan_dir_acc(tmp_path, monkeypatch, candles):
+    # раньше «нулевой» arima выигрывал отбор (0.0 > -0.3) и гейтил всю торговлю
+    import models.registry as registry
+
+    metrics = _degenerate_metrics()
+    zero_preds = pd.Series(0.0, index=candles.index[-100:])
+    results = {
+        name: registry.WalkForwardResult(zero_preds, zero_preds, metrics.loc[name].to_dict())
+        for name in metrics.index
+    }
+    monkeypatch.setattr(registry, "evaluate_all", lambda *a, **k: (metrics, results))
+
+    artifact = registry.train_and_save(candles.iloc[-500:], 1, tmp_path, "TEST", "hour")
+
+    # выбирается единственная модель с измеренным направлением, не «нулевой» arima
+    assert artifact.kind == "lgbm"
+
+
+def test_train_raises_when_no_model_has_measured_direction(tmp_path, monkeypatch, candles):
+    import models.registry as registry
+
+    metrics = _degenerate_metrics()
+    metrics.loc["lgbm", "directional_acc"] = np.nan  # и у lgbm направление не измерено
+    zero_preds = pd.Series(0.0, index=candles.index[-100:])
+    results = {
+        name: registry.WalkForwardResult(zero_preds, zero_preds, metrics.loc[name].to_dict())
+        for name in metrics.index
+    }
+    monkeypatch.setattr(registry, "evaluate_all", lambda *a, **k: (metrics, results))
+
+    with pytest.raises(ValueError, match="directional_acc"):
+        registry.train_and_save(candles.iloc[-500:], 1, tmp_path, "TEST", "hour")
 
 
 def test_train_and_save(tmp_path, candles):

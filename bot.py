@@ -47,6 +47,11 @@ log = logging.getLogger(__name__)
 # Расписание MOEX по умолчанию (если TradingSchedules недоступен): основная сессия
 DEFAULT_SESSION = (dt.time(9, 50), dt.time(18, 50))
 
+# Столько подряд неудачных продаж позиции — критический сигнал: стоп не может
+# исполниться (регрессия 09-18.09.2026: лотность позиции была завышена в 10 раз,
+# биржа отклоняла заявки 9 дней, никто не замечал)
+FAILED_SELL_ESCALATION = 3
+
 
 class SessionCalendar:
     """Торговый календарь MOEX: интервалы из TradingSchedules + фиксированный фолбэк.
@@ -163,6 +168,8 @@ class TradingBot:
         self._running = False
         # kill-switch по просадке: False = новых входов нет, выходы работают
         self._entries_allowed = True
+        # подряд неудачные продажи по figi: эскалация шума после FAILED_SELL_ESCALATION
+        self._sell_failures: dict[str, int] = {}
         # бюджет счёта (якорь kill-switch и P&L); уточняется при старте цикла
         self._budget_rub: float | None = getattr(config, "account_budget_rub", None)
 
@@ -243,16 +250,23 @@ class TradingBot:
         return artifact
 
     def _model_allowed(self, ticker: str, artifact: ModelArtifact) -> bool:
-        """Гейт качества модели: без подтверждённого направления — новых входов нет.
+        """Гейт качества модели: без подтверждённого преимущества — новых входов нет.
 
         Открытые позиции обслуживаются как обычно (стопы/тейки/выход по развороту);
-        гейт блокирует только открытие новых позиций. Модели без замеренной
-        directional_acc (NaN) тоже не допускаются: нет доказательств преимущества.
+        гейт блокирует только открытие новых позиций. Модель допускается, если у неё
+        либо измеренный dir_acc >= MIN_MODEL_DIR_ACC, либо положительный edge после
+        издержек (strategy_sharpe_net > 0) — тот же критерий, по которому модель
+        выбирается при обучении. Метрики NaN/отсутствие доказательств — не допуск.
         """
         dir_acc = artifact.metrics.get("directional_acc")
-        if dir_acc is None or pd.isna(dir_acc):
-            return False
-        return float(dir_acc) >= self.config.min_model_dir_acc
+        if (
+            dir_acc is not None
+            and not pd.isna(dir_acc)
+            and float(dir_acc) >= self.config.min_model_dir_acc
+        ):
+            return True
+        net = artifact.metrics.get("strategy_sharpe_net")
+        return net is not None and not pd.isna(net) and float(net) > 0.0
 
     def predict(self, ticker: str, candles: pd.DataFrame, agenda: AgendaScore) -> tuple[float, float]:
         """Возвращает (прогноз доходности на горизонт, новостной скор)."""
@@ -278,6 +292,11 @@ class TradingBot:
         self, ticker: str, instrument: dict, portfolio: PortfolioState, entries_allowed: bool = True
     ) -> None:
         figi = instrument["figi"]
+        # оффлайн-тесты собирают бот через __new__ без __init__ — счётчик ленивый
+        if "_sell_failures" not in self.__dict__:
+            self._sell_failures = {}
+        if figi not in portfolio.positions:
+            self._sell_failures.pop(figi, None)
         artifact = self._artifact(ticker)
         if not entries_allowed and figi not in portfolio.positions:
             # kill-switch: просадка глубже MAX_DRAWDOWN_PCT — капитал сохраняем,
@@ -286,11 +305,15 @@ class TradingBot:
             return
         if figi not in portfolio.positions and not self._model_allowed(ticker, artifact):
             dir_acc = artifact.metrics.get("directional_acc")
+            net = artifact.metrics.get("strategy_sharpe_net")
+            fmt = lambda v: "n/a" if v is None or pd.isna(v) else f"{float(v):+.3f}"
             log.info(
-                "%-5s пропуск: модель %s, dir_acc=%s < %.2f (MIN_MODEL_DIR_ACC) — новых входов нет",
+                "%-5s пропуск: модель %s без подтверждённого преимущества "
+                "(dir_acc=%s, net_sharpe=%s; порог dir_acc %.2f или net > 0) — новых входов нет",
                 ticker,
                 artifact.kind,
-                "n/a" if dir_acc is None or pd.isna(dir_acc) else f"{dir_acc:.3f}",
+                fmt(dir_acc),
+                fmt(net),
                 self.config.min_model_dir_acc,
             )
             return
@@ -362,16 +385,36 @@ class TradingBot:
             executed = max(0, min(int(state.get("lots_executed") or 0), position.lots))
             exec_price = float(state.get("avg_exec_price") or 0.0) or price
             if executed <= 0:
+                fails = self._sell_failures.get(figi, 0) + 1
+                self._sell_failures[figi] = fails
                 log.warning(
                     "%s: продажа не исполнена (статус %s) — позиция остаётся",
                     ticker, state.get("status") or "неизвестен",
                 )
-                self.notifier.send_throttled(
-                    f"order-not-filled:{ticker}", f"заявка SELL {ticker} не исполнена",
-                    f"Статус: {state.get('status') or 'неизвестен'}\n"
-                    f"Пробовали продать {position.lots} лот(ов) по {price:.2f}\nПричина решения: {decision.reason}",
-                )
+                if fails >= FAILED_SELL_ESCALATION:
+                    pnl_pct = price / position.avg_price - 1.0 if position.avg_price > 0 else 0.0
+                    log.error(
+                        "%s: %d подряд неудачных продаж (статус %s): %d лот(ов), pnl %+.2f%% — "
+                        "стоп/выход физически не исполняется, требуется ручная проверка счёта",
+                        ticker, fails, state.get("status") or "неизвестен", position.lots, pnl_pct * 100,
+                    )
+                    self.notifier.send_throttled(
+                        f"sell-stuck:{ticker}", f"позиция {ticker} не продаётся",
+                        f"{fails} подряд неудачных попыток продажи "
+                        f"(статус {state.get('status') or 'неизвестен'}).\n"
+                        f"Держим {position.lots} лот(ов) × {position.avg_price:.2f}, "
+                        f"pnl {pnl_pct:+.2%}\nПричина решения: {decision.reason}\n"
+                        f"Последняя ошибка: {state.get('message') or 'нет деталей'}\n"
+                        "Стоп-лосс не может исполниться — проверьте счёт вручную.",
+                    )
+                else:
+                    self.notifier.send_throttled(
+                        f"order-not-filled:{ticker}", f"заявка SELL {ticker} не исполнена",
+                        f"Статус: {state.get('status') or 'неизвестен'}\n"
+                        f"Пробовали продать {position.lots} лот(ов) по {price:.2f}\nПричина решения: {decision.reason}",
+                    )
             else:
+                self._sell_failures.pop(figi, None)
                 if executed < position.lots:
                     log.warning(
                         "%s: частичная продажа: %d из %d лотов, остаток держим",
@@ -569,10 +612,12 @@ class TradingBot:
         for figi, pos in raw["positions"].items():
             instrument = next((i for i in self.instruments.values() if i["figi"] == figi), None)
             ticker = (instrument.get("ticker") or figi) if instrument else figi
+            lot = int(instrument.get("lot", 1)) if instrument else 1
             if pos["quantity"] > 0:
                 positions[figi] = Position(
-                    # дробные количества (корп. действия) округляются до целых лотов/штук
-                    figi, ticker, int(round(pos["quantity"])), int(instrument.get("lot", 1)) if instrument else 1,
+                    # API отдаёт количество в ШТУКАХ, а стратегии/ордерам нужны ЛОТЫ;
+                    # дробный остаток (корп. действия) округляется вниз до целого лота
+                    figi, ticker, int(pos["quantity"] // lot), lot,
                     pos["average_position_price"] or pos["current_price"],
                 )
         return PortfolioState(cash=raw["cash_rub"], equity=raw["total_amount_rub"], positions=positions)

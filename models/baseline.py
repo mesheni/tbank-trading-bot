@@ -87,6 +87,10 @@ class ARIMAReturn:
         if len(rets) < 30:
             self._order, self._params = (1, 0, 0), None
             return self
+        # statsmodels не поддерживает DatetimeIndex в разрешении микросекунд
+        # (pandas 2.x из SQLite): «No supported index is available» на forecast —
+        # индекс фону не нужен, передаём чистые значения
+        rets = pd.Series(rets.to_numpy(dtype=float))
 
         best_aic, best_order, best_res = np.inf, (1, 0, 0), None
         for p in range(self.p_max + 1):
@@ -140,11 +144,13 @@ class ETSReturn:
 
         prices = close.astype(float).iloc[-1500:]
         self._last = float(prices.iloc[-1])
+        # тот же us-индекс, что и в ARIMAReturn: statsmodels нужен массив без индекса
+        values = pd.Series(prices.to_numpy(dtype=float))
         try:
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore")
                 model = ExponentialSmoothing(
-                    prices, trend="add", damped_trend=True, initialization_method="estimated"
+                    values, trend="add", damped_trend=True, initialization_method="estimated"
                 ).fit(optimized=True)
                 self._forecast_last = float(model.forecast(self.horizon).iloc[-1])
         except Exception as exc:
