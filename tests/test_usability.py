@@ -168,6 +168,34 @@ def test_backtest_returns_1_when_all_tickers_skipped(tmp_path):
     assert cli.cmd_backtest(config) == 1
 
 
+# ---------- таблица train: маркер лучшей модели ----------
+
+def test_render_metrics_table_marker_not_on_naive_zero():
+    """При всех отрицательных нетто «>» раньше вставал на naive_zero (idxmax по всем)."""
+    import numpy as np
+    import pandas as pd
+
+    metrics = pd.DataFrame(
+        {
+            "rmse": {"naive_zero": 0.006, "arima": 0.006, "lgbm": 0.005},
+            "mae": {"naive_zero": 0.004, "arima": 0.004, "lgbm": 0.003},
+            "directional_acc": {"naive_zero": np.nan, "arima": 0.48, "lgbm": 0.53},
+            "strategy_sharpe": {"naive_zero": 0.0, "arima": -2.8, "lgbm": 2.6},
+            "strategy_sharpe_net": {"naive_zero": 0.0, "arima": -2.9, "lgbm": -10.7},
+            "live_sharpe_net": {"naive_zero": np.nan, "arima": np.nan, "lgbm": 1.4},
+            "live_trades": {"naive_zero": 0.0, "arima": 0.0, "lgbm": 23.0},
+            "n_points": {"naive_zero": 100.0, "arima": 100.0, "lgbm": 100.0},
+        }
+    )
+    from models.registry import select_best
+
+    table = cli._render_metrics_table(metrics, select_best(metrics))
+    lines = table.splitlines()
+    assert any(line.lstrip().startswith(">") and "lgbm" in line for line in lines), table
+    assert not any("naive_zero" in line and line.lstrip().startswith(">") for line in lines), table
+    assert "live" in lines[0] and "сд" in lines[0]  # новые колонки таблицы
+
+
 # ---------- файловый лог с ротацией ----------
 
 def test_attach_file_log_writes_rotating_file(tmp_path):

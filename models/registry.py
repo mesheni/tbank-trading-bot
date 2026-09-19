@@ -28,7 +28,16 @@ from stats_utils import bars_per_year, n_test_points
 
 log = logging.getLogger(__name__)
 
-METRIC_KEYS = ("rmse", "mae", "directional_acc", "strategy_sharpe", "strategy_sharpe_net", "n_points")
+METRIC_KEYS = (
+    "rmse",
+    "mae",
+    "directional_acc",
+    "strategy_sharpe",
+    "strategy_sharpe_net",
+    "live_sharpe_net",
+    "live_trades",
+    "n_points",
+)
 
 # Модель «предсказывать ноль» не может дать торговый сигнал — из выбора лучшей исключается,
 # но в таблице остаётся как эталон RMSE.
@@ -46,6 +55,25 @@ def selectable_models(metrics: pd.DataFrame) -> pd.DataFrame:
     """
     out = metrics.drop(index=[m for m in NON_SELECTABLE if m in metrics.index])
     return out[out["directional_acc"].notna()]
+
+
+def select_best(metrics: pd.DataFrame) -> str | None:
+    """Лучшая модель для live-торговли; единая логика для train_and_save и таблицы CLI.
+
+    Порядок: модели с измеренной экономикой пороговой стратегии (live_trades > 0) —
+    по live_sharpe_net; если ни одна не пересекает порог входа при издержках —
+    fallback на полный нетто-Sharpe. None — кандидатов нет вовсе.
+    """
+    pool = selectable_models(metrics)
+    if pool.empty:
+        return None
+    if "live_trades" in pool.columns and (pool["live_trades"].fillna(0) > 0).any():
+        traded = pool[pool["live_trades"].fillna(0) > 0]
+        return str(traded["live_sharpe_net"].astype(float).idxmax())
+    if "strategy_sharpe_net" not in pool.columns or pool["strategy_sharpe_net"].isna().all():
+        return None
+    scores = pool["strategy_sharpe_net"].astype(float).fillna(float("-inf"))
+    return str(scores.idxmax())
 
 
 def model_factories(horizon: int) -> dict:
@@ -67,7 +95,13 @@ class WalkForwardResult:
     metrics: dict = field(default_factory=dict)
 
 
-def _metrics(pred: np.ndarray, fact: np.ndarray, bars_per_year: float = 2100.0, round_trip_cost: float = 0.0012) -> dict:
+def _metrics(
+    pred: np.ndarray,
+    fact: np.ndarray,
+    bars_per_year: float = 2100.0,
+    round_trip_cost: float = 0.0012,
+    reversal_mult: float = 2.0,
+) -> dict:
     mask = ~np.isnan(fact)
     pred, fact = pred[mask], fact[mask]
     if len(pred) == 0:
@@ -90,12 +124,46 @@ def _metrics(pred: np.ndarray, fact: np.ndarray, bars_per_year: float = 2100.0, 
     strategy_sharpe_net = (
         float(net_ret.mean() / std_net * np.sqrt(bars_per_year)) if std_net > 1e-12 else 0.0
     )
+    # live-прокси: экономика пороговой long-only стратегии, как торгует бот —
+    # вход при pred >= thr, выход при pred < -reversal_mult*thr (strategy.py decide()).
+    # Издержки списываются только по факту сделок (полный круг = вход + выход), а не за
+    # каждую смену знака, как выше. SL/TP и новостной фильтр не моделируются —
+    # это экран отбора моделей, а не бэктест.
+    abs_pred = np.abs(pred)
+    thr = max(round_trip_cost, float(np.quantile(abs_pred, 0.75)) if len(abs_pred) else 0.0)
+    exit_level = -reversal_mult * thr
+    half_cost = round_trip_cost / 2.0
+    live_ret = np.zeros_like(fact, dtype=float)
+    trades = 0
+    position = 0
+    for i, p in enumerate(pred):
+        cost = 0.0
+        if position == 0:
+            if p >= thr:  # NaN-прогноз входа не даёт — сравнение False
+                position = 1
+                trades += 1
+                cost = half_cost
+        elif p < exit_level:
+            position = 0
+            cost = half_cost
+        live_ret[i] = (fact[i] if position == 1 else 0.0) - cost
+    if position == 1:  # принудительный выход в конце ряда
+        live_ret[-1] -= half_cost
+    if trades == 0:
+        live_sharpe_net = float("nan")  # модель не торгует — экономика неизмерима
+    else:
+        std_live = live_ret.std()
+        live_sharpe_net = (
+            float(live_ret.mean() / std_live * np.sqrt(bars_per_year)) if std_live > 1e-12 else 0.0
+        )
     return {
         "rmse": float(np.sqrt(np.mean((pred - fact) ** 2))),
         "mae": float(np.mean(np.abs(pred - fact))),
         "directional_acc": directional_acc,
         "strategy_sharpe": strategy_sharpe,
         "strategy_sharpe_net": strategy_sharpe_net,
+        "live_sharpe_net": live_sharpe_net,
+        "live_trades": int(trades),
         "n_points": int(len(pred)),
     }
 
@@ -168,6 +236,7 @@ def evaluate_all(
     refit_every: int = 48,
     use_news: bool = False,
     round_trip_cost: float = 0.0012,
+    reversal_mult: float = 2.0,
 ) -> tuple[pd.DataFrame, dict[str, WalkForwardResult]]:
     """Сравнивает все модели на одинаковых тестовых точках. Возвращает таблицу метрик."""
     features = ensure_news_columns(build_features(candles, horizon))
@@ -182,7 +251,7 @@ def evaluate_all(
 
     def register(name: str, preds: pd.Series):
         results[name] = WalkForwardResult(
-            preds, facts, _metrics(preds.to_numpy(), facts.to_numpy(), bars_yr, round_trip_cost)
+            preds, facts, _metrics(preds.to_numpy(), facts.to_numpy(), bars_yr, round_trip_cost, reversal_mult)
         )
 
     register("naive_zero", walk_forward_baselines(close, facts, horizon, NaiveZero, test_points, 1))
@@ -206,7 +275,9 @@ def evaluate_all(
     register("lgbm", walk_forward_lgbm(features, test_points, horizon, refit_every, use_news))
 
     metrics = pd.DataFrame({name: r.metrics for name, r in results.items()}).T
-    metrics = metrics.sort_values("strategy_sharpe_net", ascending=False, na_position="last")
+    # порядок строк — по основному критерию отбора (live-экономика; неторгуемые — в конец)
+    sort_col = "live_sharpe_net" if "live_sharpe_net" in metrics.columns else "strategy_sharpe_net"
+    metrics = metrics.sort_values(sort_col, ascending=False, na_position="last")
     return metrics, results
 
 
@@ -247,43 +318,66 @@ def train_and_save(
     interval: str,
     test_frac: float = 0.25,
     cost_floor: float = 0.0012,
+    reversal_mult: float = 2.0,
 ) -> ModelArtifact:
     """cost_floor — издержки за круг сделки (комиссия + проскальзывание ×2), доли.
 
-    Лучшая модель выбирается по strategy_sharpe_net — Sharpe «в сторону прогноза»
-    за вычетом издержек на смену позиции: модель с положительным брутто-Sharpe,
-    но постоянными переворотами невыгодна и отбраковывается.
+    Лучшая модель выбирается по live_sharpe_net — экономике пороговой long-only
+    стратегии с издержками по факту сделок (как торгует бот). Полный флип-оборот
+    strategy_sharpe_net остаётся в таблице как пессимистичный эталон; если ни одна
+    модель не пересекает порог входа при издержках — fallback на него.
     """
-    metrics, results = evaluate_all(candles, horizon, test_frac=test_frac, round_trip_cost=cost_floor)
+    metrics, results = evaluate_all(
+        candles, horizon, test_frac=test_frac, round_trip_cost=cost_floor, reversal_mult=reversal_mult
+    )
 
     selectable = selectable_models(metrics)
     if selectable.empty:
         raise ValueError(
             f"{ticker}: ни у одной модели не измерена directional_acc (walk-forward "
-            "прогнозы нулевые или пустые) — артефакт не сохраняется"
+            f"прогнозы нулевые или пустые) — артефакт не сохраняется"
         )
-    scores = selectable["strategy_sharpe_net"].astype(float).fillna(float("-inf"))
-    if scores.isin([float("-inf")]).all():
+    best_name = select_best(metrics)
+    if best_name is None:
         raise ValueError(
             f"{ticker}: ни у одной модели нет замеренного strategy_sharpe_net — "
-            "тестовый период слишком короткий или данные пустые"
+            f"тестовый период слишком короткий или данные пустые"
         )
-    best_name = scores.idxmax()
-    best_sharpe = float(scores.loc[best_name])
-    log.info(
-        "Лучшая модель: %s (strategy_sharpe_net=%.2f, брутто=%.2f, dir_acc=%s, rmse=%.5f)",
-        best_name,
-        best_sharpe,
-        float(selectable.loc[best_name, "strategy_sharpe"]),
-        "n/a" if pd.isna(selectable.loc[best_name, "directional_acc"]) else f"{selectable.loc[best_name, 'directional_acc']:.3f}",
-        selectable.loc[best_name, "rmse"],
+    best_row = metrics.loc[best_name]
+    dir_acc_str = "n/a" if pd.isna(best_row["directional_acc"]) else f"{best_row['directional_acc']:.3f}"
+    by_live = (
+        "live_trades" in metrics.columns
+        and pd.notna(best_row.get("live_trades"))
+        and float(best_row["live_trades"]) > 0
     )
+    if by_live:
+        best_sharpe = float(best_row["live_sharpe_net"])
+        log.info(
+            "Лучшая модель: %s (live_sharpe_net=%.2f на %d сделках; полный флип net=%.2f, "
+            "dir_acc=%s, rmse=%.5f)",
+            best_name,
+            best_sharpe,
+            int(best_row["live_trades"]),
+            float(best_row["strategy_sharpe_net"]),
+            dir_acc_str,
+            float(best_row["rmse"]),
+        )
+    else:
+        best_sharpe = float(best_row["strategy_sharpe_net"])
+        log.warning(
+            "Ни одна модель не пересекает порог входа при издержках (live-сделок 0) — "
+            "выбор по полному нетто-Sharpe: %s (%.2f). Бот будет торговать редко или не торговать.",
+            best_name,
+            best_sharpe,
+        )
     if best_sharpe <= 0:
         log.warning(
-            "ВНИМАНИЕ: ни одна модель не показала положительной доходности после издержек "
-            "(лучший strategy_sharpe_net=%.2f). Бот будет торговать редко или не торговать — это "
+            "ВНИМАНИЕ: лучшая модель не показала положительной доходности после издержек "
+            "(%s=%.2f). Бот будет торговать редко или не торговать — это "
             "защитное поведение, а не ошибка. Попробуйте другой таймфрейм/горизонт или "
-            "дополнительные признаки.", best_sharpe,
+            "дополнительные признаки.",
+            "live_sharpe_net" if by_live else "strategy_sharpe_net",
+            best_sharpe,
         )
 
     # самокалибровка порога входа: не ниже издержек и не ниже типичного масштаба прогнозов

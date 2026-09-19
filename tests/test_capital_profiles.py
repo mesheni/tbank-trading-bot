@@ -241,7 +241,7 @@ def test_cmd_train_filters_tickers_by_lot_affordability(tmp_path, monkeypatch, c
             df[["open", "high", "low", "close"]] *= 10  # лот 100 * ~2500 = 250 тыс. руб
         return df
 
-    def fake_evaluate_all(_df, _horizon, round_trip_cost=0.0):
+    def fake_evaluate_all(_df, _horizon, round_trip_cost=0.0, reversal_mult=2.0):
         metrics = pd.DataFrame(
             {
                 "rmse": [0.01],
@@ -249,6 +249,8 @@ def test_cmd_train_filters_tickers_by_lot_affordability(tmp_path, monkeypatch, c
                 "directional_acc": [0.6],
                 "strategy_sharpe": [1.0],
                 "strategy_sharpe_net": [0.5],
+                "live_sharpe_net": [0.5],
+                "live_trades": [10],
                 "n_points": [100],
             },
             index=["persistence"],

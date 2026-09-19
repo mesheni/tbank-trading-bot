@@ -72,6 +72,7 @@ def test_evaluate_all_smoke(candles):
     assert {"naive_zero", "persistence", "ma5_ret", "arima", "ets", "lgbm"} <= set(metrics.index)
     assert metrics["rmse"].notna().all()
     assert "strategy_sharpe" in metrics.columns
+    assert "live_sharpe_net" in metrics.columns and "live_trades" in metrics.columns
     for name, res in results.items():
         assert len(res.predictions) > 0
         assert np.isfinite(res.predictions.to_numpy()).all()
@@ -145,8 +146,8 @@ def test_train_never_selects_naive_zero(tmp_path, candles):
 
 def _degenerate_metrics() -> pd.DataFrame:
     """Таблица как из live-прогона 09-18.09.2026: у arima/ets/naive_zero walk-forward
-    прогнозы сплошные нули (dir_acc NaN, net sharpe ровно 0.0), у остальных —
-    честный отрицательный net sharpe."""
+    прогнозы сплошные нули (dir_acc NaN, net sharpe ровно 0.0, live-сделок 0), у lgbm —
+    честный отрицательный полный флип, но измеримая live-экономика."""
     return pd.DataFrame(
         {
             "rmse": {"naive_zero": 0.006, "arima": 0.006, "ets": 0.006, "lgbm": 0.005},
@@ -154,6 +155,8 @@ def _degenerate_metrics() -> pd.DataFrame:
             "directional_acc": {"naive_zero": np.nan, "arima": np.nan, "ets": np.nan, "lgbm": 0.51},
             "strategy_sharpe": {"naive_zero": 0.0, "arima": 0.0, "ets": 0.0, "lgbm": 0.2},
             "strategy_sharpe_net": {"naive_zero": 0.0, "arima": 0.0, "ets": 0.0, "lgbm": -0.3},
+            "live_sharpe_net": {"naive_zero": np.nan, "arima": np.nan, "ets": np.nan, "lgbm": 0.3},
+            "live_trades": {"naive_zero": 0.0, "arima": 0.0, "ets": 0.0, "lgbm": 4.0},
             "n_points": {"naive_zero": 100.0, "arima": 100.0, "ets": 100.0, "lgbm": 100.0},
         }
     )
@@ -204,3 +207,77 @@ def test_train_and_save(tmp_path, candles):
 
     loaded = load_artifact(tmp_path, "TEST", "hour", 1)
     assert loaded.kind == artifact.kind
+
+
+# ---------- live-прокси: экономика пороговой long-only стратегии ----------
+
+def test_live_proxy_measures_conditional_edge():
+    """Редкие уверенные и сбывающиеся прогнозы -> сделки есть, live_sharpe_net положителен."""
+    from models.registry import _metrics
+
+    n = 2000
+    rng = np.random.default_rng(11)
+    fact = rng.normal(0.0, 0.004, n)  # вне сигнала — шум
+    phase = np.arange(n) % 100
+    up, down = phase < 10, (phase >= 50) & (phase < 60)
+    pred = np.zeros(n)
+    pred[up] = 0.01
+    pred[down] = -0.01  # разворот -> выход по правилу reversal_mult
+    fact[up] = 0.012 + rng.normal(0.0, 0.001, n)[up]
+    fact[down] = -0.012 + rng.normal(0.0, 0.001, n)[down]
+
+    m = _metrics(pred, fact, bars_per_year=7000.0, round_trip_cost=0.0012)
+    assert m["live_trades"] >= 10  # входы повторяются каждый цикл из 100 бар
+    assert m["live_sharpe_net"] > 1.0
+
+
+def test_live_proxy_no_trades_below_threshold():
+    """Прогнозы ниже порога издержек — сделок нет, live-экономика неизмерима (NaN)."""
+    from models.registry import _metrics
+
+    n = 500
+    rng = np.random.default_rng(5)
+    fact = rng.normal(0.0, 0.004, n)
+    pred = np.full(n, 0.0005)  # 0.05% < круга издержек 0.12%
+    m = _metrics(pred, fact, bars_per_year=7000.0, round_trip_cost=0.0012)
+    assert m["live_trades"] == 0
+    assert np.isnan(m["live_sharpe_net"])
+
+
+def test_live_proxy_beats_full_flip_on_churn():
+    """Частые слабые флипы: полный флип разоряется на издержках, пороговый — не торгует."""
+    from models.registry import _metrics
+
+    n = 2000
+    rng = np.random.default_rng(7)
+    fact = rng.normal(0.0, 0.004, n)  # преимущества нет
+    pred = np.where(np.arange(n) % 2 == 0, 0.0005, -0.0005)  # флип каждый бар, ниже порога
+    m = _metrics(pred, fact, bars_per_year=7000.0, round_trip_cost=0.0012)
+    assert m["strategy_sharpe_net"] < -3.0  # флип-оборот платит круг издержек каждый бар
+    assert m["live_trades"] == 0  # пороговая стратегия в такой шум не лезет
+
+
+def test_select_best_prefers_live_economy_over_quiet_zero():
+    from models.registry import select_best
+
+    metrics = _degenerate_metrics()
+    # lgbm: полный флип хуже «нулевых» тихих моделей (-0.3 < 0.0), но live-экономика измерена
+    assert select_best(metrics) == "lgbm"
+
+
+def test_select_best_fallback_when_nothing_trades():
+    from models.registry import select_best
+
+    metrics = _degenerate_metrics()
+    metrics.loc["lgbm", "live_trades"] = 0.0
+    metrics.loc["lgbm", "live_sharpe_net"] = np.nan
+    # live-сделок нет ни у кого -> fallback на полный нетто-Sharpe (пул без NaN-dir_acc = lgbm)
+    assert select_best(metrics) == "lgbm"
+
+
+def test_select_best_none_when_pool_empty():
+    from models.registry import select_best
+
+    metrics = _degenerate_metrics()
+    metrics.loc[:, "directional_acc"] = np.nan
+    assert select_best(metrics) is None

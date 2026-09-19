@@ -44,6 +44,7 @@ from models.registry import (
     evaluate_all,
     load_artifact,
     model_factories,
+    select_best,
     train_and_save,
     walk_forward_baselines,
     walk_forward_lgbm,
@@ -201,8 +202,8 @@ def cmd_news(config: Config) -> int:
     return 0
 
 
-def _render_metrics_table(metrics: pd.DataFrame, best: str) -> str:
-    """Таблица сравнения моделей: лучшая строка выделена, sharpe/net окрашены по знаку."""
+def _render_metrics_table(metrics: pd.DataFrame, best: str | None) -> str:
+    """Таблица сравнения моделей: лучшая строка выделена, sharpe/net/live окрашены по знаку."""
 
     def fmt_num(v: float, fmt: str, na: str = "--") -> str:
         return na if pd.isna(v) else fmt.format(v)
@@ -218,6 +219,8 @@ def _render_metrics_table(metrics: pd.DataFrame, best: str) -> str:
                 fmt_num(m["directional_acc"], "{:.1%}"),
                 fmt_num(m["strategy_sharpe"], "{:+.2f}"),
                 fmt_num(m["strategy_sharpe_net"], "{:+.2f}"),
+                fmt_num(m["live_sharpe_net"], "{:+.2f}"),
+                fmt_num(m["live_trades"], "{:.0f}"),
                 f"{int(m['n_points']):d}",
             ]
         )
@@ -226,8 +229,8 @@ def _render_metrics_table(metrics: pd.DataFrame, best: str) -> str:
         name = metrics.index[r]
         if name == best:
             return ui.paint(text, ui.BRIGHT_GREEN, ui.BOLD)
-        if c in (5, 6):  # колонки sharpe / net sharpe
-            v = metrics.iloc[r][["strategy_sharpe", "strategy_sharpe_net"][c - 5]]
+        if c in (5, 6, 7):  # колонки sharpe / net / live
+            v = metrics.iloc[r][["strategy_sharpe", "strategy_sharpe_net", "live_sharpe_net"][c - 5]]
             if pd.isna(v):
                 return text
             if v > 0:
@@ -238,9 +241,9 @@ def _render_metrics_table(metrics: pd.DataFrame, best: str) -> str:
         return text
 
     return ui.render_table(
-        ["", "модель", "rmse", "mae", "dir_acc", "sharpe", "net", "точек"],
+        ["", "модель", "rmse", "mae", "dir_acc", "sharpe", "net", "live", "сд", "точек"],
         rows,
-        aligns=["c", "l", "r", "r", "r", "r", "r", "r"],
+        aligns=["c", "l", "r", "r", "r", "r", "r", "r", "r", "r"],
         paint_cell=cell_paint,
     )
 
@@ -288,13 +291,17 @@ def cmd_train(config: Config, capital: float | None = None) -> int:
                     continue
         print(ui.header(f"{ticker} · {len(df)} свечей · горизонт {config.forecast_horizon} бар(а)"))
         round_trip = 2 * (config.commission_pct + config.slippage_pct)
-        metrics, _ = evaluate_all(df, config.forecast_horizon, round_trip_cost=round_trip)
-        # таблицу печатаем до/после логов train_and_save; выбор там — по net sharpe
-        print(_render_metrics_table(metrics, metrics["strategy_sharpe_net"].idxmax()))
+        reversal_mult = getattr(config, "reversal_exit_mult", 2.0)
+        metrics, _ = evaluate_all(
+            df, config.forecast_horizon, round_trip_cost=round_trip, reversal_mult=reversal_mult
+        )
+        # таблицу печатаем до логов train_and_save; маркер «>» — тот же выбор, что и в артефакт
+        print(_render_metrics_table(metrics, select_best(metrics)))
         try:
             artifact = train_and_save(
                 df, config.forecast_horizon, config.models_dir, ticker, config.candle_interval,
                 cost_floor=2 * (config.commission_pct + config.slippage_pct),
+                reversal_mult=reversal_mult,
             )
         except ValueError as exc:
             warn(f"{ticker}: {exc} — тикер пропущен, старый артефакт (если был) не тронут")
@@ -302,9 +309,14 @@ def cmd_train(config: Config, capital: float | None = None) -> int:
         trained.append(ticker)
         summary[ticker] = {"best": artifact.kind, **artifact.metrics}
         best = ui.paint(artifact.kind, ui.BRIGHT_GREEN, ui.BOLD)
-        sharpe = ui.fmt_signed(artifact.metrics.get("strategy_sharpe_net", 0.0), "{:+.2f}")
+        live_sharpe = artifact.metrics.get("live_sharpe_net")
+        live_trades = artifact.metrics.get("live_trades")
+        if live_sharpe is not None and not pd.isna(live_sharpe):
+            score_str = f"live sharpe {ui.fmt_signed(live_sharpe, '{{:+.2f}}')}, сделок {int(live_trades)}"
+        else:
+            score_str = f"net sharpe {ui.fmt_signed(artifact.metrics.get('strategy_sharpe_net', 0.0), '{{:+.2f}}')}"
         print(
-            f"  Лучшая модель: {best} (net sharpe {sharpe}) · "
+            f"  Лучшая модель: {best} ({score_str}) · "
             f"порог входа {ui.paint(f'{artifact.threshold:.4f}', ui.CYAN)}\n"
         )
     conn.close()

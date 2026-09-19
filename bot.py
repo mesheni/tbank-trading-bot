@@ -255,8 +255,8 @@ class TradingBot:
         Открытые позиции обслуживаются как обычно (стопы/тейки/выход по развороту);
         гейт блокирует только открытие новых позиций. Модель допускается, если у неё
         либо измеренный dir_acc >= MIN_MODEL_DIR_ACC, либо положительный edge после
-        издержек (strategy_sharpe_net > 0) — тот же критерий, по которому модель
-        выбирается при обучении. Метрики NaN/отсутствие доказательств — не допуск.
+        издержек: live_sharpe_net (пороговая стратегия, как выбирает train) или
+        strategy_sharpe_net (полный флип). Метрики NaN/отсутствие доказательств — не допуск.
         """
         dir_acc = artifact.metrics.get("directional_acc")
         if (
@@ -265,8 +265,11 @@ class TradingBot:
             and float(dir_acc) >= self.config.min_model_dir_acc
         ):
             return True
-        net = artifact.metrics.get("strategy_sharpe_net")
-        return net is not None and not pd.isna(net) and float(net) > 0.0
+        for key in ("live_sharpe_net", "strategy_sharpe_net"):
+            value = artifact.metrics.get(key)
+            if value is not None and not pd.isna(value) and float(value) > 0.0:
+                return True
+        return False
 
     def predict(self, ticker: str, candles: pd.DataFrame, agenda: AgendaScore) -> tuple[float, float]:
         """Возвращает (прогноз доходности на горизонт, новостной скор)."""
@@ -305,14 +308,16 @@ class TradingBot:
             return
         if figi not in portfolio.positions and not self._model_allowed(ticker, artifact):
             dir_acc = artifact.metrics.get("directional_acc")
+            live = artifact.metrics.get("live_sharpe_net")
             net = artifact.metrics.get("strategy_sharpe_net")
             fmt = lambda v: "n/a" if v is None or pd.isna(v) else f"{float(v):+.3f}"
             log.info(
                 "%-5s пропуск: модель %s без подтверждённого преимущества "
-                "(dir_acc=%s, net_sharpe=%s; порог dir_acc %.2f или net > 0) — новых входов нет",
+                "(dir_acc=%s, live=%s, net=%s; порог dir_acc %.2f или sharpe > 0) — новых входов нет",
                 ticker,
                 artifact.kind,
                 fmt(dir_acc),
+                fmt(live),
                 fmt(net),
                 self.config.min_model_dir_acc,
             )
