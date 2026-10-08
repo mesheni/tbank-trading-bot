@@ -85,6 +85,12 @@ def build_features(df: pd.DataFrame, horizon: int) -> pd.DataFrame:
         if hour is not None and int(pd.Series(hour).nunique()) > 1:
             out["hour_sin"] = np.sin(2 * np.pi * idx.hour / 24.0)
             out["hour_cos"] = np.cos(2 * np.pi * idx.hour / 24.0)
+    # колонки времени обязательны для FEATURE_COLUMNS: на дневных свечах у всех
+    # баров один час — считаем их нулевыми, а не оставляем отсутствующими
+    # (иначе lgbm падает на KeyError прямо в evaluate_all)
+    for col in ("dow", "hour_sin", "hour_cos"):
+        if col not in out.columns:
+            out[col] = 0.0
 
     out[TARGET] = close.shift(-horizon) / close - 1.0
     out = out.replace([np.inf, -np.inf], np.nan)

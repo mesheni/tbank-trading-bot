@@ -146,7 +146,9 @@ class TradingBot:
         )
         self.client = TBankRestClient(config.token, config.mode)
         self.api = TBankAPI(self.client, order_market_fallback=config.order_fallback_to_market)
-        self.trader = Trader(self.api, Path(config.reports_dir) / "journal.csv")
+        self.trader = Trader(
+            self.api, Path(config.reports_dir) / "journal.csv", account_id=getattr(config, "account_id", "")
+        )
         self.conn = connect(config.db_path)
         self.calendar = SessionCalendar(self.api)
         self.notifier = Notifier.from_config(config)
@@ -376,6 +378,11 @@ class TradingBot:
                         f"Причина решения: {decision.reason}",
                     )
                 portfolio.positions[figi] = Position(figi, ticker, executed, lot, exec_price)
+                # снимок портфеля делается раз на итерацию — следующие тикеры этого
+                # цикла должны считать бюджет от денег после сделки, а не до неё
+                fee = float(state.get("commission") or 0.0)
+                portfolio.cash = max(0.0, portfolio.cash - exec_price * executed * lot - fee)
+                portfolio.equity = max(0.0, portfolio.equity - fee)  # деньги стали позицией; ушла комиссия
                 self.trader.log_trade(
                     make_journal_row(ticker, "BUY", executed, exec_price, decision.reason, str(state.get("order_id", "")))
                 )
@@ -435,6 +442,10 @@ class TradingBot:
                     )
                 else:
                     del portfolio.positions[figi]
+                # выручка вернулась в кэш (комиссия ушла) — уточняем снимок портфеля
+                fee = float(state.get("commission") or 0.0)
+                portfolio.cash += exec_price * executed * lot - fee
+                portfolio.equity = max(0.0, portfolio.equity - fee)  # оценочно: без переоценки остатка
                 self.trader.log_trade(
                     make_journal_row(ticker, "SELL", executed, exec_price, decision.reason, str(state.get("order_id", "")))
                 )
@@ -596,6 +607,12 @@ class TradingBot:
                 profile,
                 "; ".join(dropped),
             )
+        elif dropped and not kept:
+            log.error(
+                "Профиль %s: все %d инструментов дороже бюджета позиции (%s руб) — "
+                "ни одного лота не купить. Увеличьте капитал или задайте CAPITAL_PROFILE явно.",
+                profile, total, ui.fmt_money(equity * self.config.max_position_pct),
+            )
         self.notifier.send_throttled(
             "capital-profile",
             f"режим {profile}: капитал {equity:,.0f} руб",
@@ -619,10 +636,18 @@ class TradingBot:
             ticker = (instrument.get("ticker") or figi) if instrument else figi
             lot = int(instrument.get("lot", 1)) if instrument else 1
             if pos["quantity"] > 0:
+                # API отдаёт количество в ШТУКАХ, а стратегиям/ордерам нужны ЛОТЫ
+                lots = int(pos["quantity"] // lot)
+                if lots == 0:
+                    # некратное лоту число штук (корп. действие) неисполнимо:
+                    # заявка на 0 лотов отклоняется биржей и шумела бы вечно
+                    log.warning(
+                        "%s: позиция %.2f шт меньше лота (%d) — не обслуживается ботом",
+                        ticker, pos["quantity"], lot,
+                    )
+                    continue
                 positions[figi] = Position(
-                    # API отдаёт количество в ШТУКАХ, а стратегии/ордерам нужны ЛОТЫ;
-                    # дробный остаток (корп. действия) округляется вниз до целого лота
-                    figi, ticker, int(pos["quantity"] // lot), lot,
+                    figi, ticker, lots, lot,
                     pos["average_position_price"] or pos["current_price"],
                 )
         return PortfolioState(cash=raw["cash_rub"], equity=raw["total_amount_rub"], positions=positions)

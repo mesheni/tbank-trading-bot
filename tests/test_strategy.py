@@ -89,6 +89,14 @@ def test_lot_sizing_respects_cash(risk):
     assert d.action == "BUY" and d.lots * 250 * 10 <= 20_000
 
 
+def test_lot_sizing_reserves_commission_and_slippage(risk):
+    # денег ровно на 8 лотов: с учётом комиссии и проскальзывания биржа
+    # исполнила бы только 7 — заявка на 8 отклонилась бы за недостатком средств
+    portfolio = PortfolioState(cash=20_000, equity=1_000_000)
+    d = decide("SBER", "FG", 250.0, 0.01, 0.2, portfolio, lot_size=10, risk=risk)
+    assert d.lots == 7
+
+
 def test_helpers(risk):
     assert lots_for_budget(100_000, 250.0, 10) == 40
     assert lots_for_budget(0, 250.0, 10) == 0

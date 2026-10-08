@@ -56,6 +56,26 @@ def test_drawdown_not_refilled():
     assert api.pay_ins == []
 
 
+def test_real_mode_empty_account_raises_instead_of_paying_in():
+    # регрессия: на пустом real-счёте бот звал SandboxPayIn на прод-хосте,
+    # падал на старте и крутился в crash-loop под systemd Restart=always
+    api = StubAPI(total=0.0, cash=0.0)
+    api.is_sandbox = False
+    with pytest.raises(RuntimeError, match="вручную"):
+        make_trader(api).initialize_balance(1_000_000.0)
+    assert api.pay_ins == []
+
+
+def test_configured_account_id_honored_and_validated(tmp_path):
+    api = StubAPI(total=0.0, cash=0.0)
+    api.is_sandbox = True
+    trader = Trader(api, tmp_path / "journal.csv", account_id="acc-1")
+    assert trader.account_id == "acc-1"
+
+    with pytest.raises(RuntimeError, match="ACCOUNT_ID"):
+        Trader(StubAPI(total=0.0, cash=0.0), tmp_path / "journal.csv", account_id="nope")
+
+
 def make_trader_stub(total: float):
     flows: list[tuple[float, str]] = []
 
@@ -80,7 +100,7 @@ def test_cmd_normalize_reports_excess_and_does_nothing(tmp_path, monkeypatch):
     # в T-Invest API нет вывода из sandbox: normalize лишь объясняет и отправляет в reset-sandbox
     monkeypatch.setattr(cli, "make_api", lambda cfg: AccountsAPI())
     trader_stub = make_trader_stub(1_995_000.0)
-    monkeypatch.setattr(trader_mod, "Trader", lambda api, path: trader_stub)
+    monkeypatch.setattr(trader_mod, "Trader", lambda api, path, account_id="": trader_stub)
     config = SimpleNamespace(mode="sandbox", reports_dir=tmp_path, sandbox_initial_rub=1_000_000.0)
 
     rc = cli.cmd_normalize(config)
@@ -92,7 +112,7 @@ def test_cmd_normalize_reports_excess_and_does_nothing(tmp_path, monkeypatch):
 def test_cmd_normalize_noop_within_budget(tmp_path, monkeypatch):
     monkeypatch.setattr(cli, "make_api", lambda cfg: AccountsAPI())
     trader_stub = make_trader_stub(1_000_000.5)
-    monkeypatch.setattr(trader_mod, "Trader", lambda api, path: trader_stub)
+    monkeypatch.setattr(trader_mod, "Trader", lambda api, path, account_id="": trader_stub)
     config = SimpleNamespace(mode="sandbox", reports_dir=tmp_path, sandbox_initial_rub=1_000_000.0)
 
     rc = cli.cmd_normalize(config)
@@ -122,7 +142,7 @@ class ResetAPI:
 def test_cmd_reset_sandbox_full_flow(tmp_path, monkeypatch):
     api_stub = ResetAPI()
     monkeypatch.setattr(cli, "make_api", lambda cfg: api_stub)
-    monkeypatch.setattr(trader_mod, "Trader", lambda api, path: make_trader_stub(1_995_000.0))
+    monkeypatch.setattr(trader_mod, "Trader", lambda api, path, account_id="": make_trader_stub(1_995_000.0))
     monkeypatch.setattr("builtins.input", lambda prompt="": "YES")
     for name in ("journal.csv", "equity_live.csv"):
         (tmp_path / name).write_text("x,y\n1,2\n", encoding="utf-8")
@@ -143,7 +163,7 @@ def test_cmd_reset_sandbox_full_flow(tmp_path, monkeypatch):
 def test_cmd_reset_sandbox_cancelled_without_yes(tmp_path, monkeypatch):
     api_stub = ResetAPI()
     monkeypatch.setattr(cli, "make_api", lambda cfg: api_stub)
-    monkeypatch.setattr(trader_mod, "Trader", lambda api, path: make_trader_stub(1_995_000.0))
+    monkeypatch.setattr(trader_mod, "Trader", lambda api, path, account_id="": make_trader_stub(1_995_000.0))
     monkeypatch.setattr("builtins.input", lambda prompt="": "no")
     config = SimpleNamespace(mode="sandbox", reports_dir=tmp_path, sandbox_initial_rub=1_000_000.0)
 
@@ -234,3 +254,50 @@ def test_period_pnl_window_outside_data_returns_none():
     flows = pd.DataFrame(columns=["time", "amount_rub", "kind", "reason"])
 
     assert _period_pnl(equity, flows, pd.Timestamp("2026-09-09", tz="UTC")) is None
+
+
+# ---------- _execute: отмена недоисполненных заявок, 0 лотов ----------
+
+class StickyAPI:
+    """Заявка застревает в partiallyfill — не доходит до финального статуса."""
+
+    def __init__(self):
+        self.cancelled: list[str] = []
+
+    def post_order(self, account_id, instrument_id, lots, direction, price=None):
+        return {"order_id": "o9", "status": "new", "lots_requested": 5, "lots_executed": 0,
+                "avg_exec_price": 0.0, "commission": 0.0, "total_amount": 0.0, "message": ""}
+
+    def get_order_state(self, account_id, order_id):
+        status = "cancelled" if self.cancelled else "partiallyfill"
+        return {"order_id": order_id, "status": status, "lots_requested": 5, "lots_executed": 1,
+                "avg_exec_price": 100.0, "commission": 0.0, "total_amount": 0.0, "message": ""}
+
+    def cancel_order(self, account_id, order_id):
+        self.cancelled.append(order_id)
+        return {}
+
+
+def test_execute_cancels_unfilled_order(monkeypatch):
+    # заявка, не доработавшая за время опроса, отзывается: оставленная на бирже
+    # лимитка может исполниться через часы по неактуальному сигналу
+    import tbank.trader as trader_mod
+
+    monkeypatch.setattr(trader_mod.time, "sleep", lambda s: None)
+    api = StickyAPI()
+    state = make_trader(api).buy("F1", 5, 100.0)
+    assert api.cancelled == ["o9"]
+    assert state["status"] == "cancelled"
+    assert state["lots_executed"] == 1  # частичное исполнение до отмены не теряется
+
+
+class NoPostAPI:
+    def post_order(self, *args, **kwargs):
+        raise AssertionError("post_order не должен вызываться для 0 лотов")
+
+
+def test_execute_zero_lots_never_posts_order():
+    state = make_trader(NoPostAPI()).sell("F1", 0, 100.0)
+    assert state["status"] == "rejected"
+    assert state["lots_executed"] == 0
+    assert state["order_id"] == ""

@@ -103,6 +103,9 @@ class Config:
     # --- API ---
     token: str = field(default_factory=lambda: os.getenv("T_INVEST_TOKEN", ""))
     mode: str = field(default_factory=lambda: os.getenv("MODE", "sandbox").lower())
+    # ID счёта для торговли. В real у пользователя обычно несколько счетов
+    # (брокерский, ИИС) — без явного ID бот возьмёт первый из списка.
+    account_id: str = field(default_factory=lambda: os.getenv("ACCOUNT_ID", "").strip())
 
     # --- Инструменты ---
     tickers: list[str] = field(default_factory=lambda: _env_list("TICKERS", ["SBER", "GAZP", "LKOH"]))

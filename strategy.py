@@ -92,7 +92,7 @@ def decide(
                 "лимит совокупной экспозиции" if capped_by_exposure else "недостаточно средств на 1 лот"
             )
             return Decision("HOLD", 0, reason, price)
-        max_affordable = int(portfolio.cash / (price * lot_size))
+        max_affordable = int(portfolio.cash / (price * lot_size * (1 + risk.slippage_pct) * (1 + risk.commission_pct)))
         lots = min(lots, max_affordable)
         if lots < 1:
             return Decision("HOLD", 0, "не хватает свободных денег", price)

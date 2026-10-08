@@ -19,6 +19,10 @@ def connect(db_path) -> sqlite3.Connection:
     db_path = Path(db_path)
     db_path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(db_path)
+    # WAL + таймаут: субботний cron (download/train) пишет в ту же БД, что и
+    # живой бот, — без них встречные записи ловят «database is locked»
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=5000")
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS candles (

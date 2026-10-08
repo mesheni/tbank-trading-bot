@@ -88,6 +88,18 @@ def model_factories(horizon: int) -> dict:
     }
 
 
+# Тяжёлые periodic-модели с константным прогнозом: переобучаются не чаще раза
+# в неделю баров (168 часов). Правило одно для evaluate_all и cmd_backtest,
+# чтобы выбранная модель и её бэктест строили прогнозы по одному расписанию.
+SLOW_REFIT_MODELS = frozenset({"arima", "ets"})
+SLOW_REFIT_EVERY = 168
+
+
+def baseline_refit_every(kind: str, refit_every: int = 48) -> int:
+    """Расписание переобучения для walk_forward_baselines по имени модели."""
+    return max(refit_every, SLOW_REFIT_EVERY) if kind in SLOW_REFIT_MODELS else refit_every
+
+
 @dataclass
 class WalkForwardResult:
     predictions: pd.Series  # индекс = время бара, значение = прогноз доходности
@@ -102,7 +114,7 @@ def _metrics(
     round_trip_cost: float = 0.0012,
     reversal_mult: float = 2.0,
 ) -> dict:
-    mask = ~np.isnan(fact)
+    mask = ~(np.isnan(fact) | np.isnan(pred))  # NaN-прогнозы (холодный старт lgbm) — не сигналы
     pred, fact = pred[mask], fact[mask]
     if len(pred) == 0:
         return {k: float("nan") for k in METRIC_KEYS}
@@ -264,12 +276,18 @@ def evaluate_all(
         walk_forward_baselines(close, facts, horizon, lambda: MovingAverageReturn(horizon, k=5), test_points, 1),
     )
     # тяжёлые модели с константным прогнозом переобучаются реже: 168 часов = неделя
-    slow_refit = max(refit_every, 168)
     register(
         "arima",
-        walk_forward_baselines(close, facts, horizon, lambda: ARIMAReturn(horizon), test_points, slow_refit),
+        walk_forward_baselines(
+            close, facts, horizon, lambda: ARIMAReturn(horizon), test_points, baseline_refit_every("arima", refit_every)
+        ),
     )
-    register("ets", walk_forward_baselines(close, facts, horizon, lambda: ETSReturn(horizon), test_points, slow_refit))
+    register(
+        "ets",
+        walk_forward_baselines(
+            close, facts, horizon, lambda: ETSReturn(horizon), test_points, baseline_refit_every("ets", refit_every)
+        ),
+    )
 
     # LightGBM: walk-forward предсказания с переобучением раз в refit_every
     register("lgbm", walk_forward_lgbm(features, test_points, horizon, refit_every, use_news))
@@ -319,17 +337,30 @@ def train_and_save(
     test_frac: float = 0.25,
     cost_floor: float = 0.0012,
     reversal_mult: float = 2.0,
+    use_news: bool = False,
+    evaluation: tuple[pd.DataFrame, dict[str, WalkForwardResult]] | None = None,
 ) -> ModelArtifact:
     """cost_floor — издержки за круг сделки (комиссия + проскальзывание ×2), доли.
+
+    evaluation — готовый результат evaluate_all: CLI считает его один раз для
+    таблицы и передаёт сюда, чтобы walk-forward не выполнялся дважды.
 
     Лучшая модель выбирается по live_sharpe_net — экономике пороговой long-only
     стратегии с издержками по факту сделок (как торгует бот). Полный флип-оборот
     strategy_sharpe_net остаётся в таблице как пессимистичный эталон; если ни одна
     модель не пересекает порог входа при издержках — fallback на него.
     """
-    metrics, results = evaluate_all(
-        candles, horizon, test_frac=test_frac, round_trip_cost=cost_floor, reversal_mult=reversal_mult
-    )
+    if evaluation is None:
+        metrics, results = evaluate_all(
+            candles,
+            horizon,
+            test_frac=test_frac,
+            use_news=use_news,
+            round_trip_cost=cost_floor,
+            reversal_mult=reversal_mult,
+        )
+    else:
+        metrics, results = evaluation
 
     selectable = selectable_models(metrics)
     if selectable.empty:
@@ -402,7 +433,9 @@ def train_and_save(
     )
 
     if best_name == "lgbm":
-        model = LGBMReturnModel(horizon=horizon)
+        # тот же флаг признаков, что и в walk-forward-оценке выше: артефакт
+        # должен быть той моделью, которую измерял отбор
+        model = LGBMReturnModel(horizon=horizon, use_news_features=use_news)
         model.fit(features)
         artifact.model = model
         artifact.feature_cols = model.feature_cols

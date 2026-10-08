@@ -21,13 +21,23 @@ FINAL_STATUSES = {"fill", "cancelled", "rejected"}
 class Trader:
     """Работа со счётом sandbox: гарантированный аккаунт, разовый стартовый бюджет, сделки, журнал."""
 
-    def __init__(self, api: TBankAPI, journal_path: Path):
+    def __init__(self, api: TBankAPI, journal_path: Path, account_id: str = ""):
         self.api = api
         self.journal_path = journal_path
+        self._configured_account_id = (account_id or "").strip()
         self.account_id = self._ensure_account()
 
     def _ensure_account(self) -> str:
         accounts = self.api.get_accounts()
+        if self._configured_account_id:
+            # в real счетов обычно несколько — без явного ACCOUNT_ID бот торговал бы
+            # на первом попавшемся; заданный ID проверяем, что он вообще существует
+            if not any(acc.get("id") == self._configured_account_id for acc in accounts):
+                raise RuntimeError(
+                    f"ACCOUNT_ID={self._configured_account_id} не найден среди счетов "
+                    f"({len(accounts)} шт) — проверьте .env"
+                )
+            return self._configured_account_id
         if accounts:
             return accounts[0].get("id", "")
         log.info("Sandbox-счёт не найден, открываем новый")
@@ -47,6 +57,14 @@ class Trader:
                 total, portfolio["cash_rub"], len(portfolio["positions"]),
             )
             return total
+        if not getattr(self.api, "is_sandbox", True):
+            # SandboxPayIn на прод-хосте — гарантированный 404; без гварда бот
+            # с пустым real-счётом падал бы на старте и крутился в crash-loop
+            raise RuntimeError(
+                f"Счёт {self.account_id} пуст ({total:.2f} руб), а пополнение через API "
+                "доступно только в sandbox. В режиме real пополните счёт вручную "
+                "и запустите бота снова."
+            )
         log.info("Счёт пуст: вносим стартовый бюджет %.0f руб", initial_rub)
         self.api.pay_in(self.account_id, initial_rub)
         return initial_rub
@@ -88,8 +106,20 @@ class Trader:
 
         Рыночные заявки песочницы обычно исполняются мгновенно; если статус ещё
         не финальный (new/partiallyfill), дозапрашиваем GetOrderState несколько раз,
-        чтобы не считать исполнением то, что ещё висит на бирже.
+        чтобы не считать исполнением то, что ещё висит на бирже. Не доработавшую
+        заявку отзываем: оставленная на бирже лимитка может исполниться через часы
+        по давно устаревшему сигналу, поверх которого цикл поставит новую.
         """
+        lots = int(lots)
+        if lots <= 0:
+            # дробный остаток после корп. действия (0 лотов) либо пустое решение —
+            # PostOrder с quantity=0 отклоняется биржей и шумел бы каждую итерацию
+            log.warning("Заявка %s %s на %d лот(ов) не выставляется", instrument_id, direction, lots)
+            return {
+                "order_id": "", "status": "rejected", "lots_requested": 0, "lots_executed": 0,
+                "avg_exec_price": 0.0, "commission": 0.0, "total_amount": 0.0,
+                "message": "0 лотов — заявка не выставлялась",
+            }
         state = self.api.post_order(self.account_id, instrument_id, lots, direction, price=price)
         attempts = 0
         while state["status"] not in FINAL_STATUSES and attempts < 3 and state["order_id"]:
@@ -100,6 +130,20 @@ class Trader:
             except Exception as exc:
                 log.warning("GetOrderState %s не удался (%s) — работаем с последним статусом", state["order_id"], exc)
                 break
+        if state["status"] not in FINAL_STATUSES and state["order_id"]:
+            try:
+                self.api.cancel_order(self.account_id, state["order_id"])
+            except Exception as exc:
+                log.warning(
+                    "Отмена недоисполненной заявки %s не удалась (%s) — она может доработать позже",
+                    state["order_id"], exc,
+                )
+            else:
+                try:
+                    state = self.api.get_order_state(self.account_id, state["order_id"])
+                except Exception as exc:
+                    log.warning("GetOrderState %s после отмены не удался (%s)", state["order_id"], exc)
+                    state["status"] = "cancelled"  # отмена принята — дальше заявка не исполнится
         if state["status"] not in FINAL_STATUSES:
             log.warning(
                 "Заявка %s осталась в статусе %s (исполнено %d/%d лотов)",

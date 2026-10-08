@@ -21,6 +21,31 @@ def test_build_features_shapes_and_no_nan(candles):
         assert col in features.columns, f"нет признака {col}"
 
 
+def test_daily_candles_still_have_time_features():
+    # регрессия CANDLE_INTERVAL=day: у всех баров один час суток, hour-признаки
+    # не строились — lgbm падал на KeyError прямо в evaluate_all
+    rng = np.random.default_rng(7)
+    idx = pd.date_range("2024-01-01", periods=120, freq="D", tz="UTC")
+    close = 250.0 * np.exp(np.cumsum(rng.normal(0, 0.012, 120)))
+    df = pd.DataFrame(
+        {
+            "open": close,
+            "high": close * 1.01,
+            "low": close * 0.99,
+            "close": close,
+            "volume": rng.integers(50_000, 500_000, 120).astype(float),
+        },
+        index=idx,
+    )
+    features = build_features(df, horizon=1)
+    assert not features.empty
+    for col in FEATURE_COLUMNS:
+        assert col in features.columns, f"нет признака {col}"
+    # часы вырождены — заполнены нулями
+    assert float(features["hour_sin"].abs().max()) == 0.0
+    assert float(features["hour_cos"].abs().max()) == 0.0
+
+
 def test_target_is_forward_return(candles):
     horizon = 3
     features = build_features(candles, horizon)

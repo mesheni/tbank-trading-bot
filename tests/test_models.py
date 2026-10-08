@@ -281,3 +281,38 @@ def test_select_best_none_when_pool_empty():
     metrics = _degenerate_metrics()
     metrics.loc[:, "directional_acc"] = np.nan
     assert select_best(metrics) is None
+
+
+# ---------- регрессии отбора/оценки ----------
+
+def test_evaluate_all_on_daily_candles(candles):
+    # регрессия CANDLE_INTERVAL=day: hour-признаки отсутствовали на дневных барах
+    daily = candles.copy()
+    daily.index = pd.date_range("2024-01-01", periods=len(daily), freq="D", tz="UTC")
+    metrics, _ = evaluate_all(daily.iloc[-500:], horizon=1, test_frac=0.2, refit_every=48)
+    assert {"naive_zero", "lgbm"} <= set(metrics.index)
+
+
+def test_metrics_ignore_nan_predictions():
+    # холодный старт lgbm даёт NaN-прогнозы: они не сигналы и не должны
+    # отравлять rmse/sharpe и попадать в directional_acc
+    from models.registry import _metrics
+
+    pred = np.array([np.nan, 0.01, -0.02, 0.5, np.nan])
+    fact = np.array([0.011, 0.009, -0.021, 0.4, 0.002])
+    m = _metrics(pred, fact)
+    assert m["n_points"] == 3
+    assert np.isfinite(m["rmse"]) and m["rmse"] > 0
+    assert np.isfinite(m["directional_acc"]) and m["directional_acc"] == pytest.approx(1.0)
+    assert np.isfinite(m["strategy_sharpe_net"])
+
+
+def test_baseline_refit_every_slow_models_weekly():
+    # arima/ets переобучаются раз в 168 баров и в отборе, и в бэктесте cli
+    from models.registry import baseline_refit_every
+
+    assert baseline_refit_every("arima") == 168
+    assert baseline_refit_every("ets") == 168
+    assert baseline_refit_every("arima", refit_every=200) == 200
+    assert baseline_refit_every("persistence") == 48
+    assert baseline_refit_every("lgbm") == 48

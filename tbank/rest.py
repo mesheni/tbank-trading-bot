@@ -207,7 +207,10 @@ class TBankRestClient:
                 continue
 
             if resp.status_code == 429:
-                retry_after = float(resp.headers.get("retry-after", "1"))
+                try:
+                    retry_after = float(resp.headers.get("retry-after", "1"))
+                except ValueError:
+                    retry_after = 1.0  # сервер прислал HTTP-date вместо секунд
                 log.warning("Лимит запросов (429), пауза %.1fs", retry_after)
                 time.sleep(retry_after)
                 last_error = APIError(429, "rate limit")

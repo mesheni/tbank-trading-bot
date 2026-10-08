@@ -138,19 +138,23 @@ class TBankAPI:
         # опциональный колбэк уведомлений: вызывается с текстом при fallback
         self.on_market_fallback = None
 
+    @property
+    def is_sandbox(self) -> bool:
+        return self.client.host.endswith("sandbox-invest-public-api.tbank.ru")
+
     # ---------- Счета ----------
 
     def get_accounts(self) -> list[dict]:
         method = (
             f"{self.SANDBOX}/GetSandboxAccounts"
-            if self.client.host.endswith("sandbox-invest-public-api.tbank.ru")
+            if self.is_sandbox
             else f"{self.USERS}/GetAccounts"
         )
         data = self.client.post(method)
         return data.get("accounts", [])
 
     def open_sandbox_account(self) -> str:
-        if not self.client.host.endswith("sandbox-invest-public-api.tbank.ru"):
+        if not self.is_sandbox:
             raise APIError(0, "open_sandbox_account доступен только в sandbox")
         data = self.client.post(f"{self.SANDBOX}/OpenSandboxAccount")
         account_id = data.get("accountId", "")
@@ -168,7 +172,7 @@ class TBankAPI:
 
     def close_sandbox_account(self, account_id: str) -> None:
         """Закрывает sandbox-счёт вместе с позициями (вывода из песочницы в API нет)."""
-        if not self.client.host.endswith("sandbox-invest-public-api.tbank.ru"):
+        if not self.is_sandbox:
             raise APIError(0, "close_sandbox_account доступен только в sandbox")
         self.client.post(f"{self.SANDBOX}/CloseSandboxAccount", {"accountId": account_id})
 
@@ -381,6 +385,12 @@ class TBankAPI:
             f"{self.ORDERS}/GetOrderState", {"accountId": account_id, "orderId": order_id}
         )
         return parse_order_state(data, executed_price_is_total=True)
+
+    def cancel_order(self, account_id: str, order_id: str) -> dict:
+        """OrdersService/CancelOrder: отмена заявки (в sandbox работает тот же метод)."""
+        return self.client.post(
+            f"{self.ORDERS}/CancelOrder", {"accountId": account_id, "orderId": order_id}
+        )
 
     def get_portfolio(self, account_id: str) -> dict:
         data = self.client.post(f"{self.OPERATIONS}/GetPortfolio", {"accountId": account_id})

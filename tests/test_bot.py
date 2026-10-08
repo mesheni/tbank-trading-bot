@@ -130,6 +130,22 @@ def test_position_fractional_share_remainder_floors_to_whole_lot():
     assert portfolio.positions["BBG004S681W3"].lots == 963
 
 
+def test_sub_lot_position_skipped_with_warning(caplog):
+    # 5 шт при лоте 10 = 0 целых лотов: позиция неисполнима, и если её отдать
+    # стратегии, decide потребует SELL 0 лотов — биржа отклоняла бы заявку вечно
+    # (класс регрессии live-прогона 09-2026)
+    instruments = {"ALRS": {"ticker": "ALRS", "figi": "BBG004S681W3", "lot": 10}}
+    raw = raw_portfolio(
+        {"BBG004S681W3": {"quantity": 5.0, "current_price": 19.35, "average_position_price": 20.71}}
+    )
+
+    with caplog.at_level(logging.WARNING, logger="bot"):
+        portfolio = make_bot(instruments, raw)._load_portfolio()
+
+    assert portfolio.positions == {}
+    assert any("меньше лота" in rec.getMessage() for rec in caplog.records)
+
+
 def test_instrument_without_ticker_field_falls_back_to_figi():
     # словарь инструмента в старом формате (без ключа ticker) не должен ломать итерацию
     instruments = {"OZON": {"figi": OZON_FIGI, "lot": 1}}

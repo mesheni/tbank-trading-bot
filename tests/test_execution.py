@@ -186,6 +186,21 @@ def test_step_ticker_partial_buy_journals_executed_lots_only():
     assert portfolio.positions["F1"].lots == 120
 
 
+def test_step_ticker_updates_cash_and_equity_after_buy():
+    # снимок портфеля берётся раз на итерацию: следующий тикер цикла должен
+    # считать доступные деньги после покупки, а не предторговый остаток
+    trader = FakeTrader(buy_state=filled_state(120, 99.5))
+    bot = make_step_bot(trader)
+    portfolio = PortfolioState(cash=1_000_000, equity=1_000_000, positions={})
+
+    bot.step_ticker("AAA", bot.instruments["AAA"], portfolio)
+
+    cost = 120 * 10 * 99.5
+    fee = 0.1  # из filled_state
+    assert portfolio.cash == pytest.approx(1_000_000 - cost - fee)
+    assert portfolio.equity == pytest.approx(1_000_000 - fee)
+
+
 def test_step_ticker_rejected_buy_opens_nothing():
     state = dict(filled_state(0, 0.0))
     state["status"] = "rejected"

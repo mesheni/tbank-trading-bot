@@ -41,6 +41,7 @@ from config import CAPITAL_PROFILES, Config, resolve_capital_profile
 from features import build_features, ensure_news_columns
 from models.registry import (
     artifact_path,
+    baseline_refit_every,
     evaluate_all,
     load_artifact,
     model_factories,
@@ -63,7 +64,7 @@ from tbank.market_data import (
 )
 from tbank.rest import TBankRestClient
 
-__VERSION__ = "1.1.0"
+__VERSION__ = "1.2.0"
 
 
 def _sandbox_budget(config) -> float:
@@ -111,6 +112,16 @@ def make_api(config: Config) -> TBankAPI:
         TBankRestClient(config.token, config.mode),
         order_market_fallback=config.order_fallback_to_market,
     )
+
+
+def _pick_account(config, accounts: list[dict]) -> str:
+    """ID счёта для отчётной команды: ACCOUNT_ID из .env, иначе первый из списка."""
+    configured = getattr(config, "account_id", "")
+    if configured:
+        if not any(acc.get("id") == configured for acc in accounts):
+            raise RuntimeError(f"ACCOUNT_ID={configured} не найден среди счетов API")
+        return configured
+    return accounts[0]["id"]
 
 
 def cmd_smoke(config: Config) -> int:
@@ -292,7 +303,8 @@ def cmd_train(config: Config, capital: float | None = None) -> int:
         print(ui.header(f"{ticker} · {len(df)} свечей · горизонт {config.forecast_horizon} бар(а)"))
         round_trip = 2 * (config.commission_pct + config.slippage_pct)
         reversal_mult = getattr(config, "reversal_exit_mult", 2.0)
-        metrics, _ = evaluate_all(
+        # один walk-forward на тикер: таблица и артефакт оцениваются по нему же
+        metrics, results = evaluate_all(
             df, config.forecast_horizon, round_trip_cost=round_trip, reversal_mult=reversal_mult
         )
         # таблицу печатаем до логов train_and_save; маркер «>» — тот же выбор, что и в артефакт
@@ -302,6 +314,7 @@ def cmd_train(config: Config, capital: float | None = None) -> int:
                 df, config.forecast_horizon, config.models_dir, ticker, config.candle_interval,
                 cost_floor=2 * (config.commission_pct + config.slippage_pct),
                 reversal_mult=reversal_mult,
+                evaluation=(metrics, results),
             )
         except ValueError as exc:
             warn(f"{ticker}: {exc} — тикер пропущен, старый артефакт (если был) не тронут")
@@ -404,13 +417,15 @@ def cmd_backtest(config: Config, capital: float | None = None) -> int:
 
         # walk-forward предсказания лучшей моделью: только на прошлом, без утечки
         # (артефактная модель обучена на всей истории — для оценки на ней непригодна)
+        # расписание переобучения — то же, что и при отборе модели
         test_points = features.index[-n_test_points(len(features)):]
         if artifact.kind == "lgbm":
             preds = walk_forward_lgbm(features, test_points, config.forecast_horizon)
         else:
             preds = walk_forward_baselines(
                 df["close"], features["target"], config.forecast_horizon,
-                model_factories(config.forecast_horizon)[artifact.kind], test_points, refit_every=48,
+                model_factories(config.forecast_horizon)[artifact.kind], test_points,
+                refit_every=baseline_refit_every(artifact.kind),
             )
         preds_test = preds
 
@@ -519,6 +534,17 @@ def _net_invested(initial_rub: float, flows: pd.DataFrame) -> float:
     return initial_rub + (float(flows["amount_rub"].sum()) if len(flows) else 0.0)
 
 
+def _budget_base_warning(config) -> str | None:
+    """В real без ACCOUNT_BUDGET_RUB база P&L — дефолтный SANDBOX_INITIAL_RUB, не капитал."""
+    if config.mode == "real" and getattr(config, "account_budget_rub", None) is None:
+        return (
+            f"MODE=real без ACCOUNT_BUDGET_RUB: P&L считается от SANDBOX_INITIAL_RUB "
+            f"({config.sandbox_initial_rub:,.0f} руб) и почти наверняка неверен — "
+            "задайте ACCOUNT_BUDGET_RUB в .env"
+        )
+    return None
+
+
 def _period_pnl(
     equity: pd.DataFrame, flows: pd.DataFrame, cutoff: pd.Timestamp
 ) -> tuple[float, float, float, float] | None:
@@ -549,13 +575,16 @@ def cmd_report(config: Config) -> int:
     if not accounts:
         warn("Счетов нет (в sandbox выполните: python cli.py smoke)")
         return 1
-    account_id = accounts[0]["id"]
+    account_id = _pick_account(config, accounts)
     portfolio = api.get_portfolio(account_id)
     total = portfolio["total_amount_rub"]
     initial = _sandbox_budget(config)
     flows = _load_flows(config.reports_dir)
     invested = _net_invested(initial, flows)
     pnl = total - invested
+    base_warning = _budget_base_warning(config)
+    if base_warning:
+        warn(base_warning)
 
     figi_ticker: dict[str, str] = {}
     lot_by_ticker: dict[str, int] = {}
@@ -627,7 +656,7 @@ def cmd_report(config: Config) -> int:
             # расхождение «штуки vs лоты» было видно сразу
             name = figi_ticker.get(figi, figi)
             lot = lot_by_ticker.get(name)
-            lots_str = f"{pos['quantity'] / lot:.0f}" if lot else "--"
+            lots_str = f"{int(pos['quantity'] // lot)}" if lot else "--"
             rows.append(
                 [
                     name,
@@ -919,7 +948,7 @@ def compose_digest(config: Config) -> str:
     accounts = api.get_accounts()
     if not accounts:
         return "Счетов нет (в sandbox выполните: python cli.py smoke)"
-    account_id = accounts[0]["id"]
+    account_id = _pick_account(config, accounts)
     portfolio = api.get_portfolio(account_id)
     total = portfolio["total_amount_rub"]
     flows = _load_flows(config.reports_dir)
@@ -931,6 +960,9 @@ def compose_digest(config: Config) -> str:
         f"Капитал: {total:,.0f} руб · свободно: {portfolio['cash_rub']:,.0f} руб",
         f"Вложено: {invested:,.0f} руб · P&L: {pnl:+,.0f} руб ({pnl_pct:+.1%})",
     ]
+    base_warning = _budget_base_warning(config)
+    if base_warning:
+        lines.append(f"ВНИМАНИЕ: {base_warning}")
 
     equity_file = Path(config.reports_dir) / "equity_live.csv"
     if equity_file.exists():
@@ -1031,7 +1063,7 @@ def cmd_normalize(config: Config) -> int:
         return 2
     from tbank.trader import Trader
 
-    trader = Trader(api, Path(config.reports_dir) / "journal.csv")
+    trader = Trader(api, Path(config.reports_dir) / "journal.csv", account_id=getattr(config, "account_id", ""))
     portfolio = trader.portfolio()
     total = portfolio["total_amount_rub"]
     budget = _sandbox_budget(config)
@@ -1083,7 +1115,7 @@ def cmd_reset_sandbox(config: Config, assume_yes: bool = False) -> int:
         return 2
     from tbank.trader import Trader
 
-    trader = Trader(api, Path(config.reports_dir) / "journal.csv")
+    trader = Trader(api, Path(config.reports_dir) / "journal.csv", account_id=getattr(config, "account_id", ""))
     portfolio = trader.portfolio()
     print(
         f"  Счёт {trader.account_id}: {ui.fmt_money(portfolio['total_amount_rub'])} руб, "
