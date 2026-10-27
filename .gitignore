@@ -6,6 +6,9 @@ __pycache__/
 *.cer
 *.crt
 *.pem
+*.key
+*.p12
+*.pfx
 data/
 models_artifacts/
 reports/

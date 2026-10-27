@@ -17,7 +17,7 @@ cd "${APP_DIR}"
 # 1. Системные зависимости (OpenMP нужен LightGBM; не трогаем на не-Debian/не-root)
 if [ "$(id -u)" -eq 0 ] && command -v apt-get >/dev/null 2>&1; then
     apt-get update -y
-    apt-get install -y python3-venv python3-pip libgomp1
+    apt-get install -y --no-install-recommends python3-venv python3-pip libgomp1
 else
     echo "[i] пропуск apt-зависимостей (не root или не Debian). При ошибке libgomp.so.1:"
     echo "    sudo apt install -y libgomp1 python3-venv"

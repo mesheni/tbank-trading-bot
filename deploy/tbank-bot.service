@@ -6,12 +6,15 @@
 Description=T-Bank sandbox trading bot
 After=network-online.target
 Wants=network-online.target
+StartLimitIntervalSec=600
 
 [Service]
 WorkingDirectory=__APP_DIR__
+ExecStartPre=__APP_DIR__/.venv/bin/python cli.py check-config
 ExecStart=__APP_DIR__/.venv/bin/python cli.py run
 Restart=always
 RestartSec=30
+StartLimitBurst=5
 # Лог пишется в journald (journalctl -u tbank-bot -f).
 # Файловый лог с ротацией проще включить через LOG_FILE=var/bot.log в .env —
 # либо раскомментируйте (без ротации, следите за размером):
