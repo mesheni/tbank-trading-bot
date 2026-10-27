@@ -396,6 +396,18 @@ systemctl restart tbank-bot
 на сервере `git pull` → `systemctl restart tbank-bot`. Отставание видно в `git status -sb`
 (`[behind N]`).
 
+### 3.11 Воспроизводимая установка, CI и сброс kill-switch
+
+- `requirements.lock` — зафиксированные версии всех пакетов (`pip freeze` из проверенного venv).
+  Для воспроизводимой установки на сервере: `.venv/bin/pip install -r requirements.lock`.
+  `requirements.txt` остаётся источником минимальных версий для разработки.
+- CI: `.github/workflows/tests.yml` запускает `pytest tests` на каждый push и pull request.
+- Перед запуском юнит выполняет `cli.py check-config` (`ExecStartPre`): неверный `.env`
+  останавливает старт сразу, а не через crash-loop.
+- Kill-switch сохраняется в `reports/kill_switch.json` и переживает перезапуск. Снять запрет
+  новых входов можно только вручную: `.venv/bin/python cli.py kill-switch-reset`.
+- Торговля на реальном счёте (`MODE=real`) требует `CONFIRM_REAL_TRADING=YES` в `.env`.
+
 ## 4. Типичные проблемы на сервере
 
 | Симптом | Причина и решение |
