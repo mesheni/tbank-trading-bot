@@ -15,13 +15,27 @@
 from __future__ import annotations
 
 import datetime as dt
+import json
 import logging
+import os
 import smtplib
 from dataclasses import dataclass
 from email.mime.text import MIMEText
 from email.utils import formataddr
+from pathlib import Path
 
 log = logging.getLogger(__name__)
+
+
+def throttle_key(action: str, kind: str, ticker: str) -> str:
+    """Ключ троттлинга, изолированный по направлению сделки.
+
+    bot.py сейчас строит ключи без направления (``order-not-filled:SBER``),
+    поэтому письмо о неисполненной покупке глушит письмо о неисполненной
+    продаже того же тикера. Формат ``<kind>:<action>:<ticker>`` разводит
+    BUY и SELL по разным пространствам ключей.
+    """
+    return f"{kind}:{action}:{ticker}"
 
 
 @dataclass
@@ -53,13 +67,53 @@ class SmtpConfig:
 class Notifier:
     """Отправка коротких писем; исключения не покидают send()."""
 
-    def __init__(self, cfg: SmtpConfig | None = None):
+    def __init__(self, cfg: SmtpConfig | None = None, state_path: Path | None = None):
         self.cfg = cfg or SmtpConfig()
+        self.state_path = Path(state_path) if state_path is not None else None
         self._last_sent: dict[str, dt.datetime] = {}
+        self._load_state()
 
     @classmethod
     def from_config(cls, config) -> "Notifier":
-        return cls(SmtpConfig.from_config(config))
+        reports_dir = getattr(config, "reports_dir", None)
+        state_path = Path(reports_dir) / "notify_state.json" if reports_dir else None
+        return cls(SmtpConfig.from_config(config), state_path=state_path)
+
+    def _load_state(self) -> None:
+        """Поднимает окна троттлинга прошлого запуска (некорректные записи игнорируются)."""
+        if self.state_path is None:
+            return
+        try:
+            raw = json.loads(self.state_path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return
+        except (OSError, ValueError) as exc:
+            log.warning("Состояние троттлинга не загружено (%s): %s", self.state_path, exc)
+            return
+        if not isinstance(raw, dict):
+            log.warning("Состояние троттлинга повреждено (%s): ожидался объект", self.state_path)
+            return
+        for key, value in raw.items():
+            try:
+                sent_at = dt.datetime.fromisoformat(value)
+            except (TypeError, ValueError):
+                continue
+            if sent_at.tzinfo is None:
+                sent_at = sent_at.replace(tzinfo=dt.timezone.utc)
+            self._last_sent[key] = sent_at
+
+    def _save_state(self) -> None:
+        """Атомарно сохраняет окна троттлинга: временный файл + os.replace."""
+        if self.state_path is None:
+            return
+        try:
+            self.state_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self.state_path.with_name(f"{self.state_path.name}.{os.getpid()}.tmp")
+            payload = {key: sent_at.isoformat() for key, sent_at in self._last_sent.items()}
+            tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+            os.replace(tmp, self.state_path)
+        except OSError as exc:
+            log.warning("Состояние троттлинга не сохранено (%s): %s", self.state_path, exc)
 
     @property
     def enabled(self) -> bool:
@@ -98,5 +152,6 @@ class Notifier:
             return False
         if self.send(subject, body):
             self._last_sent[key] = now
+            self._save_state()
             return True
         return False

@@ -18,6 +18,7 @@ from __future__ import annotations
 import base64
 import json
 import logging
+import math
 import os
 import re
 import threading
@@ -144,14 +145,21 @@ class TBankRestClient:
         timeout: float = 30.0,
         min_request_interval: float = 0.25,
         max_retries: int = 3,
+        breaker_threshold: int = 5,
+        breaker_cooldown_sec: float = 60.0,
     ):
         if not token:
             raise ValueError("Пустой токен T_INVEST_TOKEN")
         if mode not in {"sandbox", "real"}:
             raise ValueError(f"Неизвестный режим: {mode}")
         self.host = SANDBOX_HOST if mode == "sandbox" else PROD_HOST
+        self._mode = mode
         self.timeout = timeout
         self.max_retries = max_retries
+        self.breaker_threshold = breaker_threshold
+        self.breaker_cooldown_sec = breaker_cooldown_sec
+        self._consecutive_failures = 0
+        self._breaker_open_until = 0.0
         self._min_interval = min_request_interval
         self._last_request_ts = 0.0
         self._lock = threading.Lock()
@@ -166,6 +174,11 @@ class TBankRestClient:
             }
         )
         self._configure_tls()
+
+    @property
+    def mode(self) -> str:
+        """Режим клиента: "sandbox" или "real" (только чтение)."""
+        return self._mode
 
     def _configure_tls(self) -> None:
         if os.getenv("TLS_INSECURE", "").strip().lower() in {"1", "true", "yes"}:
@@ -191,17 +204,42 @@ class TBankRestClient:
                 time.sleep(wait)
             self._last_request_ts = time.monotonic()
 
+    def _breaker_remaining(self) -> float:
+        """Сколько секунд предохранитель ещё открыт (0 — запросы разрешены)."""
+        with self._lock:
+            return self._breaker_open_until - time.monotonic()
+
+    def _record_success(self) -> None:
+        with self._lock:
+            self._consecutive_failures = 0
+            self._breaker_open_until = 0.0
+
+    def _record_failure(self) -> None:
+        with self._lock:
+            self._consecutive_failures += 1
+            if self._consecutive_failures >= self.breaker_threshold:
+                self._breaker_open_until = time.monotonic() + self.breaker_cooldown_sec
+
     def post(self, service_method: str, payload: dict | None = None) -> dict:
         """POST /rest/<Service>/<Method>. Возвращает JSON-ответ или {}."""
+        remaining = self._breaker_remaining()
+        if remaining > 0:
+            raise APIError(
+                503,
+                "circuit open",
+                f"слишком много ошибок подряд, запросы приостановлены на {math.ceil(remaining)} c",
+            )
         url = f"{self.host}/rest/{service_method}"
         body = payload or {}
         last_error: Exception | None = None
+        counts_as_failure = False
         for attempt in range(1, self.max_retries + 1):
             self._throttle()
             try:
                 resp = self.session.post(url, data=json.dumps(body), timeout=self.timeout)
             except requests.RequestException as exc:
                 last_error = exc
+                counts_as_failure = True
                 log.warning("Сетевая ошибка %s (попытка %d/%d): %s", service_method, attempt, self.max_retries, exc)
                 time.sleep(1.5 * attempt)
                 continue
@@ -214,11 +252,13 @@ class TBankRestClient:
                 log.warning("Лимит запросов (429), пауза %.1fs", retry_after)
                 time.sleep(retry_after)
                 last_error = APIError(429, "rate limit")
+                counts_as_failure = False
                 continue
             if resp.status_code >= 500:
                 log.warning("Сервер %s -> %d (попытка %d)", service_method, resp.status_code, attempt)
                 time.sleep(1.5 * attempt)
                 last_error = APIError(resp.status_code, "server error")
+                counts_as_failure = True
                 continue
             if resp.status_code >= 400:
                 details = resp.text[:500]
@@ -228,8 +268,11 @@ class TBankRestClient:
                 except (ValueError, AttributeError):
                     pass
                 raise APIError(resp.status_code, "client error", details)
+            self._record_success()
             if not resp.content:
                 return {}
             return resp.json()
 
+        if counts_as_failure:
+            self._record_failure()
         raise last_error or APIError(0, f"не удалось выполнить {service_method}")

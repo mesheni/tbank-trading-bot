@@ -26,6 +26,9 @@ class Trader:
         self.journal_path = journal_path
         self._configured_account_id = (account_id or "").strip()
         self.account_id = self._ensure_account()
+        # незавершённые заявки: instrument_id -> order_id; новая заявка по тому же
+        # инструменту не выставляется, пока прошлая может исполниться
+        self._pending_orders: dict[str, str] = {}
 
     def _ensure_account(self) -> str:
         accounts = self.api.get_accounts()
@@ -39,6 +42,13 @@ class Trader:
                 )
             return self._configured_account_id
         if accounts:
+            # в real счетов обычно несколько (брокерский, ИИС): без явного
+            # ACCOUNT_ID выбор «первого попавшегося» может торговать не тем счётом
+            if len(accounts) > 1 and not getattr(self.api, "is_sandbox", True):
+                raise RuntimeError(
+                    f"ACCOUNT_ID не задан, а счетов в режиме real несколько ({len(accounts)}) — "
+                    "задайте ACCOUNT_ID в .env"
+                )
             return accounts[0].get("id", "")
         log.info("Sandbox-счёт не найден, открываем новый")
         return self.api.open_sandbox_account()
@@ -96,10 +106,70 @@ class Trader:
         return self.api.get_portfolio(self.account_id)
 
     def buy(self, instrument_id: str, lots: int, price: float) -> dict:
+        blocked = self._reconcile_pending(instrument_id)
+        if blocked is not None:
+            return self._pending_result(blocked, lots)
         return self._execute(instrument_id, lots, BUY, price)
 
     def sell(self, instrument_id: str, lots: int, price: float | None = None) -> dict:
+        blocked = self._reconcile_pending(instrument_id)
+        if blocked is not None:
+            return self._pending_result(blocked, lots)
         return self._execute(instrument_id, lots, SELL, price)
+
+    def _pending_registry(self) -> dict[str, str]:
+        """Ленивая инициализация: часть тестов создаёт Trader через __new__."""
+        pending = getattr(self, "_pending_orders", None)
+        if pending is None:
+            pending = {}
+            self._pending_orders = pending
+        return pending
+
+    def _reconcile_pending(self, instrument_id: str) -> str | None:
+        """Проверяет ранее оставленную незавершённую заявку по инструменту.
+
+        Возвращает order_id, если заявка всё ещё может исполниться (новую
+        выставлять нельзя), и None, когда можно торговать дальше. Ошибка
+        GetOrderState трактуется как «статус неизвестен» — fail closed.
+        """
+        pending = self._pending_registry()
+        order_id = pending.get(instrument_id)
+        if not order_id:
+            return None
+        try:
+            state = self.api.get_order_state(self.account_id, order_id)
+        except Exception as exc:
+            log.warning(
+                "Статус прошлой заявки %s по %s не получен (%s) — новые заявки блокируем",
+                order_id, instrument_id, exc,
+            )
+            return order_id
+        status = str(state.get("status") or "")
+        if status in FINAL_STATUSES:
+            pending.pop(instrument_id, None)
+            log.info(
+                "Прошлая заявка %s по %s завершилась (%s) — можно выставлять новую",
+                order_id, instrument_id, status,
+            )
+            return None
+        log.warning(
+            "По %s всё ещё жива заявка %s (статус %s) — новую не выставляем",
+            instrument_id, order_id, status or "неизвестен",
+        )
+        return order_id
+
+    @staticmethod
+    def _pending_result(order_id: str, lots: int) -> dict:
+        return {
+            "order_id": order_id,
+            "status": "pending_unresolved",
+            "lots_requested": int(lots),
+            "lots_executed": 0,
+            "avg_exec_price": 0.0,
+            "commission": 0.0,
+            "total_amount": 0.0,
+            "message": f"previous order still open: {order_id}",
+        }
 
     def _execute(self, instrument_id: str, lots: int, direction: str, price: float | None) -> dict:
         """Ставит заявку и возвращает нормализованный результат исполнения.
@@ -145,6 +215,10 @@ class Trader:
                     log.warning("GetOrderState %s после отмены не удался (%s)", state["order_id"], exc)
                     state["status"] = "cancelled"  # отмена принята — дальше заявка не исполнится
         if state["status"] not in FINAL_STATUSES:
+            if state["order_id"]:
+                # отмена не удалась или биржа ещё не подтвердила финальный статус:
+                # заявка может исполниться позже, поэтому блокируем новые по инструменту
+                self._pending_registry()[instrument_id] = state["order_id"]
             log.warning(
                 "Заявка %s осталась в статусе %s (исполнено %d/%d лотов)",
                 state["order_id"], state["status"], state["lots_executed"], state["lots_requested"],

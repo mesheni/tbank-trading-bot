@@ -106,6 +106,10 @@ class Config:
     # ID счёта для торговли. В real у пользователя обычно несколько счетов
     # (брокерский, ИИС) — без явного ID бот возьмёт первый из списка.
     account_id: str = field(default_factory=lambda: os.getenv("ACCOUNT_ID", "").strip())
+    # явное подтверждение реальной торговли: только ровно "YES" (регистр важен)
+    confirm_real_trading: bool = field(
+        default_factory=lambda: os.getenv("CONFIRM_REAL_TRADING", "") == "YES"
+    )
 
     # --- Инструменты ---
     tickers: list[str] = field(default_factory=lambda: _env_list("TICKERS", ["SBER", "GAZP", "LKOH"]))
@@ -225,6 +229,10 @@ class Config:
                 "T_INVEST_TOKEN не задан. Получите токен на https://www.tbank.ru/invest/open-api "
                 "и укажите его в файле .env"
             )
+        self.validate_risk()
+
+    def validate_risk(self) -> None:
+        """Проверяет риск-параметры и бюджет счёта (без проверок режима и токена)."""
         for name in ("stop_loss_pct", "take_profit_pct"):
             value = getattr(self, name)
             if not 0 < value < 1:

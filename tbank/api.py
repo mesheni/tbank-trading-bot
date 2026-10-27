@@ -137,6 +137,7 @@ class TBankAPI:
         self.order_market_fallback = order_market_fallback
         # опциональный колбэк уведомлений: вызывается с текстом при fallback
         self.on_market_fallback = None
+        self._fallback_blocked_logged = False
 
     @property
     def is_sandbox(self) -> bool:
@@ -359,24 +360,34 @@ class TBankAPI:
         try:
             data = self.client.post(f"{self.ORDERS}/PostOrder", payload)
         except APIError as exc:
-            if exc.status == 400 and order_type == "ORDER_TYPE_LIMIT" and self.order_market_fallback:
-                log.warning(
-                    "Лимитная заявка %s отклонена (%s) — переподача рыночной",
-                    instrument_id, exc.details[:200] or exc.message,
-                )
-                payload["orderType"] = "ORDER_TYPE_MARKET"
-                payload.pop("price", None)
-                data = self.client.post(f"{self.ORDERS}/PostOrder", payload)
-                if self.on_market_fallback is not None:
-                    try:
-                        self.on_market_fallback(
-                            f"{instrument_id}: лимитная заявка отклонена ({exc.details[:200]}), "
-                            f"исполнена рыночная на {quantity_lots} лот(ов)"
-                        )
-                    except Exception:
-                        pass
-            else:
+            if exc.status != 400 or order_type != "ORDER_TYPE_LIMIT" or not self.order_market_fallback:
                 raise
+            if self.client.mode != "sandbox":
+                # в real рыночная заявка вместо отклонённой лимитной исполняется
+                # по неизвестной цене — такой fallback запрещён независимо от env
+                if not self._fallback_blocked_logged:
+                    log.warning(
+                        "Лимитная заявка %s отклонена (%s), но fallback на рыночную "
+                        "в режиме %s запрещён — возвращаем ошибку брокера",
+                        instrument_id, exc.details[:200] or exc.message, self.client.mode,
+                    )
+                    self._fallback_blocked_logged = True
+                raise
+            log.warning(
+                "Лимитная заявка %s отклонена (%s) — переподача рыночной",
+                instrument_id, exc.details[:200] or exc.message,
+            )
+            payload["orderType"] = "ORDER_TYPE_MARKET"
+            payload.pop("price", None)
+            data = self.client.post(f"{self.ORDERS}/PostOrder", payload)
+            if self.on_market_fallback is not None:
+                try:
+                    self.on_market_fallback(
+                        f"{instrument_id}: лимитная заявка отклонена ({exc.details[:200]}), "
+                        f"исполнена рыночная на {quantity_lots} лот(ов)"
+                    )
+                except Exception:
+                    pass
         return parse_order_state(data, fallback_price=price)
 
     def get_order_state(self, account_id: str, order_id: str) -> dict:

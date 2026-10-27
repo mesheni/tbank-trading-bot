@@ -147,12 +147,27 @@ def _store_candles(conn: sqlite3.Connection, figi: str, ticker: str, interval: s
         )
         for r in rows
     ]
-    conn.executemany(
-        "INSERT OR REPLACE INTO candles (figi, ticker, interval, time, open, high, low, close, volume, is_complete)"
-        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        payload,
-    )
-    conn.commit()
+    # параллельный cron (download/upsert) может кратко держать БД: до 3 попыток
+    # на «database is locked», между ними нарастающая пауза
+    last_error: sqlite3.OperationalError | None = None
+    for attempt in range(1, 4):
+        try:
+            conn.executemany(
+                "INSERT OR REPLACE INTO candles (figi, ticker, interval, time, open, high, low, close, volume, is_complete)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                payload,
+            )
+            conn.commit()
+            last_error = None
+            break
+        except sqlite3.OperationalError as exc:
+            if "locked" not in str(exc).lower():
+                raise
+            last_error = exc
+            if attempt < 3:
+                time.sleep(0.5 * attempt)
+    if last_error is not None:
+        raise last_error
     return len(payload)
 
 

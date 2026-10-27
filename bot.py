@@ -11,8 +11,11 @@ from __future__ import annotations
 
 import csv
 import datetime as dt
+import json
 import logging
+import os
 import time
+from collections.abc import Mapping
 from dataclasses import replace
 from pathlib import Path
 
@@ -20,12 +23,12 @@ import pandas as pd
 
 from backtest import RiskConfig  # noqa: F401  (реэкспорт для удобства)
 from config import MIN_TRADABLE_EQUITY_RUB, MSK, Config
-from features import build_features, ensure_news_columns
+from features import build_live_features, ensure_news_columns
 from models.registry import ModelArtifact, load_artifact, model_factories
 from nlp.agenda import AgendaScore, batch_score_news, score_agenda
 from nlp.embedder import NewsEmbedder
 from nlp.sentiment import make_sentiment
-from notify import Notifier
+from notify import Notifier, throttle_key
 from strategy import Decision, PortfolioState, Position, RiskConfig, decide, is_affordable
 import ui
 from tbank.api import TBankAPI
@@ -51,6 +54,73 @@ DEFAULT_SESSION = (dt.time(9, 50), dt.time(18, 50))
 # исполниться (регрессия 09-18.09.2026: лотность позиции была завышена в 10 раз,
 # биржа отклоняла заявки 9 дней, никто не замечал)
 FAILED_SELL_ESCALATION = 3
+
+# Длительность бара в секундах; ключи совпадают с config.CANDLE_INTERVALS
+BAR_SECONDS = {"1min": 60, "5min": 300, "15min": 900, "hour": 3600, "day": 86400}
+
+# Запас сверх двух баров: вечерние/выходные перерывы и задержка публикации API
+STALE_BAR_GRACE_SEC = 900
+
+# Интервалы, которых нет в BAR_SECONDS: предупреждаем один раз за процесс
+_STALE_UNKNOWN_INTERVALS: set[str] = set()
+
+
+class StaleDataError(RuntimeError):
+    """Последняя свеча старше допустимого — по тикеру нельзя принимать решения."""
+
+
+def kill_switch_path(reports_dir) -> Path:
+    """Путь к файлу состояния kill-switch (переживает рестарт до явного сброса)."""
+    return Path(reports_dir) / "kill_switch.json"
+
+
+def read_kill_switch(reports_dir) -> dict | None:
+    """Состояние kill-switch с диска; None — файла нет, {"corrupt": True} — fail closed."""
+    path = kill_switch_path(reports_dir)
+    if not path.exists():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {"corrupt": True}
+    return payload if isinstance(payload, dict) else {"corrupt": True}
+
+
+def clear_kill_switch(reports_dir) -> bool:
+    """Снимает kill-switch (cli.py kill-switch-reset); True — файл существовал."""
+    path = kill_switch_path(reports_dir)
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        return False
+    return True
+
+
+def _write_kill_switch(reports_dir, payload: dict) -> None:
+    """Атомарная запись состояния: временный файл рядом + os.replace."""
+    path = kill_switch_path(reports_dir)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def model_passes_live_gate(metrics: Mapping, min_dir_acc: float) -> bool:
+    """Гейт качества модели: без подтверждённого преимущества — новых входов нет.
+
+    Модель допускается, если у неё либо измеренный dir_acc >= min_dir_acc, либо
+    положительный edge после издержек: live_sharpe_net (пороговая стратегия, как
+    выбирает train) или strategy_sharpe_net (полный флип). Метрики NaN/отсутствие
+    доказательств — не допуск.
+    """
+    dir_acc = metrics.get("directional_acc")
+    if dir_acc is not None and not pd.isna(dir_acc) and float(dir_acc) >= min_dir_acc:
+        return True
+    for key in ("live_sharpe_net", "strategy_sharpe_net"):
+        value = metrics.get(key)
+        if value is not None and not pd.isna(value) and float(value) > 0.0:
+            return True
+    return False
 
 
 class SessionCalendar:
@@ -170,6 +240,8 @@ class TradingBot:
         self._running = False
         # kill-switch по просадке: False = новых входов нет, выходы работают
         self._entries_allowed = True
+        # сработавший kill-switch переживает рестарт до явного `cli.py kill-switch-reset`
+        self._load_kill_switch_state()
         # подряд неудачные продажи по figi: эскалация шума после FAILED_SELL_ESCALATION
         self._sell_failures: dict[str, int] = {}
         # бюджет счёта (якорь kill-switch и P&L); уточняется при старте цикла
@@ -181,6 +253,27 @@ class TradingBot:
         return self.calendar.active(now)
 
     # ---------- Данные и сигналы ----------
+
+    def _check_stale_candles(self, ticker: str, df: pd.DataFrame) -> None:
+        """Свеча старше 2 баров + запас — торговать по ней нельзя (аудит F-C1.5)."""
+        interval = self.config.candle_interval
+        bar_seconds = BAR_SECONDS.get(interval)
+        if bar_seconds is None:
+            if interval not in _STALE_UNKNOWN_INTERVALS:
+                _STALE_UNKNOWN_INTERVALS.add(interval)
+                log.warning(
+                    "Интервал %r не учтён в BAR_SECONDS — проверка устаревания свечей отключена",
+                    interval,
+                )
+            return
+        last = pd.Timestamp(df.index[-1])
+        if last.tzinfo is None:
+            last = last.tz_localize("UTC")
+        else:
+            last = last.tz_convert("UTC")
+        age_sec = (dt.datetime.now(dt.timezone.utc) - last.to_pydatetime()).total_seconds()
+        if age_sec > 2 * bar_seconds + STALE_BAR_GRACE_SEC:
+            raise StaleDataError(f"{ticker}: последняя свеча {last.isoformat()} старше допустимого")
 
     def refresh_candles(self, figi: str, ticker: str) -> pd.DataFrame:
         try:
@@ -198,6 +291,7 @@ class TradingBot:
         df = load_candles(self.conn, ticker, self.config.candle_interval)
         if df.empty:
             raise RuntimeError(f"{ticker}: в БД нет свечей — выполните команду download")
+        self._check_stale_candles(ticker, df)
         return df
 
     def update_news(self) -> None:
@@ -252,32 +346,14 @@ class TradingBot:
         return artifact
 
     def _model_allowed(self, ticker: str, artifact: ModelArtifact) -> bool:
-        """Гейт качества модели: без подтверждённого преимущества — новых входов нет.
-
-        Открытые позиции обслуживаются как обычно (стопы/тейки/выход по развороту);
-        гейт блокирует только открытие новых позиций. Модель допускается, если у неё
-        либо измеренный dir_acc >= MIN_MODEL_DIR_ACC, либо положительный edge после
-        издержек: live_sharpe_net (пороговая стратегия, как выбирает train) или
-        strategy_sharpe_net (полный флип). Метрики NaN/отсутствие доказательств — не допуск.
-        """
-        dir_acc = artifact.metrics.get("directional_acc")
-        if (
-            dir_acc is not None
-            and not pd.isna(dir_acc)
-            and float(dir_acc) >= self.config.min_model_dir_acc
-        ):
-            return True
-        for key in ("live_sharpe_net", "strategy_sharpe_net"):
-            value = artifact.metrics.get(key)
-            if value is not None and not pd.isna(value) and float(value) > 0.0:
-                return True
-        return False
+        """Гейт качества модели (см. model_passes_live_gate); блокирует только входы."""
+        return model_passes_live_gate(artifact.metrics, self.config.min_model_dir_acc)
 
     def predict(self, ticker: str, candles: pd.DataFrame, agenda: AgendaScore) -> tuple[float, float]:
         """Возвращает (прогноз доходности на горизонт, новостной скор)."""
         artifact = self._artifact(ticker)
 
-        features = ensure_news_columns(build_features(candles, self.config.forecast_horizon))
+        features = ensure_news_columns(build_live_features(candles, self.config.forecast_horizon))
 
         if artifact.kind == "lgbm" and artifact.model is not None:
             last = features.iloc[-1]
@@ -292,6 +368,16 @@ class TradingBot:
         return float(r_hat), float(agenda.sentiment)
 
     # ---------- Исполнение ----------
+
+    def _log_execution_deviation(self, ticker: str, price: float, exec_price: float) -> None:
+        """Проскальзывание факта против цены решения в базисных пунктах (аудит F-C2.2)."""
+        if price <= 0:
+            return
+        bps = (exec_price / price - 1.0) * 1e4
+        log.info(
+            "%s: отклонение исполнения %+.1f bps (решение %.2f → факт %.2f)",
+            ticker, bps, price, exec_price,
+        )
 
     def step_ticker(
         self, ticker: str, instrument: dict, portfolio: PortfolioState, entries_allowed: bool = True
@@ -365,15 +451,16 @@ class TradingBot:
                     ticker, state.get("status") or "неизвестен",
                 )
                 self.notifier.send_throttled(
-                    f"order-not-filled:{ticker}", f"заявка BUY {ticker} не исполнена",
+                    throttle_key("BUY", "order-not-filled", ticker), f"заявка BUY {ticker} не исполнена",
                     f"Статус: {state.get('status') or 'неизвестен'}\n"
                     f"Запрошено {decision.lots} лот(ов) по {price:.2f}\nПричина решения: {decision.reason}",
                 )
             else:
+                self._log_execution_deviation(ticker, price, exec_price)
                 if executed < decision.lots:
                     log.warning("%s: частичное исполнение покупки: %d из %d лотов", ticker, executed, decision.lots)
                     self.notifier.send_throttled(
-                        f"partial-fill:{ticker}", f"частичная покупка {ticker}",
+                        throttle_key("BUY", "partial-fill", ticker), f"частичная покупка {ticker}",
                         f"Исполнено {executed} из {decision.lots} лотов по {exec_price:.2f}\n"
                         f"Причина решения: {decision.reason}",
                     )
@@ -421,11 +508,12 @@ class TradingBot:
                     )
                 else:
                     self.notifier.send_throttled(
-                        f"order-not-filled:{ticker}", f"заявка SELL {ticker} не исполнена",
+                        throttle_key("SELL", "order-not-filled", ticker), f"заявка SELL {ticker} не исполнена",
                         f"Статус: {state.get('status') or 'неизвестен'}\n"
                         f"Пробовали продать {position.lots} лот(ов) по {price:.2f}\nПричина решения: {decision.reason}",
                     )
             else:
+                self._log_execution_deviation(ticker, price, exec_price)
                 self._sell_failures.pop(figi, None)
                 if executed < position.lots:
                     log.warning(
@@ -433,7 +521,7 @@ class TradingBot:
                         ticker, executed, position.lots,
                     )
                     self.notifier.send_throttled(
-                        f"partial-fill:{ticker}", f"частичная продажа {ticker}",
+                        throttle_key("SELL", "partial-fill", ticker), f"частичная продажа {ticker}",
                         f"Исполнено {executed} из {position.lots} лотов по {exec_price:.2f}\n"
                         f"Причина решения: {decision.reason}",
                     )
@@ -482,6 +570,12 @@ class TradingBot:
                     for ticker, instrument in self.instruments.items():
                         try:
                             self.step_ticker(ticker, instrument, portfolio, self._entries_allowed)
+                        except StaleDataError as exc:
+                            log.warning("%s: свечи устарели — тикер пропущен: %s", ticker, exc)
+                            self.notifier.send_throttled(
+                                f"stale-data:{ticker}", f"свечи {ticker} устарели", str(exc)
+                            )
+                            continue
                         except Exception as exc:
                             log.exception("%s: шаг не выполнен: %s", ticker, exc)
                             self.notifier.send_throttled(
@@ -522,23 +616,53 @@ class TradingBot:
             self.conn.close()
             log.info("Бот остановлен")
 
+    def _load_kill_switch_state(self) -> None:
+        """Восстанавливает сработавший kill-switch с диска (в т.ч. повреждённый — fail closed)."""
+        reports_dir = getattr(self.config, "reports_dir", None)
+        if not reports_dir:
+            return
+        state = read_kill_switch(reports_dir)
+        if state is None:
+            return
+        self._entries_allowed = False
+        triggered_at = None if state.get("corrupt") else state.get("triggered_at")
+        log.error(
+            "kill-switch активен с %s: новых входов нет, пока не выполнена `cli.py kill-switch-reset`",
+            triggered_at or "неизвестного времени",
+        )
+
     def _check_kill_switch(self, equity: float) -> None:
-        """Просадка глубже MAX_DRAWDOWN_PCT — навсегда (до перезапуска) запретить входы."""
+        """Просадка глубже MAX_DRAWDOWN_PCT — запретить входы до явного сброса (переживает рестарт)."""
         anchor = self._budget_rub if self._budget_rub is not None else self.config.sandbox_initial_rub
         if self._entries_allowed and equity < anchor * (1.0 - self.config.max_drawdown_pct):
             self._entries_allowed = False
             dd = 1.0 - equity / anchor
+            triggered_at = dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
+            reports_dir = getattr(self.config, "reports_dir", None)
+            if reports_dir:
+                try:
+                    _write_kill_switch(
+                        reports_dir,
+                        {
+                            "triggered_at": triggered_at,
+                            "equity": equity,
+                            "budget": anchor,
+                            "threshold": self.config.max_drawdown_pct,
+                        },
+                    )
+                except OSError as exc:
+                    log.error("kill-switch: не удалось сохранить состояние (%s)", exc)
             log.error(
                 "KILL-SWITCH: капитал %.0f руб — просадка %.1f%% превышает MAX_DRAWDOWN_PCT (%.0f%%). "
                 "Новые входы запрещены; стопы/тейки продолжают работать. Вернуть торговлю: "
-                "поднять порог в .env и перезапустить бота.",
+                "`cli.py kill-switch-reset`.",
                 equity, dd * 100, self.config.max_drawdown_pct * 100,
             )
             self.notifier.send(
                 "kill-switch: просадка сверх порога",
                 f"Капитал {equity:,.0f} руб — просадка {dd:.1%} при пороге "
                 f"{self.config.max_drawdown_pct:.0%} (бюджет {anchor:,.0f} руб).\n"
-                f"Новые входы запрещены до перезапуска бота; "
+                f"Новые входы запрещены до `cli.py kill-switch-reset`; "
                 f"открытые позиции обслуживаются.",
             )
 
