@@ -5,8 +5,12 @@
 """
 from __future__ import annotations
 
+import logging
+
 import numpy as np
 import pandas as pd
+
+log = logging.getLogger(__name__)
 
 ROLL_WINDOWS = (5, 10, 20)
 RSI_PERIOD = 14
@@ -39,8 +43,8 @@ def _atr(df: pd.DataFrame, period: int = ATR_PERIOD) -> pd.Series:
     return tr.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
 
 
-def build_features(df: pd.DataFrame, horizon: int) -> pd.DataFrame:
-    """Добавляет признаки и таргет; строки с прогревочными NaN удаляются."""
+def _compute_features(df: pd.DataFrame, horizon: int) -> pd.DataFrame:
+    """Считает признаки и forward-таргет; строки с NaN/Inf не удаляет."""
     if df.empty or len(df) < 40:
         raise ValueError(f"Слишком мало свечей ({len(df)}), нужно >= 40")
 
@@ -93,9 +97,43 @@ def build_features(df: pd.DataFrame, horizon: int) -> pd.DataFrame:
             out[col] = 0.0
 
     out[TARGET] = close.shift(-horizon) / close - 1.0
-    out = out.replace([np.inf, -np.inf], np.nan)
-    out = out.dropna()
-    return out
+    return out.replace([np.inf, -np.inf], np.nan)
+
+
+def build_features(df: pd.DataFrame, horizon: int) -> pd.DataFrame:
+    """Добавляет признаки и таргет; строки с прогревочными NaN удаляются."""
+    computed = _compute_features(df, horizon)
+    features = computed.dropna()
+
+    # Санитарный sentinel: слишком агрессивное выпадение строк означает, что
+    # признаки/таргет почти не строятся (обычно из-за вырожденной серии цен).
+    # Предупреждаем, но результат не меняем — вызывающий код получает те же данные.
+    total = len(computed)
+    dropped = total - len(features)
+    feature_ready = computed.dropna(subset=FEATURE_COLUMNS)
+    missing_target = int(feature_ready[TARGET].isna().sum())
+    if total and (missing_target > horizon or dropped / total > 0.5):
+        log.warning(
+            "build_features: отброшено %d из %d строк (%.1f%%), "
+            "строк с признаками без таргета: %d (горизонт %d)",
+            dropped,
+            total,
+            dropped / total * 100.0,
+            missing_target,
+            horizon,
+        )
+    return features
+
+
+def build_live_features(df: pd.DataFrame, horizon: int) -> pd.DataFrame:
+    """Признаки последнего бара: хвост с неопределённым таргетом сохраняется.
+
+    В отличие от build_features, отбрасываются только прогревочные строки с NaN
+    в признаках, поэтому последняя строка соответствует последнему бару df,
+    а не бару horizon назад. TARGET в хвосте остаётся NaN — модель его не читает.
+    """
+    features = _compute_features(df, horizon)
+    return features.dropna(subset=FEATURE_COLUMNS)
 
 
 FEATURE_COLUMNS = [

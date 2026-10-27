@@ -241,10 +241,12 @@ def save_report(result: BacktestResult, reports_dir: Path, name: str) -> Path:
         f"| Buy&hold того же окна | {m.get('benchmark_buyhold', 0):+.2%} |",
         f"| Стратегия минус бенчмарк | {m.get('total_return', 0) - m.get('benchmark_buyhold', 0):+.2%} |",
         "",
-        "## Кривая капитала",
+        f"Кривая капитала: `equity_{name}.csv`",
     ]
     path.write_text("\n".join(lines), encoding="utf-8")
     result.equity_curve.to_csv(reports_dir / f"equity_{name}.csv")
     result.trades.to_csv(reports_dir / f"trades_{name}.csv", index=False)
-    (reports_dir / f"metrics_{name}.json").write_text(json.dumps(m, ensure_ascii=False, indent=2), encoding="utf-8")
+    (reports_dir / f"backtest_metrics_{name}.json").write_text(
+        json.dumps(m, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
     return path
