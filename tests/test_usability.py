@@ -95,7 +95,8 @@ def test_status_reports_data_models_and_gaps(tmp_path, capsys):
     )
 
     assert cli.cmd_status(config) == 0
-    out = capsys.readouterr().out
+    captured = capsys.readouterr()
+    out = captured.out + captured.err
     assert "SBER" in out and "lgbm" in out and "55.0%" in out
     assert "GAZP" in out  # нет ни данных, ни модели — должен быть назван в предупреждениях
     assert "download" in out and "train" in out  # подсказки, что делать с пробелами
@@ -104,8 +105,9 @@ def test_status_reports_data_models_and_gaps(tmp_path, capsys):
 def test_status_on_empty_project(tmp_path, capsys):
     config = make_config(tmp_path)
     assert cli.cmd_status(config) == 0
-    out = capsys.readouterr().out
-    assert "Свечей нет" in out and "нет моделей" in out
+    captured = capsys.readouterr()
+    assert "Свечей нет" in captured.out + captured.err
+    assert "нет моделей" in captured.out + captured.err
 
 
 # ---------- setup: цепочка шагов с остановкой на сбое ----------
@@ -144,7 +146,7 @@ def test_setup_stops_on_failed_step(tmp_path, monkeypatch, capsys):
 def test_send_test_email_fails_cleanly_without_smtp(tmp_path, capsys):
     config = make_config(tmp_path, notify_email_to="", smtp_host="", smtp_user="", smtp_password="")
     assert cli.cmd_send_test_email(config) == 2
-    assert "SMTP" in capsys.readouterr().out
+    assert "SMTP" in capsys.readouterr().err
 
 
 def test_send_test_email_ok_with_mocked_send(tmp_path, monkeypatch, capsys):

@@ -13,6 +13,9 @@
     python cli.py run                    # торговый цикл в sandbox
     python cli.py run --iterations 5     # пробный запуск, 5 итераций
     python cli.py report                 # состояние счёта и журнал сделок
+    python cli.py status --json          # машинночитаемая сводка (для мониторинга)
+    python cli.py check-config           # проверка конфигурации без обращения к API
+    python cli.py kill-switch-reset      # снять kill-switch после срабатывания
     python cli.py watchdog --restart     # проверка живости бота (для cron)
     python cli.py digest                 # письмо-дайджест состояния (для cron)
     python cli.py send-test-email        # проверка SMTP-настроек
@@ -29,11 +32,14 @@ import datetime as dt
 import json
 import logging
 import logging.handlers
+import math
+import shutil
 import sys
 from dataclasses import replace
 from pathlib import Path
 
 import pandas as pd
+import requests
 
 import ui
 from backtest import run_backtest, save_report
@@ -62,7 +68,7 @@ from tbank.market_data import (
     store_instruments,
     store_news,
 )
-from tbank.rest import TBankRestClient
+from tbank.rest import APIError, TBankRestClient
 
 __VERSION__ = "1.2.0"
 
@@ -70,6 +76,17 @@ __VERSION__ = "1.2.0"
 def _sandbox_budget(config) -> float:
     """Бюджет песочницы: ACCOUNT_BUDGET_RUB, если задан, иначе SANDBOX_INITIAL_RUB."""
     return getattr(config, "account_budget_rub", None) or config.sandbox_initial_rub
+
+
+def _json_safe(obj):
+    """Рекурсивно заменяет NaN/inf на None: RFC 8259 не допускает такие числа."""
+    if isinstance(obj, float):
+        return obj if math.isfinite(obj) else None
+    if isinstance(obj, dict):
+        return {key: _json_safe(value) for key, value in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_json_safe(value) for value in obj]
+    return obj
 
 
 class ColorFormatter(logging.Formatter):
@@ -104,7 +121,7 @@ def ok(message: str) -> None:
 
 
 def warn(message: str) -> None:
-    print(f"{ui.paint('[!!]', ui.BRIGHT_RED)} {ui.paint(message, ui.YELLOW)}")
+    print(f"{ui.paint('[!!]', ui.BRIGHT_RED)} {ui.paint(message, ui.YELLOW)}", file=sys.stderr)
 
 
 def make_api(config: Config) -> TBankAPI:
@@ -121,6 +138,13 @@ def _pick_account(config, accounts: list[dict]) -> str:
         if not any(acc.get("id") == configured for acc in accounts):
             raise RuntimeError(f"ACCOUNT_ID={configured} не найден среди счетов API")
         return configured
+    if len(accounts) > 1:
+        print(
+            f"[!!] ACCOUNT_ID не задан, а счетов несколько ({len(accounts)}) — "
+            f"для отчёта используется первый: {accounts[0]['id']}. "
+            "Укажите ACCOUNT_ID в .env, чтобы выбрать нужный счёт.",
+            file=sys.stderr,
+        )
     return accounts[0]["id"]
 
 
@@ -154,6 +178,7 @@ def cmd_smoke(config: Config) -> int:
         + (f", последняя close={last['close']:.2f}" if last is not None else "")
     )
 
+    problems: list[str] = []
     try:
         news = api.get_news(max_pages=1)
         sber_uid = first.get("uid") or first["figi"]
@@ -169,9 +194,13 @@ def cmd_smoke(config: Config) -> int:
             print(f"     {item['pub_time'][:19]} | {item['title'][:70]}")
     except Exception as exc:
         warn(f"Новости недоступны: {exc}")
+        problems.append("новости недоступны")
 
     conn.close()
     print()
+    if problems:
+        warn(f"Smoke-тест пройден частично: {', '.join(problems)}")
+        return 1
     ok("Smoke-тест пройден")
     return 0
 
@@ -181,7 +210,9 @@ def cmd_download(config: Config, days: int) -> int:
     instruments = api.resolve_instruments(config.tickers)
     conn = connect(config.db_path)
     store_instruments(conn, instruments)  # лоты/uid для офлайн-команд (backtest)
-    for ticker, instrument in instruments.items():
+    total = len(config.tickers)
+    for i, (ticker, instrument) in enumerate(instruments.items(), 1):
+        print(f"[{i}/{total}] {ticker}")
         print(f"Выгрузка {ticker} ({config.candle_interval}, {days} дней)...")
         n = download_candles(api, conn, instrument["figi"], config.candle_interval, days_back=days, ticker=ticker)
         print(f"  {ticker}: {n} свечей")
@@ -276,7 +307,8 @@ def cmd_train(config: Config, capital: float | None = None) -> int:
                 f"· позиция до {pos_pct:.0%} капитала"
             )
         )
-    for ticker in config.tickers:
+    for i, ticker in enumerate(config.tickers, 1):
+        print(f"[{i}/{len(config.tickers)}] {ticker}")
         df = load_candles(conn, ticker, config.candle_interval)
         if df.empty:
             warn(f"{ticker}: нет свечей в {config.db_path} — выполните `python cli.py download`")
@@ -339,7 +371,8 @@ def cmd_train(config: Config, capital: float | None = None) -> int:
             payload |= {"capital_rub": capital, "profile": capital_profile}
         config.reports_dir.mkdir(parents=True, exist_ok=True)
         (config.reports_dir / "train_summary.json").write_text(
-            json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
+            json.dumps(_json_safe(payload), ensure_ascii=False, indent=2, allow_nan=False),
+            encoding="utf-8",
         )
         print(
             f"Итого обучено: {len(summary)}/{len(config.tickers)}. "
@@ -365,7 +398,7 @@ def cmd_backtest(config: Config, capital: float | None = None) -> int:
         max_total_exposure_pct=config.max_total_exposure_pct,
     )
     # тональность нужна и офлайн: скоры кэшируются в БД, живой цикл их разделяет
-    from bot import ensure_sentiments
+    from bot import ensure_sentiments, model_passes_live_gate
     from nlp.agenda import sentiment_series
     from nlp.sentiment import make_sentiment
 
@@ -384,6 +417,11 @@ def cmd_backtest(config: Config, capital: float | None = None) -> int:
         except FileNotFoundError as exc:
             warn(f"{ticker}: {exc}")
             continue
+        if not model_passes_live_gate(artifact.metrics, config.min_model_dir_acc):
+            warn(
+                f"{ticker}: модель {artifact.kind} не прошла бы live-гейт — "
+                "в боте новых входов не будет"
+            )
         features = ensure_news_columns(build_features(df, config.forecast_horizon))
 
         instrument = load_instrument(conn, ticker)
@@ -463,6 +501,16 @@ def cmd_backtest(config: Config, capital: float | None = None) -> int:
 
 
 def cmd_run(config: Config, max_iterations: int | None) -> int:
+    # F-C1.6: в real — только после явного подтверждения в .env (systemd работает
+    # без интерактивного ввода, поэтому это флаг, а не вопрос в консоли)
+    if config.mode == "real" and not getattr(config, "confirm_real_trading", False):
+        print(
+            "[!!] MODE=real: для торговли на реальном счёте задайте CONFIRM_REAL_TRADING=YES "
+            "в окружении или .env",
+            file=sys.stderr,
+        )
+        return 2
+
     from bot import TradingBot
 
     # артефакты обязательны: без модели бот не может прогнозировать
@@ -614,10 +662,12 @@ def cmd_report(config: Config) -> int:
         warn(
             f"капитал выше вложенного на {ui.fmt_money(total - invested)} руб, "
             "но в flows.csv нет записей об этом — похоже, было неучтённое пополнение. "
-            "Выполните `python cli.py normalize`: излишек будет выведен и внесён в учёт."
+            "Выполните `python cli.py normalize`: команда сверит счёт с бюджетом; "
+            "излишек не выводится — вывода из песочницы через API нет, вернуть бюджет "
+            "можно только пересозданием счёта: `python cli.py reset-sandbox`."
         )
 
-    print(ui.header("P&L ПО ПЕРИОДАМ (без учёта пополнений/выводов)"))
+    print(ui.header("P&L ПО ПЕРИОДАМ (с поправкой на пополнения/выводы)"))
     equity_file = config.reports_dir / "equity_live.csv"
     equity = None
     if equity_file.exists():
@@ -754,29 +804,50 @@ def _print_benchmark(config: Config, equity: pd.DataFrame, bot_return: float) ->
     )
 
 
-def _model_row(config: Config, ticker: str) -> list[str] | None:
-    """Строка таблицы моделей: тип, порог, dir_acc, возраст артефакта; None — модели нет."""
+def _model_info(config: Config, ticker: str) -> dict | None:
+    """Данные артефакта модели: вид, порог, dir_acc, возраст; None — модели нет."""
     path = artifact_path(config.models_dir, ticker, config.candle_interval, config.forecast_horizon)
     if not path.exists():
         return None
-    kind, threshold, dir_acc = "--", "--", "--"
+    kind, threshold, dir_acc = "--", None, None
     metrics_path = path.with_name(f"metrics_{ticker}_{config.candle_interval}_h{config.forecast_horizon}.json")
     try:
         data = json.loads(metrics_path.read_text(encoding="utf-8"))
         kind = str(data.get("best", "--"))
-        threshold = f"{float(data.get('threshold', 0.0)):.4f}"
+        threshold = float(data.get("threshold", 0.0))
         acc = (data.get("metrics", {}).get("directional_acc", {}) or {}).get(kind)
         if acc is not None:
-            dir_acc = f"{float(acc):.1%}"
+            dir_acc = float(acc)
     except (OSError, ValueError, TypeError):
         pass  # артефакт есть, метрики не читаются — покажем хотя бы возраст
     age_days = (dt.datetime.now() - dt.datetime.fromtimestamp(path.stat().st_mtime)).days
+    return {
+        "ticker": ticker,
+        "kind": kind,
+        "threshold": threshold,
+        "dir_acc": dir_acc,
+        "age_days": age_days,
+    }
+
+
+def _model_row(config: Config, ticker: str) -> list[str] | None:
+    """Строка таблицы моделей: тип, порог, dir_acc, возраст артефакта; None — модели нет."""
+    info = _model_info(config, ticker)
+    if info is None:
+        return None
+    threshold = "--" if info["threshold"] is None else f"{info['threshold']:.4f}"
+    dir_acc = "--" if info["dir_acc"] is None else f"{info['dir_acc']:.1%}"
+    age_days = info["age_days"]
     age = "сегодня" if age_days == 0 else f"{age_days} дн."
-    return [ticker, kind, threshold, dir_acc, age]
+    return [ticker, info["kind"], threshold, dir_acc, age]
 
 
-def cmd_status(config: Config) -> int:
+def cmd_status(config: Config, json_output: bool = False) -> int:
     """Офлайн-сводка без обращения к API: конфиг, покрытие данных, модели, живость."""
+    if json_output:
+        print(json.dumps(_json_safe(_status_payload(config)), ensure_ascii=False, indent=2, allow_nan=False))
+        return 0
+
     print(ui.header(f"СТАТУС · режим {config.mode} · v{__VERSION__}"))
 
     print(ui.header("КОНФИГУРАЦИЯ"))
@@ -881,6 +952,35 @@ def _last_activity(reports_dir: Path) -> tuple[dt.datetime | None, str]:
     return max(stamps, key=lambda item: item[0])
 
 
+def _status_payload(config: Config) -> dict:
+    """Машиночитаемая сводка `status --json` (F-C4.10): те же данные, что и таблица."""
+    models = []
+    for ticker in config.tickers:
+        info = _model_info(config, ticker)
+        if info is not None:
+            models.append({"ticker": ticker, "kind": info["kind"], "dir_acc": info["dir_acc"]})
+    last, _source = _last_activity(config.reports_dir)
+    heartbeat_age_min = None
+    if last is not None:
+        heartbeat_age_min = (dt.datetime.now(dt.timezone.utc) - last).total_seconds() / 60
+    last_trade = None
+    journal = Path(config.reports_dir) / "journal.csv"
+    if journal.exists():
+        with open(journal, encoding="utf-8") as f:
+            rows = list(csv.DictReader(f))
+        if rows:
+            last_trade = dict(rows[-1])
+    return {
+        "mode": config.mode,
+        "capital_profile": config.capital_profile,
+        "budget_rub": config.budget_rub,
+        "tickers": list(config.tickers),
+        "models": models,
+        "heartbeat_age_min": heartbeat_age_min,
+        "last_trade": last_trade,
+    }
+
+
 def cmd_watchdog(config: Config, max_stale_min: int, restart: bool) -> int:
     """Живость бота: в открытую сессию heartbeat/equity должны обновляться каждый цикл.
 
@@ -893,6 +993,16 @@ def cmd_watchdog(config: Config, max_stale_min: int, restart: bool) -> int:
     from notify import Notifier
 
     reports = Path(config.reports_dir)
+    # F-C4.6: диск — единственный ресурс, который watchdog не видел; порог 500 МБ
+    disk_warning = None
+    try:
+        free_mb = shutil.disk_usage(reports).free / (1024 * 1024)
+    except OSError:
+        free_mb = None
+    if free_mb is not None and free_mb < 500:
+        disk_warning = f"мало свободного места: {free_mb:.0f} МБ в {reports} (порог 500 МБ)"
+        warn(disk_warning)
+
     in_session = SessionCalendar(make_api(config)).active()
     if not in_session:
         print("Вне торговой сессии MOEX — живость не проверяется (и это нормально)")
@@ -918,11 +1028,30 @@ def cmd_watchdog(config: Config, max_stale_min: int, restart: bool) -> int:
         f"Бот не подаёт признаков жизни во время открытой сессии MOEX.\n{note}.\n"
         f"Время проверки: {now.isoformat(timespec='seconds')}.\n"
     )
+    if disk_warning:
+        body += f"{disk_warning}\n"
     if restart:
         import subprocess
 
-        proc = subprocess.run(["systemctl", "restart", config.systemd_unit], capture_output=True, text=True)
-        outcome = "ок" if proc.returncode == 0 else f"ошибка: {(proc.stderr or '').strip()[:200]}"
+        try:
+            proc = subprocess.run(
+                ["systemctl", "restart", config.systemd_unit], capture_output=True, text=True
+            )
+        except FileNotFoundError:
+            print(
+                "[!!] systemctl не найден — перезапуск невозможен; "
+                "запустите юнит вручную или проверьте окружение",
+                file=sys.stderr,
+            )
+            return 1
+        if proc.returncode != 0:
+            detail = (proc.stderr or "").strip()[:200] or f"код {proc.returncode}"
+            print(
+                f"[!!] systemctl restart {config.systemd_unit} не удался: {detail}",
+                file=sys.stderr,
+            )
+            return 1
+        outcome = "ок"
         body += f"systemctl restart {config.systemd_unit}: {outcome}\n"
         print(f"Перезапуск {config.systemd_unit}: {outcome}")
 
@@ -965,10 +1094,15 @@ def compose_digest(config: Config) -> str:
         lines.append(f"ВНИМАНИЕ: {base_warning}")
 
     equity_file = Path(config.reports_dir) / "equity_live.csv"
+    equity = pd.DataFrame()
     if equity_file.exists():
         equity = pd.read_csv(equity_file)
         equity["time"] = pd.to_datetime(equity["time"], utc=True)
+    if not equity.empty:
+        first = equity["time"].iloc[0]
         now = equity["time"].iloc[-1]
+        coverage_days = max(1, round((now - first).total_seconds() / 86400))
+        lines.append(f"Данные за {coverage_days} дн. (с {first:%d.%m.%Y})")
         for label, days in (("день", 1), ("неделя", 7)):
             res = _period_pnl(equity, flows, now - pd.Timedelta(days=days))
             if res is None:
@@ -1018,7 +1152,8 @@ def cmd_digest(config: Config) -> int:
         print(body)
         warn("SMTP не настроен (NOTIFY_EMAIL_TO, SMTP_HOST/USER/PASSWORD) — письмо не отправлено, текст выше")
         return 1
-    if notifier.send("дайджест дня", body):
+    today = dt.datetime.now(dt.timezone.utc).date()
+    if notifier.send(f"дайджест {today:%Y-%m-%d}", body):
         ok("Дайджест отправлен")
         return 0
     warn("Не удалось отправить дайджест")
@@ -1096,6 +1231,18 @@ def _rotate_report_file(path: Path) -> str | None:
     return archived.name
 
 
+def _confirm_reset(assume_yes: bool) -> bool | None:
+    """Подтверждение сброса: True — да, False — отказ, None — нет интерактивного ввода."""
+    if assume_yes:
+        return True
+    try:
+        answer = input("  Подтвердите (YES): ").strip()
+    except EOFError:
+        print("  Нет интерактивного ввода — передайте --yes для подтверждения", file=sys.stderr)
+        return None
+    return answer == "YES"
+
+
 def cmd_reset_sandbox(config: Config, assume_yes: bool = False) -> int:
     """Полный сброс sandbox: закрыть счёт, открыть новый, внести бюджет.
 
@@ -1125,11 +1272,12 @@ def cmd_reset_sandbox(config: Config, assume_yes: bool = False) -> int:
         f"  Счёт будет ЗАКРЫТ вместе с позициями; откроется новый с бюджетом "
         f"{ui.fmt_money(_sandbox_budget(config))} руб."
     )
-    if not assume_yes:
-        answer = input("  Подтвердите (YES): ").strip()
-        if answer != "YES":
-            print("  Отменено")
-            return 1
+    confirmed = _confirm_reset(assume_yes)
+    if confirmed is None:
+        return 2
+    if not confirmed:
+        print("  Отменено")
+        return 1
 
     api.close_sandbox_account(trader.account_id)
     new_account_id = api.open_sandbox_account()
@@ -1147,8 +1295,30 @@ def cmd_reset_sandbox(config: Config, assume_yes: bool = False) -> int:
     return 0
 
 
+def cmd_check_config(config: Config) -> int:
+    """Полная проверка конфигурации: режим, токен, риск-параметры (без API)."""
+    try:
+        config.validate()
+    except ValueError as exc:
+        print(f"[!!] Конфигурация: {exc}", file=sys.stderr)
+        return 2
+    ok("Конфигурация корректна")
+    return 0
+
+
+def cmd_kill_switch_reset(config: Config) -> int:
+    """Снять активный kill-switch: только файл в reports/, API не нужен."""
+    from bot import clear_kill_switch
+
+    if clear_kill_switch(Path(config.reports_dir)):
+        ok("Kill-switch сброшен — новые входы разрешены после перезапуска бота")
+    else:
+        warn("Kill-switch не был активен")
+    return 0
+
+
 # команды, которым не нужен токен T-Invest (офлайн или только SMTP)
-MODE_ONLY_COMMANDS = {"train", "backtest", "status", "send-test-email"}
+MODE_ONLY_COMMANDS = {"train", "backtest", "status", "send-test-email", "kill-switch-reset"}
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -1156,6 +1326,7 @@ def _build_parser() -> argparse.ArgumentParser:
         description="Торговый бот T-Invest API (sandbox) с ML-прогнозом и новостным анализом",
     )
     parser.add_argument("--version", action="version", version=f"%(prog)s {__VERSION__}")
+    parser.add_argument("--no-color", action="store_true", help="отключить цвета в выводе (как NO_COLOR=1)")
     sub = parser.add_subparsers(dest="command", required=True, metavar="command")
 
     sub.add_parser("smoke", help="проверка токена, счёта и API (открывает и пополняет sandbox-счёт)")
@@ -1175,7 +1346,10 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--iterations", type=int, default=None, help="число итераций цикла (пробный запуск)")
 
     sub.add_parser("report", help="состояние счёта: P&L, позиции, сделки, кривая капитала")
-    sub.add_parser("status", help="офлайн-сводка: конфиг, данные, модели, живость (без API)")
+    p = sub.add_parser("status", help="офлайн-сводка: конфиг, данные, модели, живость (без API)")
+    p.add_argument("--json", action="store_true", help="машиночитаемая сводка одним JSON-объектом")
+
+    sub.add_parser("check-config", help="проверить конфигурацию: режим, токен, риск-параметры")
 
     p = sub.add_parser("watchdog", help="проверка живости бота (для cron)")
     p.add_argument("--max-stale-min", type=int, default=20, help="порог устаревания отметок живости, минут")
@@ -1184,6 +1358,7 @@ def _build_parser() -> argparse.ArgumentParser:
     sub.add_parser("digest", help="письмо-дайджест состояния счёта (для cron)")
     sub.add_parser("send-test-email", help="тестовое письмо: проверка SMTP-настроек")
     sub.add_parser("normalize", help="проверить счёт на соответствие бюджету (sandbox)")
+    sub.add_parser("kill-switch-reset", help="сбросить kill-switch — разрешить новые входы (локально)")
 
     p = sub.add_parser("reset-sandbox", help="пересоздать sandbox-счёт с бюджетом")
     p.add_argument("--yes", action="store_true", help="не спрашивать подтверждение")
@@ -1215,6 +1390,9 @@ def _attach_file_log(config: Config) -> None:
 
 def main() -> int:
     args = _build_parser().parse_args()
+    if args.no_color:
+        ui.set_colors(False)
+        ui.set_colors(False, sys.stderr)
 
     config = Config()
     try:
@@ -1228,35 +1406,51 @@ def main() -> int:
         return 2
     _attach_file_log(config)
 
-    if args.command == "setup":
-        return cmd_setup(config, args.days, args.capital)
-    if args.command == "smoke":
-        return cmd_smoke(config)
-    if args.command == "download":
-        return cmd_download(config, args.days or config.history_days)
-    if args.command == "news":
-        return cmd_news(config)
-    if args.command == "train":
-        return cmd_train(config, args.capital)
-    if args.command == "backtest":
-        return cmd_backtest(config, args.capital)
-    if args.command == "run":
-        return cmd_run(config, args.iterations)
-    if args.command == "report":
-        return cmd_report(config)
-    if args.command == "status":
-        return cmd_status(config)
-    if args.command == "watchdog":
-        return cmd_watchdog(config, args.max_stale_min, args.restart)
-    if args.command == "digest":
-        return cmd_digest(config)
-    if args.command == "send-test-email":
-        return cmd_send_test_email(config)
-    if args.command == "normalize":
-        return cmd_normalize(config)
-    if args.command == "reset-sandbox":
-        return cmd_reset_sandbox(config, assume_yes=args.yes)
-    return 1
+    try:
+        if args.command == "setup":
+            return cmd_setup(config, args.days, args.capital)
+        if args.command == "smoke":
+            return cmd_smoke(config)
+        if args.command == "download":
+            return cmd_download(config, args.days or config.history_days)
+        if args.command == "news":
+            return cmd_news(config)
+        if args.command == "train":
+            return cmd_train(config, args.capital)
+        if args.command == "backtest":
+            return cmd_backtest(config, args.capital)
+        if args.command == "run":
+            return cmd_run(config, args.iterations)
+        if args.command == "report":
+            return cmd_report(config)
+        if args.command == "status":
+            if getattr(args, "json", False):
+                return cmd_status(config, json_output=True)
+            return cmd_status(config)
+        if args.command == "check-config":
+            return cmd_check_config(config)
+        if args.command == "kill-switch-reset":
+            return cmd_kill_switch_reset(config)
+        if args.command == "watchdog":
+            return cmd_watchdog(config, args.max_stale_min, args.restart)
+        if args.command == "digest":
+            return cmd_digest(config)
+        if args.command == "send-test-email":
+            return cmd_send_test_email(config)
+        if args.command == "normalize":
+            return cmd_normalize(config)
+        if args.command == "reset-sandbox":
+            return cmd_reset_sandbox(config, assume_yes=args.yes)
+        return 1
+    except APIError as exc:
+        print(f"[!!] Ошибка API: {exc}", file=sys.stderr)
+        return 2
+    except requests.RequestException as exc:
+        print(f"[!!] Нет соединения с API: {exc}", file=sys.stderr)
+        return 2
+    except RuntimeError as exc:
+        print(f"[!!] {exc}", file=sys.stderr)
+        return 2
 
 
 if __name__ == "__main__":

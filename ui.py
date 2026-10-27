@@ -107,8 +107,8 @@ def fmt_signed_log(value: float, fmt: str = "{:+.2%}") -> str:
 
 
 def fmt_money(value: float) -> str:
-    """1 000 000.4 -> '1 000 000' (рубли, тонкий разделитель разрядов)."""
-    return f"{value:,.0f}".replace(",", "\u2009" if color_enabled() else " ")
+    """1 000 000.4 -> '1 000 000' (рубли; обычный пробел — числа удобно копировать)."""
+    return f"{value:,.0f}".replace(",", " ")
 
 
 # ---------- Таблицы ----------
@@ -158,6 +158,6 @@ def render_table(
 
 
 def header(title: str, width: int = 64, stream=None) -> str:
-    """'── Заголовок ──────────────' — цветной разделитель секций."""
+    """'-- Заголовок -----' — цветной ASCII-разделитель секций (добивка дефисами)."""
     line = f"-- {title} ".ljust(width, "-")
     return paint(line, CYAN, BOLD, stream=stream)
