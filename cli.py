@@ -33,6 +33,7 @@ import json
 import logging
 import logging.handlers
 import math
+import os
 import shutil
 import sys
 import time
@@ -559,6 +560,14 @@ def _real_trading_guard(config: Config) -> int | None:
     return None
 
 
+def _ensure_daemon_streams() -> None:
+    """pythonw без консоли: потоки None — подменяем на devnull, чтобы бот не падал на print."""
+    if sys.stdout is None:
+        sys.stdout = open(os.devnull, "w", encoding="utf-8")
+    if sys.stderr is None:
+        sys.stderr = open(os.devnull, "w", encoding="utf-8")
+
+
 def _ensure_daemon_log(config: Config) -> None:
     """pythonw без консоли не должен терять лог: по умолчанию var/daemon.log."""
     if config.log_file is not None:
@@ -615,6 +624,7 @@ def cmd_run(config: Config, max_iterations: int | None) -> int:
 
 
 def cmd_daemon_run(config: Config, max_iterations: int | None = None) -> int:
+    _ensure_daemon_streams()  # pythonw: stdout/stderr = None до первого print
     print(ui.mode_banner(config.mode))  # первая строка вывода: режим виден сразу
     return _run_headless(config, max_iterations)
 

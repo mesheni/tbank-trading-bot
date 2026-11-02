@@ -6,9 +6,12 @@
 from __future__ import annotations
 
 import json
+import sys
 import threading
 import time
 from types import SimpleNamespace
+
+import pytest
 
 import bot as bot_module
 import cli
@@ -296,3 +299,31 @@ def test_fake_api_is_offline_and_deterministic():
     state = api.post_order("fake-account", "FAKE-SBER", 1, "ORDER_DIRECTION_BUY", price=100.0)
     assert state["status"] == "fill"
     assert state["lots_executed"] == 1
+
+
+# =====================================================================
+# (3) pythonw.exe: sys.stdout/sys.stderr are None at logon (no console)
+# =====================================================================
+
+@pytest.mark.parametrize("entry", [cli.cmd_daemon_run, cli.cmd_run])
+@pytest.mark.parametrize("missing", [("stdout",), ("stderr",), ("stdout", "stderr")])
+def test_daemon_entry_survives_missing_std_streams(tmp_path, monkeypatch, entry, missing):
+    """pythonw: потоки None — daemon-run не падает и подставляет devnull.
+
+    monkeypatch восстанавливает sys.stdout/sys.stderr и при падении теста.
+    """
+    config = make_config(tmp_path, tbank_fake_api=True)
+    for name in missing:
+        monkeypatch.setattr(sys, name, None)
+
+    rc = entry(config, max_iterations=1)
+
+    assert rc == 0
+    assert sys.stdout is not None and sys.stderr is not None
+    sys.stdout.write("")  # devnull-поток принимает записи без исключений
+    sys.stderr.write("")
+    status_path = control.paths(config.reports_dir)["status"]
+    assert status_path.exists()  # misleading_success: файл статуса, а не только rc
+    payload = json.loads(status_path.read_text(encoding="utf-8"))
+    assert payload["state"] == "stopped"
+    assert payload["iteration"] >= 1
