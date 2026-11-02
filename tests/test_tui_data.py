@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import time
 
 import pytest
 
@@ -84,6 +85,55 @@ def test_corrupt_status_is_corrupt(tmp_path):
     state = data.daemon_state(tmp_path, now=NOW)
     assert state["corrupt"] is True
     assert data.badge(state, now=NOW) == "corrupt"
+
+
+# ---------- badge: daemon_status.json semantics (todo 9) ----------
+# Вне сессии демон не пишет heartbeat, но daemon_status.json обновляется каждый тик:
+# свежий статус со state=running — это running без heartbeat вообще.
+
+def test_status_running_without_heartbeat_is_running(tmp_path):
+    _write_status(tmp_path, updated_at=(NOW - dt.timedelta(seconds=30)).isoformat())
+    state = data.daemon_state(tmp_path, now=NOW)
+    assert state["status"] is not None
+    assert data.badge(state, now=NOW) == "running"
+
+
+def test_status_running_wins_over_stale_heartbeat(tmp_path):
+    _write_status(tmp_path, updated_at=(NOW - dt.timedelta(seconds=30)).isoformat())
+    _write_heartbeat(tmp_path, 30)  # по старой логике было бы offline
+    assert data.badge(data.daemon_state(tmp_path, now=NOW), now=NOW) == "running"
+
+
+def test_status_stopped_is_offline_even_with_fresh_heartbeat(tmp_path):
+    _write_status(tmp_path, state="stopped", updated_at=NOW.isoformat())
+    _write_heartbeat(tmp_path, 1)  # свежий heartbeat после мягкой остановки
+    assert data.badge(data.daemon_state(tmp_path, now=NOW), now=NOW) == "offline"
+
+
+def test_status_running_without_updated_at_is_stale(tmp_path):
+    _write_status(tmp_path, updated_at=None)
+    assert data.badge(data.daemon_state(tmp_path, now=NOW), now=NOW) == "stale"
+
+
+def test_status_unknown_state_is_offline(tmp_path):
+    _write_status(tmp_path, state="weird")
+    assert data.badge(data.daemon_state(tmp_path, now=NOW), now=NOW) == "offline"
+
+
+@pytest.mark.parametrize(
+    ("age_sec", "expected"),
+    [
+        (0.0, "running"),
+        (data.STATUS_FRESH_SEC, "running"),  # граница включительно
+        (data.STATUS_FRESH_SEC + 0.01, "stale"),
+        (1200.0, "stale"),  # 20 мин — граница STALE_MAX_MIN включительно
+        (1200.01, "offline"),
+    ],
+)
+def test_status_badge_boundaries(tmp_path, age_sec, expected):
+    stamp = NOW - dt.timedelta(seconds=age_sec)
+    _write_status(tmp_path, updated_at=stamp.isoformat())
+    assert data.badge(data.daemon_state(tmp_path, now=NOW), now=NOW) == expected
 
 
 def test_malformed_heartbeat_does_not_raise(tmp_path):
@@ -289,3 +339,67 @@ def test_session_pnl_missing_or_empty_is_none(tmp_path):
     assert data.session_pnl(tmp_path) is None
     _write(tmp_path, "equity_live.csv", "time,total_rub,cash_rub,positions_rub\n1000,1,2,3\n")
     assert data.session_pnl(tmp_path) is None
+
+
+# ---------- tail_log (todo 9) ----------
+
+def test_tail_log_missing_file_is_empty(tmp_path):
+    assert data.tail_log(tmp_path / "missing.log") == []
+
+
+def test_tail_log_empty_file_is_empty(tmp_path):
+    (tmp_path / "empty.log").write_text("", encoding="utf-8")
+    assert data.tail_log(tmp_path / "empty.log") == []
+
+
+def test_tail_log_returns_last_n_lines(tmp_path):
+    path = tmp_path / "app.log"
+    path.write_text("".join(f"line {index:03d}\n" for index in range(40)), encoding="utf-8")
+    lines = data.tail_log(path, 30)
+    assert len(lines) == 30
+    assert lines[0] == "line 010"
+    assert lines[-1] == "line 039"
+
+
+def test_tail_log_binary_junk_does_not_raise(tmp_path):
+    path = tmp_path / "binary.log"
+    path.write_bytes(bytes([0xFF, 0xFE, 0x00, 0x01, 0x0A]) + b"tail\n")
+    assert data.tail_log(path, 30) == []
+
+
+def test_tail_log_non_nul_binary_is_empty(tmp_path):
+    # 0x80..0xFF без NUL и без переводов строк — невалидный UTF-8, не текст.
+    path = tmp_path / "binary-no-nul.log"
+    path.write_bytes(bytes([0x80, 0x81, 0xFF, 0xFE, 0xC3]))
+    assert data.tail_log(path, 30) == []
+
+
+def test_tail_log_multibyte_split_at_block_boundary(tmp_path):
+    # Строки по 10 001 байт: граница 8192-байтного блока приходится на
+    # середину двухбайтной «Ж»; хвост обязан декодироваться без потерь.
+    path = tmp_path / "cyrillic.log"
+    line = "Ж" * 5000
+    path.write_text("\n".join([line] * 40) + "\n", encoding="utf-8")
+    lines = data.tail_log(path, 30)
+    assert len(lines) == 30
+    assert lines[0] == line
+    assert lines[-1] == line
+    assert "\ufffd" not in "\n".join(lines)
+
+
+def test_tail_log_10mb_file_is_fast_and_exact(tmp_path):
+    path = tmp_path / "big.log"
+    # newline="\n" отключает CRLF-трансляцию на Windows: размер одинаков
+    # на Windows и POSIX (1_000_000 * 13 байт = 13_000_000 > 10 MiB).
+    with open(path, "w", encoding="utf-8", newline="\n") as handle:
+        handle.write("".join(f"line {index:07d}\n" for index in range(1_000_000)))
+    assert path.stat().st_size > 10 * 1024 * 1024
+
+    started = time.monotonic()
+    lines = data.tail_log(path, 30)
+    elapsed = time.monotonic() - started
+
+    assert len(lines) == 30
+    assert lines[0] == "line 0999970"
+    assert lines[-1] == "line 0999999"
+    assert elapsed < 1.0

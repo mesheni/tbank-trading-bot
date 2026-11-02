@@ -8,17 +8,20 @@ from __future__ import annotations
 
 import asyncio
 import time
+from pathlib import Path
 
 from textual import work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
-from textual.widgets import DataTable, Static
+from textual.widgets import DataTable, RichLog, Static
 
 import bot
 import control
 import tui.controls as controls
 import tui.data as data
+
+_VAR_DIR = Path(__file__).resolve().parents[1] / "var"
 
 _BADGE_COLORS = {
     "running": "green",
@@ -26,6 +29,32 @@ _BADGE_COLORS = {
     "offline": "red",
     "corrupt": "red",
 }
+
+
+def _resolve_log_path(config) -> Path | None:
+    """Лог демона: LOG_FILE из конфига, иначе var/daemon.log, иначе var/daemon.out."""
+    if config.log_file is not None:
+        return Path(config.log_file)
+    for name in ("daemon.log", "daemon.out"):
+        candidate = _VAR_DIR / name
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def _humanize_age(age_min: float | None) -> str:
+    """Возраст последней сделки по-русски; None — сделок ещё не было."""
+    if age_min is None:
+        return "сделок нет"
+    if age_min < 1.0:
+        return "только что"
+    minutes = int(age_min)
+    if minutes < 60:
+        return f"{minutes} мин назад"
+    hours = minutes // 60
+    if hours < 24:
+        return f"{hours} ч назад"
+    return f"{hours // 24} дн назад"
 
 
 def _ack_received(reports_dir, command_id: str) -> bool:
@@ -62,7 +91,11 @@ class TbankApp(App):
     #positions { height: 1fr; }
     #positions-empty { height: 1; }
     #journal { height: 1fr; }
-    #log { height: 1; }
+    #log {
+        height: 12;
+        border: round $primary;
+        padding: 0 1;
+    }
     #status { height: 1; text-style: bold; }
     """
 
@@ -84,7 +117,7 @@ class TbankApp(App):
             with Vertical(id="right"):
                 yield Static("ЖУРНАЛ СДЕЛОК", classes="section")
                 yield DataTable(id="journal")
-        yield Static("", id="log")
+        yield RichLog(id="log", max_lines=200, markup=False)
         yield Static("", id="status")
 
     def on_mount(self) -> None:
@@ -94,7 +127,7 @@ class TbankApp(App):
         self._positions_table = self.query_one("#positions", DataTable)
         self._positions_empty = self.query_one("#positions-empty", Static)
         self._journal_table = self.query_one("#journal", DataTable)
-        self._log_line = self.query_one("#log", Static)
+        self._log_panel = self.query_one("#log", RichLog)
         self._status_line = self.query_one("#status", Static)
         self._journal_table.add_columns("время", "тикер", "действие", "лоты", "цена")
         self._journal_table.zebra_stripes = True
@@ -163,7 +196,11 @@ class TbankApp(App):
         if not controls.daemon_online(self._state()):
             self._set_status(controls.DAEMON_NOT_RUNNING)
             return
-        command_id = control.enqueue_command(self.tbank_config.reports_dir, "stop")
+        try:
+            command_id = control.enqueue_command(self.tbank_config.reports_dir, "stop")
+        except (OSError, ValueError) as exc:
+            self._set_status(f"ошибка канала управления: {exc}")
+            return
         self._set_status("останавливаю демон...")
         self._await_ack("stop", command_id)
 
@@ -176,12 +213,20 @@ class TbankApp(App):
             return
         reports_dir = self.tbank_config.reports_dir
         if controls.kill_switch_needs_daemon(self._state()):
-            command_id = control.enqueue_command(reports_dir, "kill_switch_reset")
+            try:
+                command_id = control.enqueue_command(reports_dir, "kill_switch_reset")
+            except (OSError, ValueError) as exc:
+                self._set_status(f"ошибка канала управления: {exc}")
+                return
             self._set_status("сбрасываю kill-switch...")
             self._await_ack("kill_switch_reset", command_id)
             return
         # Демон офлайн: файл никто не перезапишет — чистим напрямую.
-        bot.clear_kill_switch(reports_dir)
+        try:
+            bot.clear_kill_switch(reports_dir)
+        except OSError as exc:
+            self._set_status(f"ошибка записи kill-switch: {exc}")
+            return
         self._set_status(controls.KILL_SWITCH_CLEARED)
 
     @work(exclusive=True, group="ack")
@@ -190,7 +235,12 @@ class TbankApp(App):
         reports_dir = self.tbank_config.reports_dir
         deadline = time.monotonic() + self.ack_timeout
         while True:
-            if _ack_received(reports_dir, command_id):
+            try:
+                received = _ack_received(reports_dir, command_id)
+            except (OSError, ValueError) as exc:
+                self._set_status(f"ошибка проверки ack: {exc}")
+                return
+            if received:
                 self._set_status(
                     controls.STOPPED if name == "stop" else controls.KILL_SWITCH_RESET_CONFIRMED
                 )
@@ -215,6 +265,9 @@ class TbankApp(App):
         pnl = data.session_pnl(self.tbank_config.reports_dir)
         pending = data.pending_orders_count(self.tbank_config.reports_dir)
         kill_switch = data.kill_switch_state(self.tbank_config.reports_dir)
+        last_trade = _humanize_age(
+            data.journal_last_age_min(self.tbank_config.reports_dir)
+        )
         if kill_switch is None:
             kill_text = "нет"
         elif kill_switch.get("corrupt"):
@@ -229,6 +282,7 @@ class TbankApp(App):
             f"итерация: {state.get('iteration', '--')}",
             f"обновлён: {state.get('updated_at') or '--'}",
             f"heartbeat: {controls.fmt_age(state.get('heartbeat_age_min'))}",
+            f"последняя сделка: {last_trade}",
             "",
             f"капитал: {controls.fmt_rub(equity)}",
             f"кэш: {controls.fmt_rub(cash)}",
@@ -268,7 +322,24 @@ class TbankApp(App):
                 str(row.get("price", "") or ""),
             )
 
-        log_file = self.tbank_config.log_file
-        self._log_line.update(
-            f"лог: {log_file}" if log_file is not None else "лог: не настроен"
-        )
+        self._refresh_log()
+
+    def _log_content(self) -> list[str]:
+        """Хвост лога (30 строк) с заголовком; нет файла — явное сообщение."""
+        path = _resolve_log_path(self.tbank_config)
+        if path is None:
+            return ["ЛОГ: --", "лог не найден"]
+        header = f"ЛОГ: {path}"
+        if not path.exists():
+            return [header, "лог не найден"]
+        lines = data.tail_log(path, 30)
+        if not lines:
+            return [header, "(лог пуст)"]
+        return [header, *lines]
+
+    def _refresh_log(self) -> None:
+        """Перерисовывает RichLog и прокручивает его к самой новой строке."""
+        self._log_panel.clear()
+        for line in self._log_content():
+            self._log_panel.write(line)
+        self._log_panel.scroll_end(animate=False)
