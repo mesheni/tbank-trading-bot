@@ -1,14 +1,23 @@
-"""Read-only Textual-дашборд демона (D3).
+"""Read-only Textual-дашборд демона (D3) с управлением через подтверждение (D4).
 
-Виджет только читает файлы reports/ через tui.data: никаких записей,
-subprocess, сокетов и обращений к API. Закрытие окна не влияет на демон.
+Виджет читает файлы reports/ через tui.data. Команды демону (start/stop/reset
+kill-switch) идут через tui.controls: очередь файлов + ack, без сокетов. TUI
+никогда не дренирует очередь и не пишет kill_switch.json при живом демоне.
 """
 from __future__ import annotations
 
+import asyncio
+import time
+
+from textual import work
 from textual.app import App, ComposeResult
+from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
 from textual.widgets import DataTable, Static
 
+import bot
+import control
+import tui.controls as controls
 import tui.data as data
 
 _BADGE_COLORS = {
@@ -19,40 +28,9 @@ _BADGE_COLORS = {
 }
 
 
-def _fmt_rub(value: object) -> str:
-    if value is None:
-        return "--"
-    try:
-        return f"{float(value):,.2f} ₽"
-    except (TypeError, ValueError):
-        return "--"
-
-
-def _fmt_age(age_min: object) -> str:
-    if age_min is None:
-        return "нет отметки"
-    try:
-        return f"{float(age_min):.1f} мин назад"
-    except (TypeError, ValueError):
-        return "нет отметки"
-
-
-def _fmt_session_pnl(pnl: dict | None) -> str:
-    if pnl is None:
-        return "—"
-    money = f"{pnl['abs_rub']:+,.0f}".replace(",", " ")
-    if pnl.get("pct") is None:
-        return f"{money} ₽"
-    return f"{money} ₽ ({pnl['pct']:+.1%})"
-
-
-def _fmt_signed_rub(value: object) -> str:
-    if value is None:
-        return "--"
-    try:
-        return f"{float(value):+,.2f} ₽"
-    except (TypeError, ValueError):
-        return "--"
+def _ack_received(reports_dir, command_id: str) -> bool:
+    """Тонкая обёртка над ack-файлом: в тестах подменяется фейковым «демоном»."""
+    return controls.read_ack(reports_dir, command_id)
 
 
 class TbankApp(App):
@@ -60,6 +38,11 @@ class TbankApp(App):
 
     TITLE = "tbank"
     SUB_TITLE = "демон"
+    BINDINGS = [
+        Binding("s", "start_daemon", "Старт демона"),
+        Binding("x", "stop_daemon", "Стоп демона"),
+        Binding("k", "reset_kill_switch", "Сброс kill-switch"),
+    ]
     CSS = """
     Screen { layout: vertical; }
     #mode { height: 1; }
@@ -80,11 +63,15 @@ class TbankApp(App):
     #positions-empty { height: 1; }
     #journal { height: 1fr; }
     #log { height: 1; }
+    #status { height: 1; text-style: bold; }
     """
 
     def __init__(self, config) -> None:
         super().__init__()
         self.tbank_config = config
+        # Тесты подменяют на доли секунды, чтобы не ждать реальные 60 с.
+        self.ack_timeout = 60.0
+        self.ack_poll_interval = 0.2
 
     def compose(self) -> ComposeResult:
         yield Static(self._mode_banner(), id="mode")
@@ -98,14 +85,21 @@ class TbankApp(App):
                 yield Static("ЖУРНАЛ СДЕЛОК", classes="section")
                 yield DataTable(id="journal")
         yield Static("", id="log")
+        yield Static("", id="status")
 
     def on_mount(self) -> None:
-        table = self.query_one("#journal", DataTable)
-        table.add_columns("время", "тикер", "действие", "лоты", "цена")
-        table.zebra_stripes = True
-        positions_table = self.query_one("#positions", DataTable)
-        positions_table.add_columns("тикер", "лоты", "цена", "PnL")
-        positions_table.zebra_stripes = True
+        # Ссылки на виджеты кэшируются: refresh-таймер не должен искать их в DOM,
+        # пока модал/выключение приложения меняют стек экранов.
+        self._daemon_card = self.query_one("#daemon", Static)
+        self._positions_table = self.query_one("#positions", DataTable)
+        self._positions_empty = self.query_one("#positions-empty", Static)
+        self._journal_table = self.query_one("#journal", DataTable)
+        self._log_line = self.query_one("#log", Static)
+        self._status_line = self.query_one("#status", Static)
+        self._journal_table.add_columns("время", "тикер", "действие", "лоты", "цена")
+        self._journal_table.zebra_stripes = True
+        self._positions_table.add_columns("тикер", "лоты", "цена", "PnL")
+        self._positions_table.zebra_stripes = True
         self.refresh_dashboard()
         self.set_interval(self.tbank_config.tui_refresh_sec, self.refresh_dashboard)
 
@@ -114,6 +108,99 @@ class TbankApp(App):
         if self.tbank_config.mode == "real":
             return "[bold red] РЕЖИМ: REAL [/]"
         return " РЕЖИМ: SANDBOX "
+
+    def _mode_text(self) -> str:
+        return str(self.tbank_config.mode).upper()
+
+    def _set_status(self, text: str) -> None:
+        self._status_line.update(text)
+
+    def _state(self) -> dict:
+        return data.daemon_state(self.tbank_config.reports_dir)
+
+    def _confirm(self, action_text: str, callback) -> None:
+        self.push_screen(controls.ConfirmScreen(action_text, self._mode_text()), callback=callback)
+
+    def action_start_daemon(self) -> None:
+        if controls.systemd_managed():
+            self._set_status(controls.SYSTEMD_START)
+            return
+        refusal = controls.start_refusal(self.tbank_config, self._state())
+        if refusal is not None:
+            self._set_status(refusal)
+            return
+        self._confirm("Запустить демон?", self._on_start_confirmed)
+
+    def _on_start_confirmed(self, confirmed: bool | None) -> None:
+        if not confirmed:
+            self._set_status(controls.CANCELLED)
+            return
+        # Повторная проверка после модала: демон мог подняться, пока пользователь думал.
+        refusal = controls.start_refusal(self.tbank_config, self._state())
+        if refusal is not None:
+            self._set_status(refusal)
+            return
+        try:
+            controls.spawn_daemon()
+        except OSError as exc:
+            self._set_status(f"не удалось запустить демон: {exc}")
+            return
+        self._set_status(controls.STARTING)
+
+    def action_stop_daemon(self) -> None:
+        if controls.systemd_managed():
+            self._set_status(controls.SYSTEMD_STOP)
+            return
+        if not controls.daemon_online(self._state()):
+            self._set_status(controls.DAEMON_NOT_RUNNING)
+            return
+        self._confirm("Остановить демон?", self._on_stop_confirmed)
+
+    def _on_stop_confirmed(self, confirmed: bool | None) -> None:
+        if not confirmed:
+            self._set_status(controls.CANCELLED)
+            return
+        if not controls.daemon_online(self._state()):
+            self._set_status(controls.DAEMON_NOT_RUNNING)
+            return
+        command_id = control.enqueue_command(self.tbank_config.reports_dir, "stop")
+        self._set_status("останавливаю демон...")
+        self._await_ack("stop", command_id)
+
+    def action_reset_kill_switch(self) -> None:
+        self._confirm("Сбросить kill-switch?", self._on_kill_confirmed)
+
+    def _on_kill_confirmed(self, confirmed: bool | None) -> None:
+        if not confirmed:
+            self._set_status(controls.CANCELLED)
+            return
+        reports_dir = self.tbank_config.reports_dir
+        if controls.kill_switch_needs_daemon(self._state()):
+            command_id = control.enqueue_command(reports_dir, "kill_switch_reset")
+            self._set_status("сбрасываю kill-switch...")
+            self._await_ack("kill_switch_reset", command_id)
+            return
+        # Демон офлайн: файл никто не перезапишет — чистим напрямую.
+        bot.clear_kill_switch(reports_dir)
+        self._set_status(controls.KILL_SWITCH_CLEARED)
+
+    @work(exclusive=True, group="ack")
+    async def _await_ack(self, name: str, command_id: str) -> None:
+        """Ждём ack файлом (не drain_commands — очередь принадлежит демону)."""
+        reports_dir = self.tbank_config.reports_dir
+        deadline = time.monotonic() + self.ack_timeout
+        while True:
+            if _ack_received(reports_dir, command_id):
+                self._set_status(
+                    controls.STOPPED if name == "stop" else controls.KILL_SWITCH_RESET_CONFIRMED
+                )
+                return
+            if time.monotonic() >= deadline:
+                self._set_status(
+                    controls.STOP_TIMEOUT if name == "stop" else controls.KILL_SWITCH_TIMEOUT
+                )
+                return
+            await asyncio.sleep(self.ack_poll_interval)
 
     def _daemon_markup(self, state: dict) -> str:
         status_badge = data.badge(state)
@@ -141,11 +228,11 @@ class TbankApp(App):
             f"pid: {state.get('pid') if state.get('pid') is not None else '--'}",
             f"итерация: {state.get('iteration', '--')}",
             f"обновлён: {state.get('updated_at') or '--'}",
-            f"heartbeat: {_fmt_age(state.get('heartbeat_age_min'))}",
+            f"heartbeat: {controls.fmt_age(state.get('heartbeat_age_min'))}",
             "",
-            f"капитал: {_fmt_rub(equity)}",
-            f"кэш: {_fmt_rub(cash)}",
-            f"P&L сессии: {_fmt_session_pnl(pnl)}",
+            f"капитал: {controls.fmt_rub(equity)}",
+            f"кэш: {controls.fmt_rub(cash)}",
+            f"P&L сессии: {controls.fmt_session_pnl(pnl)}",
             f"позиций: {state.get('positions_count', '--')}",
             f"заявок в работе: {pending}",
             f"kill-switch: {kill_text}",
@@ -155,28 +242,25 @@ class TbankApp(App):
     def refresh_dashboard(self) -> None:
         """Перечитывает файлы и обновляет виджеты (без записи и сети)."""
         state = data.daemon_state(self.tbank_config.reports_dir)
-        self.query_one("#daemon", Static).update(self._daemon_markup(state))
+        self._daemon_card.update(self._daemon_markup(state))
 
         position_rows = data.positions(state)
-        positions_table = self.query_one("#positions", DataTable)
-        positions_table.clear()
+        self._positions_table.clear()
         for row in position_rows:
-            positions_table.add_row(
+            self._positions_table.add_row(
                 str(row.get("ticker", "") or ""),
                 str(row.get("lots", "") or ""),
-                _fmt_rub(row.get("price")),
-                _fmt_signed_rub(row.get("pnl_rub")),
+                controls.fmt_rub(row.get("price")),
+                controls.fmt_signed_rub(row.get("pnl_rub")),
             )
-        positions_empty = self.query_one("#positions-empty", Static)
-        positions_table.display = bool(position_rows)
-        positions_empty.display = not position_rows
+        self._positions_table.display = bool(position_rows)
+        self._positions_empty.display = not position_rows
         if not position_rows:
-            positions_empty.update("позиции: нет данных (вне сессии)")
+            self._positions_empty.update("позиции: нет данных (вне сессии)")
 
-        table = self.query_one("#journal", DataTable)
-        table.clear()
+        self._journal_table.clear()
         for row in data.journal_tail(self.tbank_config.reports_dir, 20):
-            table.add_row(
+            self._journal_table.add_row(
                 str(row.get("time", "") or ""),
                 str(row.get("ticker", "") or ""),
                 str(row.get("action", "") or ""),
@@ -185,6 +269,6 @@ class TbankApp(App):
             )
 
         log_file = self.tbank_config.log_file
-        self.query_one("#log", Static).update(
+        self._log_line.update(
             f"лог: {log_file}" if log_file is not None else "лог: не настроен"
         )
