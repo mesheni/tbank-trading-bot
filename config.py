@@ -160,6 +160,11 @@ class Config:
     account_budget_rub: float | None = field(default_factory=lambda: _env_float_opt("ACCOUNT_BUDGET_RUB"))
     # автоперевод отклонённой лимитной заявки в рыночную; для real рекомендовано 0
     order_fallback_to_market: bool = field(default_factory=lambda: _env_bool("ORDER_FALLBACK_TO_MARKET", True))
+    # шаг тика headless-демона (с): сон цикла режется на такие срезы, чтобы
+    # каждую секунду проверять очередь команд и статус
+    daemon_tick_sec: float = field(default_factory=lambda: _env_float("DAEMON_TICK_SEC", 1.0))
+    # ТОЛЬКО для тестов/e2e: детерминированный TBankAPI без сети (см. bot.FakeTBankAPI)
+    tbank_fake_api: bool = field(default_factory=lambda: _env_bool("TBANK_FAKE_API", False))
 
     # --- Уведомления (email/SMTP, см. notify.py) ---
     notify_email_to: str = field(default_factory=lambda: os.getenv("NOTIFY_EMAIL_TO", ""))

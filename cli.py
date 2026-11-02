@@ -215,16 +215,34 @@ def cmd_smoke(config: Config) -> int:
 
 
 def cmd_download(config: Config, days: int) -> int:
+    import time
+
     api = make_api(config)
     instruments = api.resolve_instruments(config.tickers)
     conn = connect(config.db_path)
     store_instruments(conn, instruments)  # лоты/uid для офлайн-команд (backtest)
     total = len(config.tickers)
+    elapsed_sum = 0.0
     for i, (ticker, instrument) in enumerate(instruments.items(), 1):
-        print(f"[{i}/{total}] {ticker}")
         print(f"Выгрузка {ticker} ({config.candle_interval}, {days} дней)...")
-        n = download_candles(api, conn, instrument["figi"], config.candle_interval, days_back=days, ticker=ticker)
-        print(f"  {ticker}: {n} свечей")
+        tick_started = time.monotonic()
+        try:
+            n = download_candles(
+                api, conn, instrument["figi"], config.candle_interval, days_back=days, ticker=ticker
+            )
+        except Exception:
+            # поведение при сбое не меняем: та же ошибка уходит наверх (тот же exit code),
+            # но строка прогресса успевает отметить тикер как ошибочный
+            print(f"[{i}/{total}] {ticker}: ошибка, {time.monotonic() - tick_started:.1f}s")
+            conn.close()
+            raise
+        elapsed = time.monotonic() - tick_started
+        elapsed_sum += elapsed
+        line = f"[{i}/{total}] {ticker}: {n} свечей, {elapsed:.1f}s"
+        if i > 1:
+            eta = (elapsed_sum / i) * (total - i)
+            line += f", ETA ~{eta:.0f}s"
+        print(line)
     conn.close()
     return 0
 
@@ -300,6 +318,8 @@ def _render_metrics_table(metrics: pd.DataFrame, best: str | None) -> str:
 
 
 def cmd_train(config: Config, capital: float | None = None) -> int:
+    import time
+
     conn = connect(config.db_path)
     summary = {}
     trained = []
@@ -317,7 +337,6 @@ def cmd_train(config: Config, capital: float | None = None) -> int:
             )
         )
     for i, ticker in enumerate(config.tickers, 1):
-        print(f"[{i}/{len(config.tickers)}] {ticker}")
         df = load_candles(conn, ticker, config.candle_interval)
         if df.empty:
             warn(f"{ticker}: нет свечей в {config.db_path} — выполните `python cli.py download`")
@@ -344,10 +363,26 @@ def cmd_train(config: Config, capital: float | None = None) -> int:
         print(ui.header(f"{ticker} · {len(df)} свечей · горизонт {config.forecast_horizon} бар(а)"))
         round_trip = 2 * (config.commission_pct + config.slippage_pct)
         reversal_mult = getattr(config, "reversal_exit_mult", 2.0)
-        # один walk-forward на тикер: таблица и артефакт оцениваются по нему же
-        metrics, results = evaluate_all(
-            df, config.forecast_horizon, round_trip_cost=round_trip, reversal_mult=reversal_mult
+        # один walk-forward на тикер: таблица и артефакт оцениваются по нему же.
+        # evaluate_all прогоняет все модели внутри, поэтому прогресс считаем по тикеру:
+        # отдельные строки на модель потребовали бы менять models/registry.py.
+        # model_factories() содержит только бейзлайны; lgbm добавляется в evaluate_all
+        model_count = len(model_factories(config.forecast_horizon)) + 1
+        print(
+            f"[{i}/{len(config.tickers)}] модель {ticker} "
+            f"({model_count} моделей) ...",
+            end="",
+            flush=True,
         )
+        wf_started = time.monotonic()
+        try:
+            metrics, results = evaluate_all(
+                df, config.forecast_horizon, round_trip_cost=round_trip, reversal_mult=reversal_mult
+            )
+        except Exception:
+            print(" ошибка")
+            raise
+        print(f" {time.monotonic() - wf_started:.1f}s")
         # таблицу печатаем до логов train_and_save; маркер «>» — тот же выбор, что и в артефакт
         print(_render_metrics_table(metrics, select_best(metrics)))
         try:

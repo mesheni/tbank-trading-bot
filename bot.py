@@ -21,6 +21,7 @@ from pathlib import Path
 
 import pandas as pd
 
+import control
 from backtest import RiskConfig  # noqa: F401  (реэкспорт для удобства)
 from config import MIN_TRADABLE_EQUITY_RUB, MSK, Config
 from features import build_live_features, ensure_news_columns
@@ -198,8 +199,88 @@ def ensure_sentiments(conn, news_df: pd.DataFrame, scorer, model_key: str) -> di
     return cached
 
 
+# ТОЛЬКО для тестов/e2e (env TBANK_FAKE_API=1): детерминированный TBankAPI без сети.
+# Достаточно для прокрутки живого цикла: счета/портфель/ордера/расписание/новости.
+class FakeTBankAPI:
+    """Минимальная офлайн-заглушка TBankAPI — не использовать в торговле."""
+
+    is_sandbox = True
+    client = None
+    order_market_fallback = False
+    on_market_fallback = None
+
+    def __init__(self, tickers, cash_rub: float = 1_000_000.0):
+        self.tickers = list(tickers)
+        self.cash_rub = float(cash_rub)
+        self.orders: dict[str, dict] = {}
+
+    def get_accounts(self) -> list[dict]:
+        return [{"id": "fake-account"}]
+
+    def resolve_instruments(self, tickers) -> dict[str, dict]:
+        return {
+            str(t).upper(): {
+                "ticker": str(t).upper(),
+                "figi": f"FAKE-{str(t).upper()}",
+                "uid": f"fake-{str(t).upper()}",
+                "name": str(t).upper(),
+                "lot": 1,
+                "class_code": "TQBR",
+                "min_price_increment": 0.01,
+            }
+            for t in tickers
+        }
+
+    def trading_schedules(self, figi: str = "", days: int = 7) -> list[tuple]:
+        return []
+
+    def get_news(self, instrument_ids=None, max_pages: int = 5) -> list[dict]:
+        return []
+
+    def get_candles(self, instrument_id, interval_enum, from_dt, to_dt) -> list[dict]:
+        return []
+
+    def get_last_price(self, instrument_id) -> float:
+        return 0.0
+
+    def get_portfolio(self, account_id) -> dict:
+        return {"positions": {}, "total_amount_rub": self.cash_rub, "cash_rub": self.cash_rub}
+
+    def open_sandbox_account(self) -> str:
+        return "fake-account"
+
+    def pay_in(self, account_id, amount_rub: float) -> None:
+        self.cash_rub = float(amount_rub)
+
+    def close_sandbox_account(self, account_id) -> None:
+        return None
+
+    def post_order(self, account_id, instrument_id, quantity_lots, direction, price=None, order_type="ORDER_TYPE_LIMIT") -> dict:
+        order_id = f"fake-{len(self.orders) + 1}"
+        state = {
+            "order_id": order_id,
+            "status": "fill",
+            "lots_requested": int(quantity_lots),
+            "lots_executed": int(quantity_lots),
+            "avg_exec_price": float(price or 0.0),
+            "commission": 0.0,
+            "total_amount": float(price or 0.0) * int(quantity_lots),
+            "message": "",
+        }
+        self.orders[order_id] = state
+        return dict(state)
+
+    def get_order_state(self, account_id, order_id) -> dict:
+        return dict(self.orders.get(order_id, {"order_id": order_id, "status": "fill", "lots_requested": 0, "lots_executed": 0, "avg_exec_price": 0.0, "commission": 0.0, "total_amount": 0.0, "message": ""}))
+
+    def cancel_order(self, account_id, order_id) -> dict:
+        state = dict(self.orders.get(order_id, {}))
+        state.update({"order_id": order_id, "status": "cancelled"})
+        return state
+
+
 class TradingBot:
-    def __init__(self, config: Config, risk: RiskConfig | None = None):
+    def __init__(self, config: Config, risk: RiskConfig | None = None, api: TBankAPI | None = None):
         config.validate()
         self.config = config
         self.risk = risk or RiskConfig(
@@ -214,8 +295,10 @@ class TradingBot:
             reversal_exit_mult=config.reversal_exit_mult,
             max_total_exposure_pct=config.max_total_exposure_pct,
         )
-        self.client = TBankRestClient(config.token, config.mode)
-        self.api = TBankAPI(self.client, order_market_fallback=config.order_fallback_to_market)
+        self.client = api.client if api is not None else TBankRestClient(config.token, config.mode)
+        self.api = api if api is not None else TBankAPI(
+            self.client, order_market_fallback=config.order_fallback_to_market
+        )
         self.trader = Trader(
             self.api, Path(config.reports_dir) / "journal.csv", account_id=getattr(config, "account_id", "")
         )
@@ -558,9 +641,11 @@ class TradingBot:
         try:
             while self._running and (max_iterations is None or iteration < max_iterations):
                 iteration += 1
+                self._daemon_event(iteration)
                 if not self.in_trading_session():
                     log.info("Вне торговой сессии MOEX — пауза %d c", self.config.loop_interval_sec)
-                    time.sleep(self.config.loop_interval_sec)
+                    if not self._tick_wait(self.config.loop_interval_sec):
+                        break
                     continue
 
                 try:
@@ -593,6 +678,7 @@ class TradingBot:
                     )
                     write_heartbeat(Path(self.config.reports_dir) / "heartbeat")
                     pnl_pct = snapshot["total_amount_rub"] / self._budget_rub - 1.0
+                    self._daemon_event(iteration, snapshot=snapshot)
                     log.info(
                         "%s Итерация %d · капитал %s руб · P&L %s · позиций: %d",
                         ui.paint_log("==", ui.CYAN),
@@ -603,6 +689,7 @@ class TradingBot:
                     )
                 except Exception as exc:
                     log.exception("Ошибка итерации: %s", exc)
+                    self._daemon_event(iteration, error=f"{type(exc).__name__}: {exc}")
                     self.notifier.send_throttled(
                         "iteration-error", "ошибка итерации бота",
                         f"{type(exc).__name__}: {exc}\n(не чаще 1 письма в 30 минут; "
@@ -610,9 +697,11 @@ class TradingBot:
                     )
 
                 if max_iterations is None or iteration < max_iterations:
-                    time.sleep(self.config.loop_interval_sec)
+                    if not self._tick_wait(self.config.loop_interval_sec):
+                        break
         finally:
             self._running = False
+            self._daemon_finish()
             self.conn.close()
             log.info("Бот остановлен")
 
@@ -665,6 +754,55 @@ class TradingBot:
                 f"Новые входы запрещены до `cli.py kill-switch-reset`; "
                 f"открытые позиции обслуживаются.",
             )
+
+    def reset_kill_switch(self) -> bool:
+        """Снять kill-switch: удалить файл состояния и снова разрешить входы.
+
+        _check_kill_switch только выставляет флаг в False и не умеет его снимать —
+        сброс обязан сбрасывать и файл, и in-memory флаг (команда демона).
+        """
+        reports_dir = getattr(self.config, "reports_dir", None)
+        cleared = clear_kill_switch(reports_dir) if reports_dir else False
+        self._entries_allowed = True
+        log.warning(
+            "kill-switch сброшен (%s) — новые входы разрешены",
+            "файл удалён" if cleared else "файл не был активен",
+        )
+        return cleared
+
+    # ---------- Демон: tick-цикл и статус ----------
+
+    def _tick_wait(self, seconds: float, on_tick=None) -> bool:
+        """Ждёт ``seconds``, просыпаясь каждые DAEMON_TICK_SEC; False — запрошен стоп.
+
+        Сон разбит на срезы, чтобы фоновый демон каждую секунду обрабатывал
+        очередь команд и писал статус, а не спал весь LOOP_INTERVAL_SEC.
+        """
+        tick = float(getattr(self.config, "daemon_tick_sec", 1.0) or 1.0)
+        if tick <= 0:
+            tick = 1.0
+        if on_tick is None:
+            runner = getattr(self, "_daemon_runner", None)
+            on_tick = runner.on_tick if runner is not None else None
+        remaining = max(0.0, float(seconds))
+        while remaining > 0:
+            slice_sec = min(tick, remaining)
+            time.sleep(slice_sec)
+            remaining -= slice_sec
+            if on_tick is not None and on_tick():
+                return False
+        return True
+
+    def _daemon_event(self, iteration: int, snapshot: dict | None = None, error: str | None = None) -> None:
+        """Уведомить демон-раннер об итерации (no-op для обычного run_forever)."""
+        runner = getattr(self, "_daemon_runner", None)
+        if runner is not None:
+            runner.publish(iteration=iteration, snapshot=snapshot, error=error)
+
+    def _daemon_finish(self) -> None:
+        runner = getattr(self, "_daemon_runner", None)
+        if runner is not None:
+            runner.finish()
 
     def _setup_capital_profile(self) -> None:
         """Режим работы под размер счёта: профиль капитала + доступная вселенная.
@@ -775,3 +913,109 @@ class TradingBot:
                     pos["average_position_price"] or pos["current_price"],
                 )
         return PortfolioState(cash=raw["cash_rub"], equity=raw["total_amount_rub"], positions=positions)
+
+# =====================================================================
+# D1: headless-демон (status snapshot + command queue + PID-lock)
+# =====================================================================
+
+class _DaemonRunner:
+    """Публикует статус демона и обрабатывает команды на каждом тике."""
+
+    def __init__(self, bot, reports_dir):
+        self.bot = bot
+        self.reports_dir = Path(reports_dir)
+        self.started_at = dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
+        self.state = "running"
+        self.iteration = 0
+        self.stop_requested = False
+        self.last_error: str | None = None
+        self.equity: float | None = None
+        self.cash: float | None = None
+        self.positions: int = 0
+
+    def _kill_switch(self) -> tuple[bool, str | None]:
+        if getattr(self.bot, "_entries_allowed", True):
+            return False, None
+        state = read_kill_switch(self.reports_dir)
+        if isinstance(state, dict):
+            return True, "corrupt" if state.get("corrupt") else state.get("triggered_at")
+        return True, None
+
+    def publish(self, iteration: int | None = None, snapshot: dict | None = None,
+                error: str | None = None, state: str | None = None) -> None:
+        if iteration is not None:
+            self.iteration = int(iteration)
+        if state is not None:
+            self.state = state
+        if snapshot is not None:
+            self.equity = snapshot.get("total_amount_rub")
+            self.cash = snapshot.get("cash_rub")
+            self.positions = len(snapshot.get("positions") or {})
+        if error is not None:
+            self.last_error = error
+        active, reason = self._kill_switch()
+        payload = {
+            "pid": os.getpid(),
+            "state": self.state,
+            "started_at": self.started_at,
+            "mode": getattr(self.bot.config, "mode", None),
+            "iteration": self.iteration,
+            "equity_rub": self.equity,
+            "cash_rub": self.cash,
+            "positions_count": self.positions,
+            "kill_switch_active": active,
+            "kill_switch_reason": reason,
+            "last_error": self.last_error,
+        }
+        try:
+            control.write_status(self.reports_dir, payload)
+        except Exception as exc:  # статус не должен ронять торговый цикл
+            log.exception("Демон: не удалось записать daemon_status.json (%s)", exc)
+
+    def on_tick(self) -> bool:
+        """Дренаж очереди команд; True — запрошен стоп (завершить цикл)."""
+        try:
+            commands = control.drain_commands(self.reports_dir)
+        except Exception as exc:
+            log.exception("Демон: очередь команд недоступна (%s)", exc)
+            return self.stop_requested
+        for command in commands:
+            name = command.get("name")
+            if name == "stop":
+                self.stop_requested = True
+                log.info("Демон: получена команда stop — завершаем текущую итерацию")
+            elif name == "kill_switch_reset":
+                try:
+                    self.bot.reset_kill_switch()
+                except Exception as exc:
+                    log.exception("Демон: kill_switch_reset не выполнен (%s)", exc)
+        if self.stop_requested:
+            self.publish(state="stopping")
+        return self.stop_requested
+
+    def finish(self) -> None:
+        self.publish(state="stopped")
+
+
+def run_headless(bot, max_iterations: int | None = None, reports_dir=None, *, acquire: bool = True) -> int:
+    """Foreground-демон: lock, tick-цикл, статус после итерации, команды.
+
+    Возвращает 0 — штатное завершение, 3 — lock занят живым процессом.
+    """
+    reports_dir = Path(reports_dir or bot.config.reports_dir)
+    if acquire and not control.acquire_lock(reports_dir):
+        log.error("Демон уже запущен (lock %s занят живым pid) — второй экземпляр не стартует", reports_dir)
+        return 3
+    runner = _DaemonRunner(bot, reports_dir)
+    bot._daemon_runner = runner
+    try:
+        runner.publish(iteration=0, state="running")
+        bot.run_forever(max_iterations=max_iterations)
+        return 0
+    except Exception as exc:
+        runner.last_error = f"{type(exc).__name__}: {exc}"
+        raise
+    finally:
+        runner.finish()
+        if acquire:
+            control.release_lock(reports_dir)
