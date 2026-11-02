@@ -89,6 +89,13 @@ def _json_safe(obj):
     return obj
 
 
+def _mask_secret(value: str) -> str:
+    """Маска секрета: короткий (<8) скрывается целиком, длинный — первые 4 символа + «...»."""
+    if len(value) < 8:
+        return "***"
+    return f"{value[:4]}..."
+
+
 class ColorFormatter(logging.Formatter):
     """Красит уровень важности; текст сообщений окрашивается там, где создаётся."""
 
@@ -501,6 +508,7 @@ def cmd_backtest(config: Config, capital: float | None = None) -> int:
 
 
 def cmd_run(config: Config, max_iterations: int | None) -> int:
+    print(ui.mode_banner(config.mode))  # первая строка вывода: режим виден сразу
     # F-C1.6: в real — только после явного подтверждения в .env (systemd работает
     # без интерактивного ввода, поэтому это флаг, а не вопрос в консоли)
     if config.mode == "real" and not getattr(config, "confirm_real_trading", False):
@@ -617,11 +625,21 @@ def _period_pnl(
     return pnl, base, moved, coverage_days
 
 
-def cmd_report(config: Config) -> int:
+def cmd_report(config: Config, json_output: bool = False) -> int:
+    """Состояние счёта: таблицы для человека или один JSON-объект для скриптов."""
+
+    def show(*args, **kwargs) -> None:
+        if not json_output:
+            print(*args, **kwargs)
+
     api = make_api(config)
     accounts = api.get_accounts()
     if not accounts:
-        warn("Счетов нет (в sandbox выполните: python cli.py smoke)")
+        message = "Счетов нет (в sandbox выполните: python cli.py smoke)"
+        if json_output:
+            print(json.dumps(_json_safe({"ok": False, "error": message}), ensure_ascii=False, allow_nan=False))
+        else:
+            warn(message)
         return 1
     account_id = _pick_account(config, accounts)
     portfolio = api.get_portfolio(account_id)
@@ -630,9 +648,26 @@ def cmd_report(config: Config) -> int:
     flows = _load_flows(config.reports_dir)
     invested = _net_invested(initial, flows)
     pnl = total - invested
+    pnl_pct = pnl / invested if invested > 1.0 else 0.0
     base_warning = _budget_base_warning(config)
     if base_warning:
         warn(base_warning)
+    payload: dict = {
+        "ok": True,
+        "account_id": account_id,
+        "mode": config.mode,
+        "capital_rub": total,
+        "cash_rub": portfolio["cash_rub"],
+        "invested_rub": invested,
+        "pnl_rub": pnl,
+        "pnl_pct": pnl_pct,
+        "warning": base_warning,
+        "periods": {},
+        "positions": [],
+        "journal": None,
+        "equity": None,
+        "benchmark_pct": None,
+    }
 
     figi_ticker: dict[str, str] = {}
     lot_by_ticker: dict[str, int] = {}
@@ -644,17 +679,16 @@ def cmd_report(config: Config) -> int:
     except Exception as exc:
         warn(f"Не удалось разрешить тикеры ({exc}) — позиции покажем по FIGI, лот=1")
 
-    print(ui.header(f"СЧЁТ {account_id} · {config.mode}"))
-    print(
+    show(ui.header(f"СЧЁТ {account_id} · {config.mode}"))
+    show(
         f"  Капитал:  {ui.paint(ui.fmt_money(total) + ' руб', ui.BOLD)} | "
         f"свободно: {ui.fmt_money(portfolio['cash_rub'])} руб"
     )
-    print(
+    show(
         f"  Вложено:  {ui.fmt_money(invested)} руб "
         f"(бюджет {ui.fmt_money(initial)} ± пополнения/выводы из flows.csv)"
     )
-    pnl_pct = pnl / invested if invested > 1.0 else 0.0
-    print(
+    show(
         f"  P&L:      {ui.fmt_signed(pnl, '{:+,.0f} руб')} "
         f"({ui.fmt_signed(pnl_pct)} от вложенного) — пополнения в прибыль не считают"
     )
@@ -667,35 +701,42 @@ def cmd_report(config: Config) -> int:
             "можно только пересозданием счёта: `python cli.py reset-sandbox`."
         )
 
-    print(ui.header("P&L ПО ПЕРИОДАМ (с поправкой на пополнения/выводы)"))
+    show(ui.header("P&L ПО ПЕРИОДАМ (с поправкой на пополнения/выводы)"))
     equity_file = config.reports_dir / "equity_live.csv"
     equity = None
     if equity_file.exists():
         equity = pd.read_csv(equity_file)
         equity["time"] = pd.to_datetime(equity["time"], utc=True)
         now = equity["time"].iloc[-1]
-        for label, days in (("день", 1), ("неделя", 7), ("месяц", 30)):
+        for label, days, key in (("день", 1, "day"), ("неделя", 7, "week"), ("месяц", 30, "month")):
             res = _period_pnl(equity, flows, now - pd.Timedelta(days=days))
             if res is None:
-                print(f"  {label:<7} нет данных за окно")
+                payload["periods"][key] = None
+                show(f"  {label:<7} нет данных за окно")
                 continue
             pnl_p, base, moved, coverage = res
+            payload["periods"][key] = {
+                "pnl_rub": pnl_p,
+                "base_rub": base,
+                "moved_rub": moved,
+                "coverage_days": coverage,
+            }
             pct_p = pnl_p / base if base > 1.0 else 0.0
             note = ""
             if coverage < days * 0.98:
                 note += f" (данных {coverage:.1f} дн. из {days})"
             if abs(moved) > 1.0:
                 note += f" [движение денег в окне: {moved:+,.0f} руб]"
-            print(
+            show(
                 f"  {label:<7} {ui.fmt_signed(pnl_p, '{:+,.0f} руб')} "
                 f"({ui.fmt_signed(pct_p)} от {ui.fmt_money(base)}){note}"
             )
     else:
-        print("  Появится после запуска бота (reports/equity_live.csv).")
+        show("  Появится после запуска бота (reports/equity_live.csv).")
 
-    print(ui.header("ПОЗИЦИИ"))
+    show(ui.header("ПОЗИЦИИ"))
     if not portfolio["positions"]:
-        print("  (нет открытых позиций)")
+        show("  (нет открытых позиций)")
     else:
         rows = []
         for figi, pos in portfolio["positions"].items():
@@ -717,14 +758,25 @@ def cmd_report(config: Config) -> int:
                     ui.fmt_signed(pnl_pos),
                 ]
             )
+            payload["positions"].append(
+                {
+                    "ticker": name,
+                    "figi": figi,
+                    "quantity": pos["quantity"],
+                    "lots": int(pos["quantity"] // lot) if lot else None,
+                    "average_price": avg,
+                    "current_price": cur,
+                    "pnl_pct": pnl_pos,
+                }
+            )
 
-        print(ui.render_table(
+        show(ui.render_table(
             ["инструмент", "кол-во", "лотов", "ср. цена", "текущая", "PnL"],
             rows,
             aligns=["l", "r", "r", "r", "r", "r"],
         ))
 
-    print(ui.header("СДЕЛКИ"))
+    show(ui.header("СДЕЛКИ"))
     journal = config.reports_dir / "journal.csv"
     if journal.exists():
         with open(journal, encoding="utf-8") as f:
@@ -737,50 +789,76 @@ def cmd_report(config: Config) -> int:
             return float(row["lots"]) * float(row["price"]) * lot * config.commission_pct
 
         total_commission = sum(commission_of(r) for r in rows)
-        print(f"  Всего {len(rows)} операций: {ui.paint(f'покупок {buys}', ui.GREEN)}, "
-              f"{ui.paint(f'продаж {sells}', ui.RED)} · "
-              f"комиссия (оценка, тариф {config.commission_pct:.2%}): ~{total_commission:,.0f} руб")
-        print("  Последние 10:")
+        payload["journal"] = {
+            "total": len(rows),
+            "buys": buys,
+            "sells": sells,
+            "estimated_commission_rub": total_commission,
+            "last_10": [{**row, "estimated_commission_rub": commission_of(row)} for row in rows[-10:]],
+        }
+        show(f"  Всего {len(rows)} операций: {ui.paint(f'покупок {buys}', ui.GREEN)}, "
+             f"{ui.paint(f'продаж {sells}', ui.RED)} · "
+             f"комиссия (оценка, тариф {config.commission_pct:.2%}): ~{total_commission:,.0f} руб")
+        show("  Последние 10:")
         for row in rows[-10:]:
             action_color = ui.GREEN if row["action"] == "BUY" else ui.RED
             action = ui.paint(f"{row['action']:<4}", action_color)
-            print(f"    {row['time']}  {action} {row['ticker']:<5} {row['lots']} лот(ов) "
-                  f"по {row['price']} · комиссия ~{commission_of(row):,.0f} руб · {row['reason']}")
+            show(f"    {row['time']}  {action} {row['ticker']:<5} {row['lots']} лот(ов) "
+                 f"по {row['price']} · комиссия ~{commission_of(row):,.0f} руб · {row['reason']}")
     else:
-        print("  Журнала сделок ещё нет — появится после первого запуска бота.")
+        show("  Журнала сделок ещё нет — появится после первого запуска бота.")
 
-    print(ui.header("КРИВАЯ КАПИТАЛА (живой прогон)"))
+    show(ui.header("КРИВАЯ КАПИТАЛА (живой прогон)"))
     if equity is not None:
-        print(f"  Точек: {len(equity)} (файл {equity_file.name})")
-        print(
-            f"  старт:  {equity.iloc[0]['time']} · {ui.fmt_money(equity.iloc[0]['total_rub'])} руб"
-        )
         last_equity = float(equity.iloc[-1]["total_rub"])
         vs_invested = last_equity / invested - 1.0 if invested > 1.0 else 0.0
-        print(
+        payload["equity"] = {
+            "points": len(equity),
+            "file": equity_file.name,
+            "start_time": str(equity.iloc[0]["time"]),
+            "start_rub": float(equity.iloc[0]["total_rub"]),
+            "last_time": str(equity.iloc[-1]["time"]),
+            "last_rub": last_equity,
+            "vs_invested_pct": vs_invested,
+            "peak_rub": float(equity["total_rub"].max()),
+            "min_rub": float(equity["total_rub"].min()),
+        }
+        show(f"  Точек: {len(equity)} (файл {equity_file.name})")
+        show(
+            f"  старт:  {equity.iloc[0]['time']} · {ui.fmt_money(equity.iloc[0]['total_rub'])} руб"
+        )
+        show(
             f"  сейчас: {equity.iloc[-1]['time']} · "
             f"{ui.fmt_signed(vs_invested)} к вложенному · {ui.fmt_money(last_equity)} руб"
         )
         if len(equity) > 2:
-            peak = equity["total_rub"].max()
-            print(
-                f"  максимум: {ui.fmt_money(peak)} руб | минимум: {ui.fmt_money(equity['total_rub'].min())} руб"
+            show(
+                f"  максимум: {ui.fmt_money(payload['equity']['peak_rub'])} руб | "
+                f"минимум: {ui.fmt_money(payload['equity']['min_rub'])} руб"
             )
-        _print_benchmark(config, equity, vs_invested)
+        payload["benchmark_pct"] = _print_benchmark(config, equity, vs_invested, emit=show)
     else:
-        print("  Пока нет данных — появится после запуска бота (reports/equity_live.csv).")
+        show("  Пока нет данных — появится после запуска бота (reports/equity_live.csv).")
+    if json_output:
+        print(json.dumps(_json_safe(payload), ensure_ascii=False, allow_nan=False))
     return 0
 
 
-def _print_benchmark(config: Config, equity: pd.DataFrame, bot_return: float) -> None:
-    """Бенчмарк: buy&hold равных весов тех же тикеров за период живой кривой (локальная БД свечей)."""
+def _print_benchmark(
+    config: Config, equity: pd.DataFrame, bot_return: float, emit=print
+) -> float | None:
+    """Бенчмарк: buy&hold равных весов тех же тикеров за период живой кривой (локальная БД свечей).
+
+    Возвращает доходность buy&hold (или None, если посчитать не удалось);
+    emit — приёмник вывода, чтобы `--json` не печатал текст в stdout.
+    """
     from tbank.market_data import connect as db_connect
 
     try:
         conn = db_connect(config.db_path)
     except Exception as exc:
-        print(f"  Бенчмарк недоступен (БД: {exc})")
-        return
+        emit(f"  Бенчмарк недоступен (БД: {exc})")
+        return None
     start, end = equity["time"].iloc[0], equity["time"].iloc[-1]
     returns: list[float] = []
     try:
@@ -794,14 +872,15 @@ def _print_benchmark(config: Config, equity: pd.DataFrame, bot_return: float) ->
     finally:
         conn.close()
     if not returns:
-        print("  Бенчмарк: нет свечей в локальной БД за период (выполните download)")
-        return
+        emit("  Бенчмарк: нет свечей в локальной БД за период (выполните download)")
+        return None
     buyhold = sum(returns) / len(returns)
-    print(
+    emit(
         f"  vs buy&hold ({len(returns)} тикеров, равные веса, без комиссий): "
         f"{ui.fmt_signed(buyhold)} · бот {ui.fmt_signed(bot_return)} · "
         f"разница {ui.fmt_signed(bot_return - buyhold)}"
     )
+    return buyhold
 
 
 def _model_info(config: Config, ticker: str) -> dict | None:
@@ -1295,8 +1374,38 @@ def cmd_reset_sandbox(config: Config, assume_yes: bool = False) -> int:
     return 0
 
 
-def cmd_check_config(config: Config) -> int:
+def _check_config_payload(config: Config) -> dict:
+    """Машиночитаемая проверка конфигурации; токен маскируется и в вывод не попадает."""
+    errors: list[str] = []
+    try:
+        config.validate()
+    except ValueError as exc:
+        errors.append(str(exc))
+    return {
+        "ok": not errors,
+        "mode": config.mode,
+        "capital_profile": config.capital_profile,
+        "budget_rub": config.budget_rub,
+        "tickers": list(config.tickers),
+        "token": _mask_secret(config.token),
+        "risk": {
+            "max_position_pct": config.max_position_pct,
+            "max_total_exposure_pct": config.max_total_exposure_pct,
+            "stop_loss_pct": config.stop_loss_pct,
+            "take_profit_pct": config.take_profit_pct,
+            "min_abs_return": config.min_abs_return,
+            "max_drawdown_pct": config.max_drawdown_pct,
+        },
+        "errors": errors,
+    }
+
+
+def cmd_check_config(config: Config, json_output: bool = False) -> int:
     """Полная проверка конфигурации: режим, токен, риск-параметры (без API)."""
+    if json_output:
+        payload = _check_config_payload(config)
+        print(json.dumps(_json_safe(payload), ensure_ascii=False, allow_nan=False))
+        return 0 if payload["ok"] else 2
     try:
         config.validate()
     except ValueError as exc:
@@ -1324,6 +1433,14 @@ MODE_ONLY_COMMANDS = {"train", "backtest", "status", "send-test-email", "kill-sw
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Торговый бот T-Invest API (sandbox) с ML-прогнозом и новостным анализом",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Группы команд:\n"
+            "  Первый запуск: setup, smoke, download, news, train, backtest\n"
+            "  Торговля:      run, report, kill-switch-reset, normalize, reset-sandbox\n"
+            "  Мониторинг:    status, watchdog, digest, send-test-email\n"
+            "  Обслуживание:  check-config, --version"
+        ),
     )
     parser.add_argument("--version", action="version", version=f"%(prog)s {__VERSION__}")
     parser.add_argument("--no-color", action="store_true", help="отключить цвета в выводе (как NO_COLOR=1)")
@@ -1345,11 +1462,13 @@ def _build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("run", help="торговый цикл (sandbox или real по MODE)")
     p.add_argument("--iterations", type=int, default=None, help="число итераций цикла (пробный запуск)")
 
-    sub.add_parser("report", help="состояние счёта: P&L, позиции, сделки, кривая капитала")
+    p = sub.add_parser("report", help="состояние счёта: P&L, позиции, сделки, кривая капитала")
+    p.add_argument("--json", action="store_true", help="машиночитаемый отчёт одним JSON-объектом")
     p = sub.add_parser("status", help="офлайн-сводка: конфиг, данные, модели, живость (без API)")
     p.add_argument("--json", action="store_true", help="машиночитаемая сводка одним JSON-объектом")
 
-    sub.add_parser("check-config", help="проверить конфигурацию: режим, токен, риск-параметры")
+    p = sub.add_parser("check-config", help="проверить конфигурацию: режим, токен, риск-параметры")
+    p.add_argument("--json", action="store_true", help="машиночитаемая проверка одним JSON-объектом")
 
     p = sub.add_parser("watchdog", help="проверка живости бота (для cron)")
     p.add_argument("--max-stale-min", type=int, default=20, help="порог устаревания отметок живости, минут")
@@ -1395,12 +1514,16 @@ def main() -> int:
         ui.set_colors(False, sys.stderr)
 
     config = Config()
+    # check-config --json собирает ошибки конфигурации в payload сам; иначе вместо
+    # обещанного JSON пользователь получил бы пустой stdout.
+    skip_prevalidation = args.command == "check-config" and getattr(args, "json", False)
     try:
-        if args.command in MODE_ONLY_COMMANDS:
-            if config.mode not in {"sandbox", "real"}:
-                raise ValueError(f"MODE должен быть sandbox|real, получено: {config.mode}")
-        else:
-            config.validate()
+        if not skip_prevalidation:
+            if args.command in MODE_ONLY_COMMANDS:
+                if config.mode not in {"sandbox", "real"}:
+                    raise ValueError(f"MODE должен быть sandbox|real, получено: {config.mode}")
+            else:
+                config.validate()
     except ValueError as exc:
         print(f"[!!] Конфигурация: {exc}", file=sys.stderr)
         return 2
@@ -1422,12 +1545,16 @@ def main() -> int:
         if args.command == "run":
             return cmd_run(config, args.iterations)
         if args.command == "report":
+            if getattr(args, "json", False):
+                return cmd_report(config, json_output=True)
             return cmd_report(config)
         if args.command == "status":
             if getattr(args, "json", False):
                 return cmd_status(config, json_output=True)
             return cmd_status(config)
         if args.command == "check-config":
+            if getattr(args, "json", False):
+                return cmd_check_config(config, json_output=True)
             return cmd_check_config(config)
         if args.command == "kill-switch-reset":
             return cmd_kill_switch_reset(config)
@@ -1451,6 +1578,17 @@ def main() -> int:
     except RuntimeError as exc:
         print(f"[!!] {exc}", file=sys.stderr)
         return 2
+    except Exception as exc:
+        # последний рубеж: пользователь видит одну строку; traceback — только в файл лога
+        print(f"[!!] Непредвиденная ошибка: {type(exc).__name__}: {exc}", file=sys.stderr)
+        log_file = getattr(config, "log_file", None)
+        if log_file is not None:
+            print(f"Подробности в логе: {log_file}", file=sys.stderr)
+            log.exception("Непредвиденная ошибка")
+        else:
+            print("лог не настроен (LOG_FILE)", file=sys.stderr)
+            log.error("Непредвиденная ошибка: %s", exc)
+        return 1
 
 
 if __name__ == "__main__":

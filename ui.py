@@ -82,6 +82,19 @@ def paint_log(text: str, *codes: str) -> str:
     return paint(text, *codes, stream=sys.stderr)
 
 
+def mode_banner(mode: str) -> str:
+    """Баннер режима торговли: первая строка вывода команд запуска.
+
+    REAL всегда красный и жирный — его нельзя спутать с песочницей.
+    Цвета отключаются автоматически (NO_COLOR / перенаправление вывода).
+    """
+    if mode == "sandbox":
+        return paint(" РЕЖИМ: SANDBOX ", CYAN, BOLD)
+    if mode == "real":
+        return paint(" РЕЖИМ: REAL ", BRIGHT_RED, BOLD)
+    raise ValueError(f"неизвестный режим: {mode}")
+
+
 def _sign_codes(value: float) -> tuple[str, ...]:
     if value > 0:
         return (BRIGHT_GREEN,)
