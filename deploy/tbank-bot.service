@@ -11,7 +11,9 @@ StartLimitIntervalSec=600
 [Service]
 WorkingDirectory=__APP_DIR__
 ExecStartPre=__APP_DIR__/.venv/bin/python cli.py check-config
-ExecStart=__APP_DIR__/.venv/bin/python cli.py run
+ExecStart=__APP_DIR__/.venv/bin/python cli.py daemon run
+# TUI не предлагает Start/Stop: процессом управляет systemd (Restart=always).
+Environment=TUI_SYSTEMD_MANAGED=1
 Restart=always
 RestartSec=30
 StartLimitBurst=5

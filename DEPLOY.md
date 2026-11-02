@@ -159,7 +159,7 @@ Wants=network-online.target
 
 [Service]
 WorkingDirectory=/root/tbank-trading-bot
-ExecStart=/root/tbank-trading-bot/.venv/bin/python cli.py run
+ExecStart=/root/tbank-trading-bot/.venv/bin/python cli.py daemon run
 Restart=always
 RestartSec=30
 # лог в journald; для файла вместо этого:
@@ -171,6 +171,11 @@ WantedBy=multi-user.target
 ```
 
 Строка `User=` не нужна — сервис работает от root (владельца файлов).
+
+> **Демон.** `ExecStart` теперь запускает `cli.py daemon run` (headless, без TUI); лог — `var/daemon.log`
+> или `LOG_FILE` из `.env`. Юнит выставляет `TUI_SYSTEMD_MANAGED=1`, поэтому TUI не предлагает
+> Start/Stop — процессом управляет systemd (`Restart=always`). Автозапуск на Windows
+> (Планировщик задач, без прав администратора) — `deploy/windows/install-autostart.ps1`, см. раздел 2.
 
 Файловый лог с ротацией (альтернатива journald): задайте в `.env`
 
