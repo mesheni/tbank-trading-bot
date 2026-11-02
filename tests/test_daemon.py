@@ -103,6 +103,33 @@ def test_daemon_run_writes_status_and_stops_after_max_iterations(tmp_path):
     assert payload["pid"] is not None
 
 
+def test_iteration_error_is_published_as_last_error(tmp_path):
+    """Ошибка API внутри итерации -> last_error в daemon_status.json.
+
+    Пока итерация обрабатывается, status остаётся state=running; к концу
+    run_headless штатно публикуется state=stopped с сохранённым last_error.
+    update_news сам глушит ошибки get_news (bot.py:385-392), поэтому в тесте
+    зовём fake напрямую: так per-iteration except run_forever действительно
+    видит RuntimeError и публикует его через _daemon_event(error=...).
+    """
+
+    class ExplodingAPI(FakeTBankAPI):
+        def get_news(self, instrument_ids=None, max_pages=5):
+            raise RuntimeError("boom")
+
+    config = make_config(tmp_path, loop_interval_sec=0.001, daemon_tick_sec=0.001)
+    bot = TradingBot(config, api=ExplodingAPI(config.tickers))
+    bot.in_trading_session = lambda: True  # не зависит от часов работы биржи
+    bot.update_news = lambda: bot.api.get_news(max_pages=3)  # без глушения ошибки
+
+    assert run_headless(bot, max_iterations=1, reports_dir=config.reports_dir) == 0
+
+    payload = control.read_status(config.reports_dir)
+    assert payload is not None and not payload.get("corrupt")
+    assert payload["state"] == "stopped"  # штатное завершение после обработанной ошибки
+    assert "RuntimeError: boom" in str(payload["last_error"] or "")
+
+
 def test_status_written_every_iteration_with_distinct_snapshots(tmp_path, monkeypatch):
     """Статус пишется после КАЖДОЙ итерации: iteration растёт, updated_at и equity меняются."""
     config = make_config(tmp_path, loop_interval_sec=0.001, daemon_tick_sec=0.001)
