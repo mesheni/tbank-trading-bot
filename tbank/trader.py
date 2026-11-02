@@ -3,7 +3,9 @@ from __future__ import annotations
 
 import csv
 import datetime as dt
+import json
 import logging
+import os
 import time
 from pathlib import Path
 
@@ -17,6 +19,12 @@ SELL = "ORDER_DIRECTION_SELL"
 # финальные статусы: заявка доработала; new/partiallyfill ещё могут исполниться дальше
 FINAL_STATUSES = {"fill", "cancelled", "rejected"}
 
+# реестр незавершённых заявок переживает рестарт: reports/pending_orders.json
+PENDING_ORDERS_FILE = "pending_orders.json"
+# повреждённый файл блокирует новые заявки по всем инструментам (fail closed)
+PENDING_CORRUPT_KEY = "*"
+PENDING_CORRUPT_VALUE = "corrupt-pending-file"
+
 
 class Trader:
     """Работа со счётом sandbox: гарантированный аккаунт, разовый стартовый бюджет, сделки, журнал."""
@@ -27,8 +35,10 @@ class Trader:
         self._configured_account_id = (account_id or "").strip()
         self.account_id = self._ensure_account()
         # незавершённые заявки: instrument_id -> order_id; новая заявка по тому же
-        # инструменту не выставляется, пока прошлая может исполниться
-        self._pending_orders: dict[str, str] = {}
+        # инструменту не выставляется, пока прошлая может исполниться.
+        # Реестр читается с диска: заявка, живая на бирже, не должна потеряться
+        # при рестарте процесса — иначе бот выставит поверх неё вторую.
+        self._pending_orders: dict[str, str] = self._load_pending()
 
     def _ensure_account(self) -> str:
         accounts = self.api.get_accounts()
@@ -125,6 +135,61 @@ class Trader:
             self._pending_orders = pending
         return pending
 
+    def _pending_orders_path(self) -> Path | None:
+        """Путь к реестру рядом с журналом сделок (reports/pending_orders.json)."""
+        journal_path = getattr(self, "journal_path", None)
+        if journal_path is None:
+            # Trader, собранный в тестах через __new__, журнала не имеет — писать некуда
+            return None
+        return Path(journal_path).parent / PENDING_ORDERS_FILE
+
+    def _load_pending(self) -> dict[str, str]:
+        """Читает реестр с диска; повреждённый файл — fail closed для всех инструментов."""
+        path = self._pending_orders_path()
+        if path is None or not path.exists():
+            return {}
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            log.warning(
+                "Файл незавершённых заявок %s не прочитан (%s) — новые заявки "
+                "блокируем по всем инструментам до его удаления",
+                path, exc,
+            )
+            return {PENDING_CORRUPT_KEY: PENDING_CORRUPT_VALUE}
+        if not isinstance(payload, dict):
+            log.warning(
+                "Файл незавершённых заявок %s повреждён: ожидался объект, получено %s — "
+                "новые заявки блокируем по всем инструментам",
+                path, type(payload).__name__,
+            )
+            return {PENDING_CORRUPT_KEY: PENDING_CORRUPT_VALUE}
+        return {str(key): str(value) for key, value in payload.items()}
+
+    def _persist_pending(self) -> None:
+        """Атомарно сохраняет реестр: временный файл рядом + os.replace.
+
+        Ошибка записи не срывает торговый цикл (заявка уже выставлена) — только
+        предупреждаем: после рестарта этот реестр может оказаться неполным.
+        """
+        path = self._pending_orders_path()
+        if path is None:
+            return
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+            tmp.write_text(
+                json.dumps(self._pending_registry(), ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            os.replace(tmp, path)
+        except OSError as exc:
+            log.warning(
+                "Не удалось сохранить незавершённые заявки в %s (%s) — "
+                "после рестарта они могут потеряться",
+                path, exc,
+            )
+
     def _reconcile_pending(self, instrument_id: str) -> str | None:
         """Проверяет ранее оставленную незавершённую заявку по инструменту.
 
@@ -133,6 +198,16 @@ class Trader:
         GetOrderState трактуется как «статус неизвестен» — fail closed.
         """
         pending = self._pending_registry()
+        sentinel = pending.get(PENDING_CORRUPT_KEY)
+        if sentinel:
+            # Не знаем, какие заявки живы: блокируем все инструменты, пока файл
+            # не удалят или не перепишут валидным содержимым.
+            log.warning(
+                "Файл незавершённых заявок повреждён (%s) — новые заявки "
+                "блокируем по всем инструментам",
+                sentinel,
+            )
+            return sentinel
         order_id = pending.get(instrument_id)
         if not order_id:
             return None
@@ -147,6 +222,7 @@ class Trader:
         status = str(state.get("status") or "")
         if status in FINAL_STATUSES:
             pending.pop(instrument_id, None)
+            self._persist_pending()
             log.info(
                 "Прошлая заявка %s по %s завершилась (%s) — можно выставлять новую",
                 order_id, instrument_id, status,
@@ -219,6 +295,7 @@ class Trader:
                 # отмена не удалась или биржа ещё не подтвердила финальный статус:
                 # заявка может исполниться позже, поэтому блокируем новые по инструменту
                 self._pending_registry()[instrument_id] = state["order_id"]
+                self._persist_pending()
             log.warning(
                 "Заявка %s осталась в статусе %s (исполнено %d/%d лотов)",
                 state["order_id"], state["status"], state["lots_executed"], state["lots_requested"],
