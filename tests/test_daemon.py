@@ -327,3 +327,51 @@ def test_daemon_entry_survives_missing_std_streams(tmp_path, monkeypatch, entry,
     payload = json.loads(status_path.read_text(encoding="utf-8"))
     assert payload["state"] == "stopped"
     assert payload["iteration"] >= 1
+
+
+# =====================================================================
+# (4) Positions in the daemon snapshot (TUI positions table, D3)
+# =====================================================================
+
+def test_daemon_status_includes_positions_in_session(tmp_path):
+    """In-session: позиции из портфеля попадают в daemon_status.json для TUI."""
+    config = make_config(tmp_path, loop_interval_sec=0.001, daemon_tick_sec=0.001)
+
+    class PositionAPI(FakeTBankAPI):
+        def get_portfolio(self, account_id):
+            return {
+                "positions": {
+                    "FAKE-SBER": {
+                        "figi": "FAKE-SBER",
+                        "quantity": 10.0,
+                        "average_position_price": 100.0,
+                        "current_price": 110.0,
+                    }
+                },
+                "total_amount_rub": 100_010.0,
+                "cash_rub": 100_000.0,
+            }
+
+    bot = TradingBot(config, api=PositionAPI(config.tickers))
+    bot.in_trading_session = lambda: True
+    bot.step_ticker = lambda ticker, instrument, portfolio, entries_allowed: None
+
+    assert run_headless(bot, max_iterations=1, reports_dir=config.reports_dir) == 0
+
+    payload = control.read_status(config.reports_dir)
+    assert payload["positions"] == [
+        {"ticker": "SBER", "lots": 10, "price": 110.0, "pnl_rub": 100.0}
+    ]
+    assert payload["positions_count"] == 1
+
+
+def test_daemon_status_positions_empty_out_of_session(tmp_path):
+    """Out-of-session: снимка портфеля нет — positions пустой список, не отсутствует."""
+    config = make_config(tmp_path, loop_interval_sec=0.001, daemon_tick_sec=0.001)
+    bot = make_fake_bot(config)
+    bot.in_trading_session = lambda: False
+
+    assert run_headless(bot, max_iterations=1, reports_dir=config.reports_dir) == 0
+
+    payload = control.read_status(config.reports_dir)
+    assert payload["positions"] == []

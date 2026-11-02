@@ -689,6 +689,14 @@ def cmd_daemon_stop(config: Config, timeout: float = 60.0, poll_interval: float 
     return 1
 
 
+def cmd_tui(config: Config) -> int:
+    """D3: read-only Textual-дашборд демона — только чтение файлов reports/."""
+    from tui.app import TbankApp
+
+    TbankApp(config).run()
+    return 0
+
+
 def cmd_setup(config: Config, days: int | None = None, capital: float | None = None) -> int:
     """Первый запуск одной командой: smoke → download → news → train → backtest.
 
@@ -1620,6 +1628,8 @@ def _build_parser() -> argparse.ArgumentParser:
     daemon_sub.add_parser("status", help="состояние демона из daemon_status.json (офлайн)")
     daemon_sub.add_parser("stop", help="остановить демон через очередь команд (≤60 с)")
 
+    sub.add_parser("tui", help="интерактивный дашборд демона (Textual)")
+
     p = sub.add_parser("report", help="состояние счёта: P&L, позиции, сделки, кривая капитала")
     p.add_argument("--json", action="store_true", help="машиночитаемый отчёт одним JSON-объектом")
     p = sub.add_parser("status", help="офлайн-сводка: конфиг, данные, модели, живость (без API)")
@@ -1713,6 +1723,8 @@ def main() -> int:
             if args.daemon_action == "stop":
                 return cmd_daemon_stop(config)
             return 1
+        if args.command == "tui":
+            return cmd_tui(config)
         if args.command == "report":
             if getattr(args, "json", False):
                 return cmd_report(config, json_output=True)

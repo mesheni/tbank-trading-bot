@@ -163,6 +163,8 @@ class Config:
     # шаг тика headless-демона (с): сон цикла режется на такие срезы, чтобы
     # каждую секунду проверять очередь команд и статус
     daemon_tick_sec: float = field(default_factory=lambda: _env_float("DAEMON_TICK_SEC", 1.0))
+    # период автообновления TUI-дашборда (с): перечитывает файлы reports/ без сети
+    tui_refresh_sec: float = field(default_factory=lambda: _env_float("TUI_REFRESH_SEC", 2.0))
     # ТОЛЬКО для тестов/e2e: детерминированный TBankAPI без сети (см. bot.FakeTBankAPI)
     tbank_fake_api: bool = field(default_factory=lambda: _env_bool("TBANK_FAKE_API", False))
 

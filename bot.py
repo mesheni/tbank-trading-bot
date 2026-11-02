@@ -932,6 +932,7 @@ class _DaemonRunner:
         self.equity: float | None = None
         self.cash: float | None = None
         self.positions: int = 0
+        self.position_rows: list[dict] = []
 
     def _kill_switch(self) -> tuple[bool, str | None]:
         if getattr(self.bot, "_entries_allowed", True):
@@ -940,6 +941,43 @@ class _DaemonRunner:
         if isinstance(state, dict):
             return True, "corrupt" if state.get("corrupt") else state.get("triggered_at")
         return True, None
+
+    def _positions_payload(self, portfolio_positions: dict) -> list[dict]:
+        """Позиции портфеля для TUI (ticker/lots/price/pnl_rub); только чтение.
+
+        Ключи API — figi; тикер и лот берём из уже разрешённых self.bot.instruments.
+        Пустой список вне сессии и при отсутствии снимка портфеля.
+        """
+        instruments = getattr(self.bot, "instruments", {}) or {}
+        by_figi: dict[str, tuple[str, dict]] = {}
+        for ticker, instrument in instruments.items():
+            instrument = instrument or {}
+            figi = instrument.get("figi")
+            if figi:
+                by_figi[figi] = (ticker, instrument)
+        rows: list[dict] = []
+        for figi, pos in (portfolio_positions or {}).items():
+            if not isinstance(pos, dict):
+                continue
+            ticker, instrument = by_figi.get(figi, (figi, {}))
+            try:
+                quantity = float(pos.get("quantity") or 0)
+                avg = float(pos.get("average_position_price") or 0)
+                current = float(pos.get("current_price") or 0)
+                lot = int(instrument.get("lot") or 1)
+            except (TypeError, ValueError):
+                continue
+            lots = int(quantity // lot) if lot else int(quantity)
+            pnl_rub = round((current - avg) * quantity, 2) if avg > 0 and current > 0 else 0.0
+            rows.append(
+                {
+                    "ticker": ticker,
+                    "lots": lots,
+                    "price": round(current, 4),
+                    "pnl_rub": pnl_rub,
+                }
+            )
+        return rows
 
     def publish(self, iteration: int | None = None, snapshot: dict | None = None,
                 error: str | None = None, state: str | None = None) -> None:
@@ -950,7 +988,9 @@ class _DaemonRunner:
         if snapshot is not None:
             self.equity = snapshot.get("total_amount_rub")
             self.cash = snapshot.get("cash_rub")
-            self.positions = len(snapshot.get("positions") or {})
+            portfolio_positions = snapshot.get("positions") or {}
+            self.positions = len(portfolio_positions)
+            self.position_rows = self._positions_payload(portfolio_positions)
         if error is not None:
             self.last_error = error
         active, reason = self._kill_switch()
@@ -963,6 +1003,7 @@ class _DaemonRunner:
             "equity_rub": self.equity,
             "cash_rub": self.cash,
             "positions_count": self.positions,
+            "positions": self.position_rows,
             "kill_switch_active": active,
             "kill_switch_reason": reason,
             "last_error": self.last_error,
