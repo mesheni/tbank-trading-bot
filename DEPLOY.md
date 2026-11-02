@@ -50,6 +50,28 @@ copy .env.example .env
 Полезные флаги: `run --iterations 5` (пробный прогон), `download --days 720`.
 Плановое переобучение: `download` → `train` раз в 1–2 недели (модели видят только прошлые данные).
 
+### Автозапуск при входе в систему (Windows)
+
+Для работы без открытого окна служит скрипт `deploy/windows/install-autostart.ps1`. Он не
+требует прав администратора и регистрирует задачу Планировщика `tbank-daemon` с триггером
+ONLOGON, которая запускает `.venv\Scripts\pythonw.exe cli.py daemon run` без окна консоли.
+
+```powershell
+# установить (из корня проекта)
+powershell -ExecutionPolicy Bypass -File deploy\windows\install-autostart.ps1
+
+# удалить задачу
+powershell -ExecutionPolicy Bypass -File deploy\windows\install-autostart.ps1 -Uninstall
+```
+
+Что создаётся: задача `tbank-daemon` (ONLOGON, `LIMITED` — без прав администратора), которая
+запускает `pythonw.exe` с полным путём к `cli.py` и аргументом `daemon run`. Логи пишутся в
+`var/daemon.log` (путь задаётся `LOG_FILE` в `.env`). Остановить торговлю — `cli.py daemon stop`,
+состояние — `cli.py daemon status`.
+
+Ограничение: триггер ONLOGON не переживает выход из системы, поэтому после логаута бот
+останавливается. Для круглосуточной работы используйте Linux VPS с systemd (§3.5).
+
 ---
 
 ## 3. Запуск на удалённом сервере (Linux VPS) — под root

@@ -30,6 +30,19 @@ copy .env.example .env                          # и вписать токен
 `.venv\Scripts\python cli.py ...` пишите `tbank ...` (`tbank status`, `tbank run`, ...).
 Все команды ниже приведены в полном виде — они равноценны.
 
+### Автозапуск на Windows
+
+Чтобы бот стартовал при входе в систему, зарегистрируйте задачу Планировщика (права
+администратора не нужны):
+
+```powershell
+powershell -ExecutionPolicy Bypass -File deploy\windows\install-autostart.ps1
+```
+
+Скрипт создаёт задачу `tbank-daemon` с триггером ONLOGON, которая запускает
+`.venv\Scripts\pythonw.exe cli.py daemon run` без окна. Логи пишутся в `var/daemon.log`.
+Удалить задачу: тот же скрипт с ключом `-Uninstall`.
+
 ### Сертификат НУЦ Минцифры
 
 При доступе к API из РФ цепочка TLS подписывается корнем НУЦ Минцифры, которого нет в
@@ -64,6 +77,8 @@ TLS_INSECURE=1
 | `cli.py train [--capital RUB]` | walk-forward сравнение 6 моделей, сохранение лучшей; с `--capital` — тикеры, чей лот дороже бюджета позиции, исключаются | нет |
 | `cli.py backtest [--capital RUB]` | бэктест стратегии с лучшей моделью, отчёты; без `--capital` — на бюджете из `.env` | нет |
 | `cli.py run [--iterations N]` | торговый цикл бота в sandbox | да |
+| `cli.py daemon run\|status\|stop` | фон: торговля без открытого TUI; `status` — сводка по `daemon_status.json`, `stop` — мягкая остановка через очередь команд | да (`run`), нет (`status`/`stop`, читают файлы) |
+| `cli.py tui` | интерактивный дашборд демона (Textual); только читает файлы `reports/` | нет |
 | `cli.py report` | позиции счёта, журнал сделок, vs buy&hold | да |
 | `cli.py status` | офлайн-сводка: активный конфиг, покрытие свечей, возраст/тип моделей, живость бота | нет |
 | `cli.py watchdog [--restart]` | живость бота по heartbeat (для cron); имя юнита — `SYSTEMD_UNIT` | да |
@@ -184,6 +199,10 @@ python cli.py run
 * **Kill-switch**: при просадке глубже `MAX_DRAWDOWN_PCT` новые входы запрещаются, приходит
   письмо. Запрет сохраняется в `reports/kill_switch.json` и переживает перезапуск; снять его
   можно только командой `cli.py kill-switch-reset`.
+
+Бот торгует в фоне независимо от TUI: `cli.py tui` только читает файлы в `reports/`
+(`daemon_status.json`, `heartbeat`, `equity_live.csv`, `journal.csv`). Закрытие TUI не
+останавливает торговлю — остановка делается командой `cli.py daemon stop`.
 
 Примеры cron и настройка SMTP — в [DEPLOY.md](DEPLOY.md) §3.8.
 
