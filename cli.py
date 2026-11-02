@@ -35,15 +35,17 @@ import logging.handlers
 import math
 import shutil
 import sys
+import time
 from dataclasses import replace
 from pathlib import Path
 
 import pandas as pd
 import requests
 
+import control
 import ui
 from backtest import run_backtest, save_report
-from config import CAPITAL_PROFILES, Config, resolve_capital_profile
+from config import BASE_DIR, CAPITAL_PROFILES, Config, resolve_capital_profile
 from features import build_features, ensure_news_columns
 from models.registry import (
     artifact_path,
@@ -507,10 +509,11 @@ def cmd_backtest(config: Config, capital: float | None = None) -> int:
     return 0
 
 
-def cmd_run(config: Config, max_iterations: int | None) -> int:
-    print(ui.mode_banner(config.mode))  # первая строка вывода: режим виден сразу
-    # F-C1.6: в real — только после явного подтверждения в .env (systemd работает
-    # без интерактивного ввода, поэтому это флаг, а не вопрос в консоли)
+def _real_trading_guard(config: Config) -> int | None:
+    """REAL-режим без CONFIRM_REAL_TRADING=YES — отказ до любых обращений к API.
+
+    Единая точка для `run`, `daemon run`, systemd и Task Scheduler.
+    """
     if config.mode == "real" and not getattr(config, "confirm_real_trading", False):
         print(
             "[!!] MODE=real: для торговли на реальном счёте задайте CONFIRM_REAL_TRADING=YES "
@@ -518,24 +521,127 @@ def cmd_run(config: Config, max_iterations: int | None) -> int:
             file=sys.stderr,
         )
         return 2
+    return None
 
-    from bot import TradingBot
 
-    # артефакты обязательны: без модели бот не может прогнозировать
-    missing = [
-        t for t in config.tickers
-        if not artifact_path(config.models_dir, t, config.candle_interval, config.forecast_horizon).exists()
-    ]
-    if missing:
-        warn(f"Нет артефактов моделей для: {', '.join(missing)} — выполните `python cli.py train`")
-    bot = TradingBot(config)
-    for ticker in missing:
-        bot.instruments.pop(ticker, None)
-    if not bot.instruments:
-        warn("Ни одного тикера с моделью — запуск невозможен. Сначала: python cli.py train")
-        return 2
-    bot.run_forever(max_iterations=max_iterations)
+def _ensure_daemon_log(config: Config) -> None:
+    """pythonw без консоли не должен терять лог: по умолчанию var/daemon.log."""
+    if config.log_file is not None:
+        return
+    config.log_file = BASE_DIR / "var" / "daemon.log"
+    _attach_file_log(config)
+
+
+def _run_headless(config: Config, max_iterations: int | None) -> int:
+    """Общий headless-вход: REAL-гейт, лог, lock, сборка бота, tick-цикл."""
+    guard = _real_trading_guard(config)
+    if guard is not None:
+        return guard
+    _ensure_daemon_log(config)
+
+    from bot import FakeTBankAPI, TradingBot, run_headless
+
+    reports_dir = Path(config.reports_dir)
+    # lock берём ДО сборки бота: второй экземпляр не должен даже открывать счёт
+    if not control.acquire_lock(reports_dir):
+        print(
+            "[!!] Демон уже запущен (daemon.lock занят живым процессом) — "
+            "второй экземпляр не запускается",
+            file=sys.stderr,
+        )
+        return 3
+    try:
+        if getattr(config, "tbank_fake_api", False):
+            bot = TradingBot(config, api=FakeTBankAPI(config.tickers))
+        else:
+            # артефакты обязательны: без модели бот не может прогнозировать
+            missing = [
+                t for t in config.tickers
+                if not artifact_path(
+                    config.models_dir, t, config.candle_interval, config.forecast_horizon
+                ).exists()
+            ]
+            if missing:
+                warn(f"Нет артефактов моделей для: {', '.join(missing)} — выполните `python cli.py train`")
+            bot = TradingBot(config)
+            for ticker in missing:
+                bot.instruments.pop(ticker, None)
+            if not bot.instruments:
+                warn("Ни одного тикера с моделью — запуск невозможен. Сначала: python cli.py train")
+                return 2
+        return run_headless(bot, max_iterations, reports_dir, acquire=False)
+    finally:
+        control.release_lock(reports_dir)
+
+
+def cmd_run(config: Config, max_iterations: int | None) -> int:
+    """Обратная совместимость: `cli.py run` — тот же headless-путь, что daemon run."""
+    return cmd_daemon_run(config, max_iterations)
+
+
+def cmd_daemon_run(config: Config, max_iterations: int | None = None) -> int:
+    print(ui.mode_banner(config.mode))  # первая строка вывода: режим виден сразу
+    return _run_headless(config, max_iterations)
+
+
+def cmd_daemon_status(config: Config) -> int:
+    """Сводка daemon_status.json; отсутствие/порча файла — не ошибка, а «не запущен»."""
+    print(ui.mode_banner(config.mode))
+    payload = control.read_status(config.reports_dir)
+    if payload is None:
+        print("  демон не запущен (файла daemon_status.json нет)")
+        return 0
+    if payload.get("corrupt"):
+        print("  демон не запущен (daemon_status.json повреждён)")
+        return 0
+    print(ui.header("ДЕМОН"))
+    print(
+        f"  Состояние: {payload.get('state')} · pid {payload.get('pid')} · "
+        f"итерация {payload.get('iteration')}"
+    )
+    print(f"  Режим: {payload.get('mode')} · обновлено: {payload.get('updated_at')}")
+    equity = payload.get("equity_rub")
+    cash = payload.get("cash_rub")
+    if equity is not None or cash is not None:
+        print(
+            f"  Капитал: {ui.fmt_money(equity) if equity is not None else '--'} руб · "
+            f"кэш: {ui.fmt_money(cash) if cash is not None else '--'} руб · "
+            f"позиций: {payload.get('positions_count')}"
+        )
+    if payload.get("kill_switch_active"):
+        warn(f"kill-switch активен: {payload.get('kill_switch_reason') or 'причина неизвестна'}")
+    if payload.get("last_error"):
+        warn(f"последняя ошибка: {payload['last_error']}")
     return 0
+
+
+def _wait_for_daemon_stop(reports_dir, command_id: str, timeout: float, poll_interval: float) -> bool:
+    """Ждёт ack команды И состояния stopped; False — таймаут (демон завис/не отвечает)."""
+    ack_path = control.paths(reports_dir)["acks"] / f"{command_id}.json"
+    deadline = time.monotonic() + max(0.0, float(timeout))
+    while True:
+        payload = control.read_status(reports_dir)
+        stopped = isinstance(payload, dict) and not payload.get("corrupt") and payload.get("state") == "stopped"
+        if ack_path.exists() and stopped:
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(min(poll_interval, max(0.0, deadline - time.monotonic())))
+
+
+def cmd_daemon_stop(config: Config, timeout: float = 60.0, poll_interval: float = 0.5) -> int:
+    """Ставит команду stop и ждёт ack ≤ timeout; таймаут — вежливый отказ, не зависание."""
+    reports_dir = Path(config.reports_dir)
+    current = control.read_status(reports_dir)
+    if current is None or (not current.get("corrupt") and current.get("state") == "stopped"):
+        print("  демон не запущен — останавливать нечего")
+        return 0
+    command_id = control.enqueue_command(reports_dir, "stop")
+    if _wait_for_daemon_stop(reports_dir, command_id, timeout, poll_interval):
+        ok(f"Демон остановлен (команда {command_id})")
+        return 0
+    warn(f"Демон не подтвердил остановку за {timeout:g} с (команда {command_id})")
+    return 1
 
 
 def cmd_setup(config: Config, days: int | None = None, capital: float | None = None) -> int:
@@ -1462,6 +1568,13 @@ def _build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("run", help="торговый цикл (sandbox или real по MODE)")
     p.add_argument("--iterations", type=int, default=None, help="число итераций цикла (пробный запуск)")
 
+    p = sub.add_parser("daemon", help="фоновый режим: run | status | stop")
+    daemon_sub = p.add_subparsers(dest="daemon_action", required=True, metavar="action")
+    p_run = daemon_sub.add_parser("run", help="торговый цикл без UI (lock, статус, очередь команд)")
+    p_run.add_argument("--iterations", type=int, default=None, help="число итераций цикла (пробный запуск)")
+    daemon_sub.add_parser("status", help="состояние демона из daemon_status.json (офлайн)")
+    daemon_sub.add_parser("stop", help="остановить демон через очередь команд (≤60 с)")
+
     p = sub.add_parser("report", help="состояние счёта: P&L, позиции, сделки, кривая капитала")
     p.add_argument("--json", action="store_true", help="машиночитаемый отчёт одним JSON-объектом")
     p = sub.add_parser("status", help="офлайн-сводка: конфиг, данные, модели, живость (без API)")
@@ -1519,7 +1632,10 @@ def main() -> int:
     skip_prevalidation = args.command == "check-config" and getattr(args, "json", False)
     try:
         if not skip_prevalidation:
-            if args.command in MODE_ONLY_COMMANDS:
+            mode_only = args.command in MODE_ONLY_COMMANDS or (
+                args.command == "daemon" and getattr(args, "daemon_action", None) != "run"
+            )
+            if mode_only:
                 if config.mode not in {"sandbox", "real"}:
                     raise ValueError(f"MODE должен быть sandbox|real, получено: {config.mode}")
             else:
@@ -1544,6 +1660,14 @@ def main() -> int:
             return cmd_backtest(config, args.capital)
         if args.command == "run":
             return cmd_run(config, args.iterations)
+        if args.command == "daemon":
+            if args.daemon_action == "run":
+                return cmd_daemon_run(config, args.iterations)
+            if args.daemon_action == "status":
+                return cmd_daemon_status(config)
+            if args.daemon_action == "stop":
+                return cmd_daemon_stop(config)
+            return 1
         if args.command == "report":
             if getattr(args, "json", False):
                 return cmd_report(config, json_output=True)
