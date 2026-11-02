@@ -69,16 +69,23 @@ def _command_names(reports: Path) -> list[str]:
     return [json.loads(path.read_text(encoding="utf-8"))["name"] for path in _command_files(reports)]
 
 
-def _fake_ack(monkeypatch) -> list[str]:
-    """Фейковый демон: ack появляется сразу после enqueue (файл на диске, не UI-текст)."""
-    seen: list[str] = []
+def _fake_ack(monkeypatch, *, stop_state: bool = False, ok: bool = True, detail: str = ""):
+    """Фейковый демон: ack пишется сразу после enqueue (файл на диске, не UI-текст).
 
-    def ack(reports_dir, command_id: str) -> bool:
+    ``stop_state`` доводит статус до ``stopped`` — TUI проверяет наблюдаемый
+    результат, а не только наличие ack-файла.
+    """
+    seen: list[str] = []
+    payload = {"ok": ok, "detail": detail}
+
+    def ack(reports_dir, command_id: str):
         path = control.paths(reports_dir)["acks"] / f"{command_id}.json"
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps({"ok": True}), encoding="utf-8")
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        if stop_state:
+            control.write_status(reports_dir, {"state": "stopped", "iteration": 2, "mode": "sandbox"})
         seen.append(command_id)
-        return True
+        return dict(payload)
 
     monkeypatch.setattr(tui_app, "_ack_received", ack)
     return seen
@@ -126,7 +133,7 @@ async def _cancel(app: TbankApp, pilot) -> None:
 
 def test_stop_key_enqueues_stop_and_shows_stopped(tmp_path, monkeypatch):
     _write_running(tmp_path)
-    acked = _fake_ack(monkeypatch)
+    acked = _fake_ack(monkeypatch, stop_state=True)
     app = TbankApp(_config(tmp_path))
 
     async def scenario() -> None:
@@ -183,6 +190,49 @@ def test_kill_switch_online_enqueues_reset_and_never_clears_file(tmp_path, monke
     assert _command_names(tmp_path) == ["kill_switch_reset"]
     assert len(_ack_files(tmp_path)) == 1
     assert cleared == []  # живой демон сам снимает флаг; TUI файл не трогает
+
+
+def test_kill_switch_reset_failure_ack_shows_error_not_confirmed(tmp_path, monkeypatch):
+    """F1/Pilot: ack ok=False -> ошибка, а не «сброшен»; файл флага на месте."""
+    _write_running(tmp_path)
+    (tmp_path / "kill_switch.json").write_text(
+        json.dumps({"triggered_at": "2026-01-01T00:00:00+00:00"}), encoding="utf-8"
+    )
+    _fake_ack(monkeypatch, ok=False, detail="RuntimeError: reset denied")
+    app = TbankApp(_config(tmp_path))
+
+    async def scenario() -> None:
+        async with app.run_test(size=(120, 42)) as pilot:
+            await pilot.press("k")
+            await _confirm(app, pilot)
+            await pilot.pause(0.2)
+            text = _status(app)
+            assert "ошибка выполнения" in text
+            assert "reset denied" in text
+            assert "сброшен" not in text
+
+    asyncio.run(scenario())
+    assert (tmp_path / "kill_switch.json").exists()
+
+
+def test_stop_ack_with_running_state_is_not_declared_stopped(tmp_path, monkeypatch):
+    """F1/Pilot: ack есть, но демон всё ещё running -> «остановлен» не показываем."""
+    _write_running(tmp_path)
+    _fake_ack(monkeypatch)  # ok=True, но статус остаётся running
+    app = TbankApp(_config(tmp_path))
+    app.ack_timeout = 0.2
+    app.ack_poll_interval = 0.02
+
+    async def scenario() -> None:
+        async with app.run_test(size=(120, 42)) as pilot:
+            await pilot.press("x")
+            await _confirm(app, pilot)
+            await pilot.pause(0.35)
+            text = _status(app)
+            assert "демон остановлен" not in text
+            assert "не подтвердил остановку" in text
+
+    asyncio.run(scenario())
 
 
 # =====================================================================

@@ -20,8 +20,7 @@ import bot
 import control
 import tui.controls as controls
 import tui.data as data
-
-_VAR_DIR = Path(__file__).resolve().parents[1] / "var"
+from tui import _VAR_DIR
 
 _BADGE_COLORS = {
     "running": "green",
@@ -57,7 +56,7 @@ def _humanize_age(age_min: float | None) -> str:
     return f"{hours // 24} дн назад"
 
 
-def _ack_received(reports_dir, command_id: str) -> bool:
+def _ack_received(reports_dir, command_id: str) -> dict | None:
     """Тонкая обёртка над ack-файлом: в тестах подменяется фейковым «демоном»."""
     return controls.read_ack(reports_dir, command_id)
 
@@ -229,18 +228,34 @@ class TbankApp(App):
             return
         self._set_status(controls.KILL_SWITCH_CLEARED)
 
+    def _ack_outcome(self, name: str) -> bool:
+        """Подтверждён ли наблюдаемый результат команды (не только факт ack).
+
+        stop — демон опубликовал ``state=stopped``; kill_switch_reset — файл
+        ``kill_switch.json`` действительно исчез. Иначе «сброшен/остановлен» было
+        бы ложью: ack пишется ещё до выполнения команды.
+        """
+        reports_dir = self.tbank_config.reports_dir
+        if name == "stop":
+            return data.daemon_state(reports_dir).get("state") == "stopped"
+        return bot.read_kill_switch(reports_dir) is None
+
     @work(exclusive=True, group="ack")
     async def _await_ack(self, name: str, command_id: str) -> None:
-        """Ждём ack файлом (не drain_commands — очередь принадлежит демону)."""
+        """Ждём ack файлом и подтверждаем результат; ack ok=False — сразу ошибка."""
         reports_dir = self.tbank_config.reports_dir
         deadline = time.monotonic() + self.ack_timeout
         while True:
             try:
-                received = _ack_received(reports_dir, command_id)
+                ack = _ack_received(reports_dir, command_id)
             except (OSError, ValueError) as exc:
                 self._set_status(f"ошибка проверки ack: {exc}")
                 return
-            if received:
+            if isinstance(ack, dict) and not ack.get("ok", False):
+                detail = str(ack.get("detail") or "неизвестная ошибка")
+                self._set_status(f"ошибка выполнения {name}: {detail}")
+                return
+            if isinstance(ack, dict) and ack.get("ok") and self._ack_outcome(name):
                 self._set_status(
                     controls.STOPPED if name == "stop" else controls.KILL_SWITCH_RESET_CONFIRMED
                 )

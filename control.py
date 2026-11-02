@@ -201,6 +201,20 @@ def drain_commands(reports_dir) -> list[dict]:
     return drained
 
 
+def write_ack(reports_dir, command_id: str, name: str, ok: bool, detail: str = "") -> None:
+    """Переписывает ack команды реальным исходом обработки (accepted -> done/failed).
+
+    Первый ack из :func:`drain_commands` означает лишь «команда принята»; этот
+    вызов атомарно заменяет его после выполнения, чтобы клиент видел настоящий
+    результат, а не только факт доставки. Ошибка записи не роняет демон.
+    """
+    ack = {"name": name, "handled_at": _utc_now(), "ok": bool(ok), "detail": str(detail or "")}
+    try:
+        _write_json_atomic(paths(reports_dir)["acks"] / f"{command_id}.json", ack)
+    except OSError as exc:
+        log.warning("Не удалось переписать ack команды %s: %s", command_id, exc)
+
+
 def _pid_alive(pid: int) -> bool:
     """Жив ли процесс: os.kill(pid, 0) на POSIX, OpenProcess на Windows (без psutil).
 

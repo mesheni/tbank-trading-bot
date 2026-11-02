@@ -1014,24 +1014,43 @@ class _DaemonRunner:
             log.exception("Демон: не удалось записать daemon_status.json (%s)", exc)
 
     def on_tick(self) -> bool:
-        """Дренаж очереди команд; True — запрошен стоп (завершить цикл)."""
+        """Дренаж очереди команд и публикация свежего статуса; True — запрошен стоп.
+
+        Статус пишется каждый тик (DAEMON_TICK_SEC, по умолчанию 1 с), а не только
+        раз на итерацию: TUI судит о живости демона по ``updated_at``, и при
+        LOOP_INTERVAL_SEC=300 файл иначе устаревал бы между итерациями.
+        """
         try:
             commands = control.drain_commands(self.reports_dir)
         except Exception as exc:
             log.exception("Демон: очередь команд недоступна (%s)", exc)
+            self.publish()
             return self.stop_requested
         for command in commands:
             name = command.get("name")
+            command_id = str(command.get("id") or "")
             if name == "stop":
                 self.stop_requested = True
                 log.info("Демон: получена команда stop — завершаем текущую итерацию")
+                if command_id:
+                    control.write_ack(self.reports_dir, command_id, "stop", True)
             elif name == "kill_switch_reset":
                 try:
                     self.bot.reset_kill_switch()
                 except Exception as exc:
+                    detail = f"{type(exc).__name__}: {exc}"
+                    self.last_error = detail
                     log.exception("Демон: kill_switch_reset не выполнен (%s)", exc)
-        if self.stop_requested:
-            self.publish(state="stopping")
+                    if command_id:
+                        control.write_ack(
+                            self.reports_dir, command_id, "kill_switch_reset", False, detail
+                        )
+                else:
+                    if command_id:
+                        control.write_ack(
+                            self.reports_dir, command_id, "kill_switch_reset", True
+                        )
+        self.publish(state="stopping" if self.stop_requested else None)
         return self.stop_requested
 
     def finish(self) -> None:

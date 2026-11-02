@@ -216,8 +216,6 @@ def cmd_smoke(config: Config) -> int:
 
 
 def cmd_download(config: Config, days: int) -> int:
-    import time
-
     api = make_api(config)
     instruments = api.resolve_instruments(config.tickers)
     conn = connect(config.db_path)
@@ -319,8 +317,6 @@ def _render_metrics_table(metrics: pd.DataFrame, best: str | None) -> str:
 
 
 def cmd_train(config: Config, capital: float | None = None) -> int:
-    import time
-
     conn = connect(config.db_path)
     summary = {}
     trained = []
@@ -1486,8 +1482,10 @@ def cmd_reset_sandbox(config: Config, assume_yes: bool = False) -> int:
 
     Единственный способ вернуть счёт к бюджету после ошибочного пополнения:
     вывода из песочницы в API нет. Позиции и кэш закрываются вместе со счётом;
-    journal.csv / equity_live.csv / flows.csv ротируются с меткой времени —
-    история старого счёта остаётся в reports/ с суффиксом-датой.
+    journal.csv / equity_live.csv / flows.csv / pending_orders.json ротируются
+    с меткой времени — история старого счёта остаётся в reports/ с
+    суффиксом-датой. Реестр незавершённых заявок архивируется вместе с
+    журналами: иначе новый счёт унаследовал бы блокировки старого.
     После сброса бота нужно перезапустить, чтобы он подхватил новый счёт.
     """
     if config.mode != "sandbox":
@@ -1523,12 +1521,12 @@ def cmd_reset_sandbox(config: Config, assume_yes: bool = False) -> int:
 
     rotated = [
         name
-        for name in ("journal.csv", "equity_live.csv", "flows.csv")
+        for name in ("journal.csv", "equity_live.csv", "flows.csv", "pending_orders.json")
         if (archived := _rotate_report_file(Path(config.reports_dir) / name))
     ]
     print(f"  Новый счёт: {new_account_id}, бюджет {ui.fmt_money(_sandbox_budget(config))} руб внесён")
     if rotated:
-        print(f"  Журналы старого счёта заархивированы: {', '.join(rotated)}")
+        print(f"  Журналы и реестр заявок старого счёта заархивированы: {', '.join(rotated)}")
     print("  Перезапустите бота, чтобы он подхватил новый счёт (например: systemctl restart tbank-bot)")
     return 0
 

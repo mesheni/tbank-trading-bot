@@ -14,6 +14,7 @@ from pathlib import Path
 
 import control
 from bot import read_kill_switch
+from tbank.trader import PENDING_CORRUPT_KEY
 
 # Пороги свежести heartbeat (минуты) для legacy-режима `cli.py run` без
 # daemon_status.json. Используются в badge() и переиспользуются в todo 9
@@ -26,8 +27,8 @@ STALE_MAX_MIN: float = 20.0
 # подозрительно. Граница включительна: ровно 60.0 c — ещё running.
 STATUS_FRESH_SEC: float = 60.0
 
-# Ключ-маркер повреждённого реестра заявок (tbank/trader.py:PENDING_CORRUPT_KEY).
-PENDING_CORRUPT_KEY = "*"
+# Ключ-маркер повреждённого реестра заявок берётся из tbank/trader.py — один
+# источник истины, а не продублированная строка "*".
 
 _EQUITY_COLUMNS = ("time", "total_rub", "cash_rub", "positions_rub")
 # Минимум колонок journal.csv, без которых строки бесполезны для дашборда

@@ -21,6 +21,7 @@ from textual.screen import ModalScreen
 from textual.widgets import Button, Static
 
 import control
+from tui import _VAR_DIR
 from tui.data import badge
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -134,7 +135,7 @@ def daemon_argv() -> list[str]:
 
 def _daemon_out_path() -> Path:
     """Куда писать stdout/stderr отдельного демона (в тестах подменяется на tmp)."""
-    return ROOT / "var" / "daemon.out"
+    return _VAR_DIR / "daemon.out"
 
 
 def spawn_daemon() -> subprocess.Popen:
@@ -154,16 +155,20 @@ def spawn_daemon() -> subprocess.Popen:
         return subprocess.Popen(daemon_argv(), stdout=stream, stderr=subprocess.STDOUT, **kwargs)
 
 
-def read_ack(reports_dir, command_id: str) -> bool:
-    """Ack получен? Читаем файл напрямую; битый JSON — «ещё нет» (дожимает дедлайн)."""
+def read_ack(reports_dir, command_id: str) -> dict | None:
+    """Содержимое ack-файла или None (нет файла, битый JSON, не объект).
+
+    Возвращается весь payload (``ok``/``detail``), а не только факт «получено»:
+    клиент обязан проверить реальный исход команды, а не доверять наличию файла.
+    """
     path = control.paths(reports_dir)["acks"] / f"{command_id}.json"
     if not path.exists():
-        return False
+        return None
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
-        return False
-    return isinstance(payload, dict)
+        return None
+    return payload if isinstance(payload, dict) else None
 
 
 class ConfirmScreen(ModalScreen[bool]):

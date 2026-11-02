@@ -1,6 +1,7 @@
 """Trader.initialize_balance и cli.cmd_normalize: бюджет вносится один раз и только на пустой счёт."""
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -158,6 +159,27 @@ def test_cmd_reset_sandbox_full_flow(tmp_path, monkeypatch):
     assert list(tmp_path.glob("journal_*.csv"))
     assert not (tmp_path / "equity_live.csv").exists()
     assert list(tmp_path.glob("equity_live_*.csv"))
+
+
+def test_cmd_reset_sandbox_archives_pending_orders_and_starts_clean(tmp_path, monkeypatch):
+    """F3: реестр заявок старого счёта архивируется, новый Trader стартует чистым."""
+    api_stub = ResetAPI()
+    monkeypatch.setattr(cli, "make_api", lambda cfg: api_stub)
+    monkeypatch.setattr(trader_mod, "Trader", lambda api, path, account_id="": make_trader_stub(1_995_000.0))
+    (tmp_path / "pending_orders.json").write_text('{"SBER-UID": "o1"}', encoding="utf-8")
+    config = SimpleNamespace(mode="sandbox", reports_dir=tmp_path, sandbox_initial_rub=1_000_000.0)
+
+    rc = cli.cmd_reset_sandbox(config, assume_yes=True)
+
+    assert rc == 0
+    assert not (tmp_path / "pending_orders.json").exists()
+    archived = list(tmp_path.glob("pending_orders_*.json"))
+    assert len(archived) == 1
+    assert json.loads(archived[0].read_text(encoding="utf-8")) == {"SBER-UID": "o1"}
+    # свежий Trader на том же каталоге не видит блокировок старого счёта
+    fresh = Trader.__new__(Trader)
+    fresh.journal_path = tmp_path / "journal.csv"
+    assert fresh._load_pending() == {}
 
 
 def test_cmd_reset_sandbox_cancelled_without_yes(tmp_path, monkeypatch):

@@ -1,4 +1,4 @@
-﻿"""E2E smoke (todo 11): real `cli.py daemon run` subprocess + TUI under Pilot.
+"""E2E smoke (todo 11): real `cli.py daemon run` subprocess + TUI under Pilot.
 
 Marked ``e2e`` and skipped unless ``TBANK_E2E=1``; the full suite stays offline
 by default. Only file-level facts are asserted (status JSON, kill-switch file,
@@ -194,10 +194,14 @@ def _assert_stopped(reports: Path, expected_acks: set[str]) -> dict:
 
 
 def _assert_no_process_leak(daemon: _Daemon, before: set[int]) -> None:
-    assert daemon.proc.pid not in _python_pids()
+    """Ни одного НОВОГО python-процесса; чужие процессы, жившие до теста, не мешают."""
+    def no_leak() -> bool:
+        current = _python_pids()
+        return daemon.proc.pid not in current and current - before == set()
+
     asyncio.run(_await_for(
-        lambda: _python_pids() == before, STOP_TIMEOUT,
-        f"python process set changed: before={sorted(before)} after={sorted(_python_pids())}",
+        no_leak, STOP_TIMEOUT,
+        f"python process leak: before={sorted(before)} after={sorted(_python_pids())}",
     ))
 
 
@@ -219,7 +223,12 @@ def test_tui_controls_real_daemon_end_to_end(tmp_path, monkeypatch, _attempt):
                     "daemon_status.json did not reach state=running, iteration>=1",
                     lambda: _tail(daemon.out_path),
                 )
-                await pilot.pause()
+                # TUI refreshes on its own interval: wait for its render instead
+                # of assuming one frame is enough (mount may precede the file).
+                await _await_for(
+                    lambda: "running" in _text(app, "#daemon"), STARTUP_TIMEOUT,
+                    "TUI card did not refresh to running", lambda: _tail(daemon.out_path),
+                )
                 card = _text(app, "#daemon")
                 assert "running" in card, f"badge/card is not running: {card!r}"
                 assert "kill-switch" in card, f"kill-switch line missing: {card!r}"
@@ -294,8 +303,10 @@ def test_daemon_iteration_error_is_published_and_visible_to_tui(tmp_path, monkey
                     STARTUP_TIMEOUT, "daemon did not publish last_error=fake api failure",
                     lambda: _tail(daemon.out_path),
                 )
-                await pilot.pause()
-                assert "running" in _text(app, "#daemon")
+                await _await_for(
+                    lambda: "running" in _text(app, "#daemon"), STARTUP_TIMEOUT,
+                    "TUI card did not refresh to running", lambda: _tail(daemon.out_path),
+                )
                 await _await_for(
                     lambda: "fake api failure" in "\n".join(
                         strip.text for strip in app.query_one("#log", RichLog).lines),

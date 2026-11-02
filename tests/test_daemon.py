@@ -5,6 +5,7 @@
 """
 from __future__ import annotations
 
+import datetime as dt
 import json
 import sys
 import threading
@@ -16,6 +17,7 @@ import pytest
 import bot as bot_module
 import cli
 import control
+import tui.data as tui_data
 from bot import FakeTBankAPI, TradingBot, run_headless
 from config import Config
 from strategy import PortfolioState
@@ -204,6 +206,51 @@ def test_kill_switch_reset_command_clears_file_and_restores_entries(tmp_path):
     assert bot._entries_allowed is True
     payload = control.read_status(config.reports_dir)
     assert payload["kill_switch_active"] is False
+
+
+def test_kill_switch_reset_failure_rewrites_ack_and_publishes_error(tmp_path):
+    """F1: сорванный reset -> ack ok=False с причиной и last_error в статусе."""
+    config = make_config(tmp_path, loop_interval_sec=0.001, daemon_tick_sec=0.001)
+    config.reports_dir.mkdir(parents=True)
+    bot_module._write_kill_switch(config.reports_dir, {"triggered_at": "2026-01-01T00:00:00+00:00"})
+    command_id = control.enqueue_command(config.reports_dir, "kill_switch_reset")
+    bot = make_fake_bot(config)
+
+    def boom() -> None:
+        raise RuntimeError("reset denied")
+
+    bot.reset_kill_switch = boom
+
+    assert run_headless(bot, max_iterations=2, reports_dir=config.reports_dir) == 0
+
+    ack_path = control.paths(config.reports_dir)["acks"] / f"{command_id}.json"
+    ack = json.loads(ack_path.read_text(encoding="utf-8"))
+    assert ack["ok"] is False
+    assert "RuntimeError: reset denied" in ack["detail"]
+    assert bot_module.kill_switch_path(config.reports_dir).exists()  # флаг остался активным
+    payload = control.read_status(config.reports_dir)
+    assert "RuntimeError: reset denied" in str(payload["last_error"] or "")
+
+
+def test_on_tick_publishes_fresh_status_every_tick(tmp_path, monkeypatch):
+    """F2: каждый тик двигает updated_at, иначе бейдж устаревает между итерациями."""
+    config = make_config(tmp_path)
+    runner = bot_module._DaemonRunner(make_fake_bot(config), config.reports_dir)
+    base = dt.datetime(2026, 1, 1, 0, 0, 0, tzinfo=dt.timezone.utc)
+    monkeypatch.setattr(control, "_utc_now", lambda: base.isoformat(timespec="seconds"))
+    runner.publish(state="running")
+    first = control.read_status(config.reports_dir)["updated_at"]
+    assert first == "2026-01-01T00:00:00+00:00"
+
+    late = base + dt.timedelta(seconds=tui_data.STATUS_FRESH_SEC + 5.0)
+    monkeypatch.setattr(control, "_utc_now", lambda: late.isoformat(timespec="seconds"))
+    runner.on_tick()
+
+    second = control.read_status(config.reports_dir)["updated_at"]
+    assert second == late.isoformat(timespec="seconds")
+    assert second != first
+    state = tui_data.daemon_state(config.reports_dir, now=late)
+    assert tui_data.badge(state, now=late) == "running"  # свежесть восстановлена тиком
 
 
 def test_second_daemon_instance_refused_by_lock(tmp_path):
