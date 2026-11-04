@@ -29,6 +29,7 @@ from __future__ import annotations
 import argparse
 import csv
 import datetime as dt
+import getpass
 import json
 import logging
 import logging.handlers
@@ -690,6 +691,55 @@ def cmd_tui(config: Config) -> int:
     from tui.app import TbankApp
 
     TbankApp(config).run()
+    return 0
+
+
+_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
+
+
+def cmd_web(config: Config) -> int:
+    """Веб-панель мониторинга: loopback по умолчанию, без токена T-Invest."""
+    if not config.web_password_hash:
+        print(
+            "[!!] WEB_PASSWORD_HASH не задан: получите хеш командой `cli.py web-hash-password` "
+            "и запишите его в .env",
+            file=sys.stderr,
+        )
+        return 2
+    if not config.web_password_hash.startswith("$argon2"):
+        print("[!!] WEB_PASSWORD_HASH должен быть argon2-хешем (начинается с $argon2)", file=sys.stderr)
+        return 2
+    if len(config.web_secret_key) < 32:
+        print(
+            "[!!] WEB_SECRET_KEY не задан или короче 32 символов: задайте случайную строку в .env",
+            file=sys.stderr,
+        )
+        return 2
+    if not config.web_user:
+        print("[!!] WEB_USER не задан: задайте имя пользователя веб-панели в .env", file=sys.stderr)
+        return 2
+
+    host = config.web_host
+    if host not in _LOOPBACK_HOSTS and config.web_allow_public != "YES":
+        print(
+            f"[!!] WEB_HOST={host} не loopback: для публичного адреса задайте WEB_ALLOW_PUBLIC=YES",
+            file=sys.stderr,
+        )
+        return 2
+
+    import uvicorn
+
+    from web.app import create_app
+
+    uvicorn.run(
+        create_app(config),
+        host=host,
+        port=config.web_port,
+        proxy_headers=True,
+        forwarded_allow_ips=config.web_trusted_proxies or "127.0.0.1",
+        log_level="info",
+        reload=False,
+    )
     return 0
 
 
@@ -1583,8 +1633,25 @@ def cmd_kill_switch_reset(config: Config) -> int:
     return 0
 
 
+def cmd_web_hash_password(read_stdin: bool) -> int:
+    """argon2id-хеш пароля веб-панели: печатает ТОЛЬКО хеш, пароль не эхоится и не логируется."""
+    from argon2 import PasswordHasher
+
+    if read_stdin:
+        password = sys.stdin.readline().rstrip("\r\n")
+    else:
+        password = getpass.getpass("Пароль веб-панели: ")
+    if not password:
+        print("[!!] Пустой пароль недопустим", file=sys.stderr)
+        return 2
+    print(PasswordHasher().hash(password))
+    return 0
+
+
 # команды, которым не нужен токен T-Invest (офлайн или только SMTP)
-MODE_ONLY_COMMANDS = {"train", "backtest", "status", "send-test-email", "kill-switch-reset"}
+MODE_ONLY_COMMANDS = {
+    "train", "backtest", "status", "send-test-email", "kill-switch-reset", "web-hash-password", "web",
+}
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -1627,6 +1694,7 @@ def _build_parser() -> argparse.ArgumentParser:
     daemon_sub.add_parser("stop", help="остановить демон через очередь команд (≤60 с)")
 
     sub.add_parser("tui", help="интерактивный дашборд демона (Textual)")
+    sub.add_parser("web", help="веб-панель мониторинга (FastAPI, логин и пароль)")
 
     p = sub.add_parser("report", help="состояние счёта: P&L, позиции, сделки, кривая капитала")
     p.add_argument("--json", action="store_true", help="машиночитаемый отчёт одним JSON-объектом")
@@ -1644,6 +1712,9 @@ def _build_parser() -> argparse.ArgumentParser:
     sub.add_parser("send-test-email", help="тестовое письмо: проверка SMTP-настроек")
     sub.add_parser("normalize", help="проверить счёт на соответствие бюджету (sandbox)")
     sub.add_parser("kill-switch-reset", help="сбросить kill-switch — разрешить новые входы (локально)")
+
+    p = sub.add_parser("web-hash-password", help="argon2id-хеш пароля для веб-панели (в выводе только хеш)")
+    p.add_argument("--stdin", action="store_true", help="прочитать пароль одной строкой из stdin (тесты/скрипты)")
 
     p = sub.add_parser("reset-sandbox", help="пересоздать sandbox-счёт с бюджетом")
     p.add_argument("--yes", action="store_true", help="не спрашивать подтверждение")
@@ -1723,6 +1794,8 @@ def main() -> int:
             return 1
         if args.command == "tui":
             return cmd_tui(config)
+        if args.command == "web":
+            return cmd_web(config)
         if args.command == "report":
             if getattr(args, "json", False):
                 return cmd_report(config, json_output=True)
@@ -1737,6 +1810,8 @@ def main() -> int:
             return cmd_check_config(config)
         if args.command == "kill-switch-reset":
             return cmd_kill_switch_reset(config)
+        if args.command == "web-hash-password":
+            return cmd_web_hash_password(args.stdin)
         if args.command == "watchdog":
             return cmd_watchdog(config, args.max_stale_min, args.restart)
         if args.command == "digest":

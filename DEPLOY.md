@@ -435,6 +435,60 @@ systemctl restart tbank-bot
   новых входов можно только вручную: `.venv/bin/python cli.py kill-switch-reset`.
 - Торговля на реальном счёте (`MODE=real`) требует `CONFIRM_REAL_TRADING=YES` в `.env`.
 
+### Веб-панель
+
+Панель — отдельный процесс (`cli.py web`), который читает те же файлы `reports/`, что и TUI,
+и по умолчанию слушает только `127.0.0.1:8000`. Наружу её выставляет Caddy с автоматическим HTTPS.
+
+**1. Ключи в `.env`.** Скопируйте блок `WEB_*` из `.env.example` и заполните:
+
+```bash
+cd /root/tbank-trading-bot
+WEB_PASSWORD_HASH=$(.venv/bin/python cli.py web-hash-password)   # спросит пароль без эха
+```
+
+`WEB_USER`, `WEB_PASSWORD_HASH` (argon2id-хеш, не пароль), `WEB_SECRET_KEY` (не короче 32
+символов — например, `python3 -c "import secrets; print(secrets.token_urlsafe(48))"`).
+`WEB_ALLOW_PUBLIC` при работе через Caddy **должен оставаться пустым**: панель не должна
+слушать не-loopback адрес, публичный доступ даёт только Caddy.
+
+**2. Юнит systemd** (как в §3.5, подставьте свой каталог проекта):
+
+```bash
+sed "s|__APP_DIR__|/root/tbank-trading-bot|g" deploy/tbank-web.service > /etc/systemd/system/tbank-web.service
+systemctl daemon-reload
+systemctl enable --now tbank-web
+systemctl status tbank-web --no-pager
+journalctl -u tbank-web -f
+```
+
+Юнит выставляет `TUI_SYSTEMD_MANAGED=1`: панель не запускает второй демон, а делает
+`systemctl start|stop tbank-bot` через узкий sudoers-доступ.
+
+**3. Sudoers** (только если панель работает не от root). Проверьте синтаксис **до** установки
+и замените `__WEB_USER__` на пользователя панели:
+
+```bash
+sed "s|__WEB_USER__|tbank|g" deploy/sudoers-tbank-web > /tmp/tbank-web.sudoers
+visudo -cf /tmp/tbank-web.sudoers
+install -m 0440 /tmp/tbank-web.sudoers /etc/sudoers.d/tbank-web
+```
+
+Drop-in разрешает ровно две команды — `systemctl start tbank-bot` и `systemctl stop tbank-bot`;
+шаблонов и произвольных команд в нём нет.
+
+**4. Caddy** (TLS-терминация и прокси на localhost):
+
+```bash
+apt install -y caddy
+sed "s|__PANEL_DOMAIN__|panel.example.com|g" deploy/Caddyfile.example > /etc/caddy/Caddyfile
+systemctl reload caddy
+```
+
+Caddy сам получает сертификат и добавляет `X-Forwarded-For`, поэтому в `.env` укажите
+`WEB_TRUSTED_PROXIES=127.0.0.1` — иначе панель игнорирует заголовок и лимитирует вход по
+адресу прокси. Открывайте `https://panel.example.com`; порт 8000 наружу не открывайте.
+
 ## 4. Типичные проблемы на сервере
 
 | Симптом | Причина и решение |

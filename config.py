@@ -168,6 +168,25 @@ class Config:
     # ТОЛЬКО для тестов/e2e: детерминированный TBankAPI без сети (см. bot.FakeTBankAPI)
     tbank_fake_api: bool = field(default_factory=lambda: _env_bool("TBANK_FAKE_API", False))
 
+    # --- Веб-панель (см. DEPLOY.md) ---
+    # адрес прослушивания: по умолчанию только loopback (наружу — через reverse-proxy)
+    web_host: str = field(default_factory=lambda: os.getenv("WEB_HOST", "127.0.0.1").strip() or "127.0.0.1")
+    web_port: int = field(default_factory=lambda: _env_int("WEB_PORT", 8000))
+    # единственный пользователь панели и argon2id-хеш его пароля (пусто — панель не стартует)
+    web_user: str = field(default_factory=lambda: os.getenv("WEB_USER", "").strip())
+    web_password_hash: str = field(default_factory=lambda: os.getenv("WEB_PASSWORD_HASH", ""))
+    # секрет подписи сессионных cookie, минимум 32 символа (пусто — панель не стартует)
+    web_secret_key: str = field(default_factory=lambda: os.getenv("WEB_SECRET_KEY", ""))
+    # доверенные reverse-proxy через запятую: только их X-Forwarded-For учитывается
+    web_trusted_proxies: str = field(default_factory=lambda: os.getenv("WEB_TRUSTED_PROXIES", "").strip())
+    # таймаут простоя сессии, минут
+    web_session_idle_min: int = field(default_factory=lambda: _env_int("WEB_SESSION_IDLE_MIN", 30))
+    # лимит неудачных попыток входа на IP за окно WEB_LOGIN_WINDOW_MIN минут
+    web_login_max_attempts: int = field(default_factory=lambda: _env_int("WEB_LOGIN_MAX_ATTEMPTS", 5))
+    web_login_window_min: int = field(default_factory=lambda: _env_int("WEB_LOGIN_WINDOW_MIN", 15))
+    # разрешить не-loopback адрес: только явное "YES" (регистр важен)
+    web_allow_public: str = field(default_factory=lambda: os.getenv("WEB_ALLOW_PUBLIC", "").strip())
+
     # --- Уведомления (email/SMTP, см. notify.py) ---
     notify_email_to: str = field(default_factory=lambda: os.getenv("NOTIFY_EMAIL_TO", ""))
     smtp_host: str = field(default_factory=lambda: os.getenv("SMTP_HOST", ""))

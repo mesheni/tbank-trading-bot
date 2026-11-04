@@ -1,0 +1,8 @@
+# Caddy: автоматический HTTPS для веб-панели.
+# Установка: скопируйте в /etc/caddy/Caddyfile, замените __PANEL_DOMAIN__ на домен,
+# затем: systemctl reload caddy
+# Панель слушает только localhost (WEB_ALLOW_PUBLIC пустой), наружу её выставляет Caddy.
+# Caddy сам добавляет X-Forwarded-For, поэтому в .env задайте WEB_TRUSTED_PROXIES=127.0.0.1.
+__PANEL_DOMAIN__ {
+	reverse_proxy 127.0.0.1:8000
+}

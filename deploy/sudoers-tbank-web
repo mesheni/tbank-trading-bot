@@ -1,0 +1,9 @@
+# Sudoers drop-in для веб-панели: разрешены только start и stop юнита tbank-bot,
+# без шаблонов и произвольных команд.
+# Установка: проверьте синтаксис и только потом копируйте в /etc/sudoers.d/:
+#   visudo -cf deploy/sudoers-tbank-web
+#   install -m 0440 deploy/sudoers-tbank-web /etc/sudoers.d/tbank-web
+# Замените __WEB_USER__ на пользователя, от которого работает панель
+# (по умолчанию сервис работает от root — тогда drop-in не требуется).
+__WEB_USER__ ALL=(root) NOPASSWD: /bin/systemctl start tbank-bot
+__WEB_USER__ ALL=(root) NOPASSWD: /bin/systemctl stop tbank-bot

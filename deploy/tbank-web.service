@@ -1,0 +1,23 @@
+# systemd-юнит веб-панели (FastAPI/uvicorn, отдельный процесс от торгового бота).
+# Установка: скопируйте в /etc/systemd/system/tbank-web.service, замените __APP_DIR__
+# на каталог проекта, затем: systemctl daemon-reload && systemctl enable --now tbank-web
+# Строка User= не нужна — сервис работает от root (владельца файлов проекта).
+[Unit]
+Description=T-Bank trading bot web panel
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=600
+
+[Service]
+WorkingDirectory=__APP_DIR__
+ExecStart=__APP_DIR__/.venv/bin/python cli.py web
+# Панель не поднимает второй демон: start/stop идут через узкий systemctl (sudoers).
+Environment=TUI_SYSTEMD_MANAGED=1
+EnvironmentFile=__APP_DIR__/.env
+Restart=on-failure
+RestartSec=5
+StartLimitBurst=5
+# Лог пишется в journald (journalctl -u tbank-web -f).
+
+[Install]
+WantedBy=multi-user.target
