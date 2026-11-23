@@ -75,6 +75,15 @@ def test_main_status_and_test_email_work_without_token(monkeypatch):
     assert cli.main() == 0  # проверка SMTP тоже не требует токена
 
 
+def test_main_tui_works_without_token(monkeypatch):
+    """Дашборд только читает файлы reports/: токен ему не нужен — иначе без него не остановить демона."""
+    monkeypatch.setattr(sys, "argv", ["cli.py", "tui"])
+    monkeypatch.setenv("T_INVEST_TOKEN", "")
+    monkeypatch.setattr(cli, "cmd_tui", lambda config: 0)
+
+    assert cli.main() == 0
+
+
 # ---------- status ----------
 
 def test_status_reports_data_models_and_gaps(tmp_path, capsys):

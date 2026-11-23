@@ -26,6 +26,10 @@ from pathlib import Path
 
 log = logging.getLogger(__name__)
 
+# Повтор после НЕудачной отправки: SMTP недоступен — каждая попытка блокирует торговый
+# цикл на таймаут, поэтому чаще, чем раз в 5 минут, по тому же ключу не пробуем.
+FAILED_SEND_RETRY_SEC = 300.0
+
 
 def throttle_key(action: str, kind: str, ticker: str) -> str:
     """Ключ троттлинга, изолированный по направлению сделки.
@@ -71,6 +75,7 @@ class Notifier:
         self.cfg = cfg or SmtpConfig()
         self.state_path = Path(state_path) if state_path is not None else None
         self._last_sent: dict[str, dt.datetime] = {}
+        self._last_failed: dict[str, dt.datetime] = {}  # только в памяти
         self._load_state()
 
     @classmethod
@@ -150,8 +155,15 @@ class Notifier:
         last = self._last_sent.get(key)
         if last is not None and (now - last).total_seconds() < min_interval_sec:
             return False
+        last_failed = self._last_failed.get(key)
+        if last_failed is not None and (now - last_failed).total_seconds() < FAILED_SEND_RETRY_SEC:
+            return False
         if self.send(subject, body):
+            self._last_failed.pop(key, None)
             self._last_sent[key] = now
             self._save_state()
             return True
+        # SMTP недоступен: каждая попытка блокирует торговый цикл на таймаут, поэтому
+        # до следующего окна не переспрашиваем. В памяти — после рестарта попытка допустима.
+        self._last_failed[key] = now
         return False

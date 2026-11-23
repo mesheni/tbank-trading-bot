@@ -16,6 +16,7 @@ from __future__ import annotations
 import datetime as dt
 import json
 import re
+import secrets
 from pathlib import Path
 
 from argon2 import PasswordHasher
@@ -27,11 +28,12 @@ import web.control as web_control
 from config import Config
 from web.app import create_app
 
-PASSWORD = "testpass12345"
+# Dummy credentials are generated per test run: nothing in the repo looks like a real secret.
+PASSWORD = secrets.token_urlsafe(16)
 PASSWORD_HASH = PasswordHasher().hash(PASSWORD)
 TOKEN = "TINVEST-E2E-TOKEN-d4e5f6"
-SMTP_PASSWORD = "smtp-e2e-secret"
-SECRET_KEY = "t10-e2e-secret-key-" + "z" * 48
+SMTP_PASSWORD = secrets.token_urlsafe(16)
+SECRET_KEY = secrets.token_urlsafe(64)
 CSRF_RE = re.compile(r'name="csrf_token"[^>]*value="([^"]+)"')
 
 

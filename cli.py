@@ -560,9 +560,9 @@ def _real_trading_guard(config: Config) -> int | None:
 def _ensure_daemon_streams() -> None:
     """pythonw без консоли: потоки None — подменяем на devnull, чтобы бот не падал на print."""
     if sys.stdout is None:
-        sys.stdout = open(os.devnull, "w", encoding="utf-8")
+        sys.stdout = Path(os.devnull).open("w", encoding="utf-8")
     if sys.stderr is None:
-        sys.stderr = open(os.devnull, "w", encoding="utf-8")
+        sys.stderr = Path(os.devnull).open("w", encoding="utf-8")
 
 
 def _ensure_daemon_log(config: Config) -> None:
@@ -675,9 +675,28 @@ def cmd_daemon_stop(config: Config, timeout: float = 60.0, poll_interval: float 
     """Ставит команду stop и ждёт ack ≤ timeout; таймаут — вежливый отказ, не зависание."""
     reports_dir = Path(config.reports_dir)
     current = control.read_status(reports_dir)
-    if current is None or (not current.get("corrupt") and current.get("state") == "stopped"):
+    state_name = (
+        current.get("state") if isinstance(current, dict) and not current.get("corrupt") else None
+    )
+    if current is None or state_name == "stopped":
         print("  демон не запущен — останавливать нечего")
         return 0
+    pid = current.get("pid") if isinstance(current, dict) else None
+    if state_name in ("running", "stopping") and isinstance(pid, int) and not control.daemon_pid_alive(current):
+        # демон умер мимо finally (kill -9, питание): статус заморожен в running,
+        # ждать ack от мёртвого процесса нечего, а команда осталась бы в очереди
+        print(f"  демон не запущен — процесс pid {pid} уже не существует (статус устарел)")
+        return 0
+    unit_name = getattr(config, "systemd_unit", "tbank-bot") or "tbank-bot"
+    unit = control.systemd_unit_of_pid(pid) if isinstance(pid, int) else None
+    if unit is not None and unit.removesuffix(".service") == unit_name:
+        # Restart=always поднимет демона через RestartSec после выхода по команде
+        print(
+            f"  демон управляется systemd ({unit}): `cli.py daemon stop` его не остановит — "
+            f"используйте `systemctl stop {unit}`",
+            file=sys.stderr,
+        )
+        return 2
     command_id = control.enqueue_command(reports_dir, "stop")
     if _wait_for_daemon_stop(reports_dir, command_id, timeout, poll_interval):
         ok(f"Демон остановлен (команда {command_id})")
@@ -1532,14 +1551,22 @@ def cmd_reset_sandbox(config: Config, assume_yes: bool = False) -> int:
 
     Единственный способ вернуть счёт к бюджету после ошибочного пополнения:
     вывода из песочницы в API нет. Позиции и кэш закрываются вместе со счётом;
-    journal.csv / equity_live.csv / flows.csv / pending_orders.json ротируются
-    с меткой времени — история старого счёта остаётся в reports/ с
-    суффиксом-датой. Реестр незавершённых заявок архивируется вместе с
-    журналами: иначе новый счёт унаследовал бы блокировки старого.
-    После сброса бота нужно перезапустить, чтобы он подхватил новый счёт.
+    journal.csv / equity_live.csv / flows.csv / pending_orders.json / kill_switch.json
+    ротируются с меткой времени — сразу после подтверждения, ДО закрытия счёта,
+    чтобы сбой API посреди операции не склеил историю двух счетов в одних файлах.
+    История старого счёта остаётся в reports/ с суффиксом-датой. Реестр незавершённых
+    заявок архивируется вместе с журналами: иначе новый счёт унаследовал бы блокировки
+    старого. После сброса бота нужно перезапустить, чтобы он подхватил новый счёт.
     """
     if config.mode != "sandbox":
         print("[!!] Команда reset-sandbox доступна только в режиме sandbox", file=sys.stderr)
+        return 2
+    if control.daemon_running(config.reports_dir):
+        print(
+            "[!!] Демон запущен: reset-sandbox закроет счёт у работающего бота. "
+            "Остановите его (`cli.py daemon stop`) и повторите команду",
+            file=sys.stderr,
+        )
         return 2
     api = make_api(config)
     accounts = api.get_accounts()
@@ -1565,15 +1592,26 @@ def cmd_reset_sandbox(config: Config, assume_yes: bool = False) -> int:
         print("  Отменено")
         return 1
 
-    api.close_sandbox_account(trader.account_id)
-    new_account_id = api.open_sandbox_account()
-    api.pay_in(new_account_id, _sandbox_budget(config))
-
     rotated = [
         name
-        for name in ("journal.csv", "equity_live.csv", "flows.csv", "pending_orders.json")
+        for name in (
+            "journal.csv", "equity_live.csv", "flows.csv",
+            "pending_orders.json", "kill_switch.json", "kill_switch_anchor.json",
+        )
         if (archived := _rotate_report_file(Path(config.reports_dir) / name))
     ]
+    try:
+        api.close_sandbox_account(trader.account_id)
+        new_account_id = api.open_sandbox_account()
+        api.pay_in(new_account_id, _sandbox_budget(config))
+    except Exception as exc:
+        print(f"  [!!] Сброс не завершён ({type(exc).__name__}: {exc}).", file=sys.stderr)
+        if rotated:
+            print(
+                "  Журналы старого счёта уже заархивированы: " + ", ".join(rotated),
+                file=sys.stderr,
+            )
+        raise
     print(f"  Новый счёт: {new_account_id}, бюджет {ui.fmt_money(_sandbox_budget(config))} руб внесён")
     if rotated:
         print(f"  Журналы и реестр заявок старого счёта заархивированы: {', '.join(rotated)}")
@@ -1622,11 +1660,48 @@ def cmd_check_config(config: Config, json_output: bool = False) -> int:
     return 0
 
 
-def cmd_kill_switch_reset(config: Config) -> int:
-    """Снять активный kill-switch: только файл в reports/, API не нужен."""
+def _wait_for_kill_switch_reset(
+    reports_dir, command_id: str, timeout: float, poll_interval: float
+) -> tuple[bool, str]:
+    """Ждёт ack команды и исчезновения kill_switch.json; False — отказ, ошибка или таймаут."""
+    from bot import read_kill_switch
+
+    ack_path = control.paths(reports_dir)["acks"] / f"{command_id}.json"
+    deadline = time.monotonic() + max(0.0, float(timeout))
+    while True:
+        try:
+            ack = json.loads(ack_path.read_text(encoding="utf-8")) if ack_path.exists() else None
+        except (OSError, ValueError):
+            ack = None
+        if isinstance(ack, dict) and not ack.get("ok", False):
+            return False, str(ack.get("detail") or "неизвестная ошибка")
+        if isinstance(ack, dict) and ack.get("ok") and read_kill_switch(reports_dir) is None:
+            return True, ""
+        if time.monotonic() >= deadline:
+            return False, ""
+        time.sleep(min(poll_interval, max(0.0, deadline - time.monotonic())))
+
+
+def cmd_kill_switch_reset(config: Config, timeout: float = 60.0, poll_interval: float = 0.5) -> int:
+    """Снять активный kill-switch: через живой демон либо файлом в reports/ (API не нужен)."""
     from bot import clear_kill_switch
 
-    if clear_kill_switch(Path(config.reports_dir)):
+    reports_dir = Path(config.reports_dir)
+    status = control.read_status(reports_dir)
+    state_name = (
+        status.get("state") if isinstance(status, dict) and not status.get("corrupt") else None
+    )
+    if state_name in ("running", "stopping") and control.daemon_pid_alive(status):
+        # живой демон держит запрет в памяти: файл напрямую удалять нельзя — рассинхрон
+        command_id = control.enqueue_command(reports_dir, "kill_switch_reset")
+        done, detail = _wait_for_kill_switch_reset(reports_dir, command_id, timeout, poll_interval)
+        if done:
+            ok(f"Kill-switch сброшен демоном — новые входы разрешены (команда {command_id})")
+            return 0
+        warn(f"Демон не подтвердил сброс kill-switch{': ' + detail if detail else f' за {timeout:g} с'}")
+        return 1
+
+    if clear_kill_switch(reports_dir):
         ok("Kill-switch сброшен — новые входы разрешены после перезапуска бота")
     else:
         warn("Kill-switch не был активен")
@@ -1648,9 +1723,10 @@ def cmd_web_hash_password(read_stdin: bool) -> int:
     return 0
 
 
-# команды, которым не нужен токен T-Invest (офлайн или только SMTP)
+# команды, которым не нужен токен T-Invest (офлайн, чтение файлов reports/, только SMTP)
 MODE_ONLY_COMMANDS = {
     "train", "backtest", "status", "send-test-email", "kill-switch-reset", "web-hash-password", "web",
+    "tui",  # дашборд читает файлы reports/ — без токена им можно остановить демона и снять kill-switch
 }
 
 
@@ -1762,6 +1838,9 @@ def main() -> int:
             if mode_only:
                 if config.mode not in {"sandbox", "real"}:
                     raise ValueError(f"MODE должен быть sandbox|real, получено: {config.mode}")
+                if args.command in {"train", "backtest"}:
+                    # токен этим командам не нужен, а риск-параметры — нужны: бэктест считается по ним
+                    config.validate_risk()
             else:
                 config.validate()
     except ValueError as exc:

@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import os
+import signal
 import sys
 import threading
 import time
@@ -45,6 +47,62 @@ def make_config(tmp_path, **kwargs) -> Config:
 
 def make_fake_bot(config) -> TradingBot:
     return TradingBot(config, api=FakeTBankAPI(config.tickers))
+
+
+def _enqueue_when_iteration_started(config, name: str, iteration: int = 1) -> list[str]:
+    """Кладёт команду, как только демон опубликует итерацию ``iteration``.
+
+    Команда адресована РАБОТАЮЩЕМУ демону: оставленная до старта, она была бы
+    отброшена как прошлая (см. test_stale_command_from_previous_run_is_discarded).
+    Возвращает список id положенных команд (заполняется из потока).
+    """
+    enqueued: list[str] = []
+
+    def worker() -> None:
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            status = control.read_status(config.reports_dir)
+            if isinstance(status, dict) and (status.get("iteration") or 0) >= iteration:
+                enqueued.append(control.enqueue_command(config.reports_dir, name))
+                return
+            time.sleep(0.002)
+
+    threading.Thread(target=worker, daemon=True).start()
+    return enqueued
+
+
+def _stub_bot(tmp_path) -> TradingBot:
+    """Бот без сети и моделей (как в блоке характеризации): цикл гоняется на заглушках."""
+    bot = TradingBot.__new__(TradingBot)
+    bot.config = SimpleNamespace(
+        loop_interval_sec=0,
+        reports_dir=tmp_path,
+        mode="sandbox",
+        candle_interval="hour",
+        forecast_horizon=1,
+        budget_rub=100_000.0,
+    )
+    bot.instruments = {
+        "SBER": {"ticker": "SBER", "figi": "BBG_S"},
+        "GAZP": {"ticker": "GAZP", "figi": "BBG_G"},
+        "LKOH": {"ticker": "LKOH", "figi": "BBG_L"},
+    }
+    bot._budget_rub = 100_000.0
+    bot._entries_allowed = True
+    bot._running = False
+    bot.trader = SimpleNamespace(
+        initialize_balance=lambda budget: None,
+        portfolio=lambda: {"total_amount_rub": 100_000.0, "cash_rub": 100_000.0, "positions": {}},
+    )
+    bot._setup_capital_profile = lambda: None
+    bot.in_trading_session = lambda: True
+    bot.update_news = lambda: None
+    bot._load_portfolio = lambda: PortfolioState(cash=100_000.0, equity=100_000.0, positions={})
+    bot._check_kill_switch = lambda equity: None
+    bot.step_ticker = lambda ticker, instrument, portfolio, entries_allowed: None
+    bot.conn = SimpleNamespace(close=lambda: None)
+    bot.notifier = SimpleNamespace(send_throttled=lambda *a, **k: None, send=lambda *a, **k: None)
+    return bot
 
 
 # =====================================================================
@@ -192,16 +250,17 @@ def test_stop_command_ends_loop_within_a_few_ticks(tmp_path):
 
 
 def test_kill_switch_reset_command_clears_file_and_restores_entries(tmp_path):
-    config = make_config(tmp_path)
+    config = make_config(tmp_path, loop_interval_sec=0.5, daemon_tick_sec=0.01)
     config.reports_dir.mkdir(parents=True)
     bot_module._write_kill_switch(config.reports_dir, {"triggered_at": "2026-01-01T00:00:00+00:00"})
-    control.enqueue_command(config.reports_dir, "kill_switch_reset")
     bot = make_fake_bot(config)
+    enqueued = _enqueue_when_iteration_started(config, "kill_switch_reset")
 
     assert bot._entries_allowed is False
 
     assert run_headless(bot, max_iterations=2, reports_dir=config.reports_dir) == 0
 
+    assert len(enqueued) == 1  # команда дошла до очереди работающего демона
     assert not bot_module.kill_switch_path(config.reports_dir).exists()
     assert bot._entries_allowed is True
     payload = control.read_status(config.reports_dir)
@@ -210,19 +269,20 @@ def test_kill_switch_reset_command_clears_file_and_restores_entries(tmp_path):
 
 def test_kill_switch_reset_failure_rewrites_ack_and_publishes_error(tmp_path):
     """F1: сорванный reset -> ack ok=False с причиной и last_error в статусе."""
-    config = make_config(tmp_path, loop_interval_sec=0.001, daemon_tick_sec=0.001)
+    config = make_config(tmp_path, loop_interval_sec=0.5, daemon_tick_sec=0.01)
     config.reports_dir.mkdir(parents=True)
     bot_module._write_kill_switch(config.reports_dir, {"triggered_at": "2026-01-01T00:00:00+00:00"})
-    command_id = control.enqueue_command(config.reports_dir, "kill_switch_reset")
     bot = make_fake_bot(config)
 
     def boom() -> None:
         raise RuntimeError("reset denied")
 
     bot.reset_kill_switch = boom
+    enqueued = _enqueue_when_iteration_started(config, "kill_switch_reset")
 
     assert run_headless(bot, max_iterations=2, reports_dir=config.reports_dir) == 0
 
+    command_id = enqueued[0]
     ack_path = control.paths(config.reports_dir)["acks"] / f"{command_id}.json"
     ack = json.loads(ack_path.read_text(encoding="utf-8"))
     assert ack["ok"] is False
@@ -449,3 +509,190 @@ def test_daemon_status_positions_empty_out_of_session(tmp_path):
 
     payload = control.read_status(config.reports_dir)
     assert payload["positions"] == []
+
+
+# =====================================================================
+# (5) SIGTERM (systemctl stop/restart): мягкая остановка вместо смерти мимо finally
+# =====================================================================
+
+def test_sigterm_requests_soft_stop_and_releases_lock(tmp_path):
+    """Без обработчика сигнал убивает процесс мимо finally: статус навсегда running, lock не снят."""
+    config = make_config(tmp_path, loop_interval_sec=30.0, daemon_tick_sec=0.02)
+    bot = make_fake_bot(config)
+    handler_before = signal.getsignal(signal.SIGTERM)
+
+    def fire_sigterm() -> None:
+        handler = signal.getsignal(signal.SIGTERM)
+        assert callable(handler)
+        handler(signal.SIGTERM, None)  # как это сделал бы POSIX при systemctl stop
+
+    timer = threading.Timer(0.15, fire_sigterm)
+    timer.start()
+    started = time.monotonic()
+    try:
+        rc = run_headless(bot, max_iterations=None, reports_dir=config.reports_dir)
+    finally:
+        timer.cancel()
+    elapsed = time.monotonic() - started
+
+    assert rc == 0
+    assert elapsed < 2.0  # 30-секундный «сон» прерван ближайшим тиком
+    payload = control.read_status(config.reports_dir)
+    assert payload["state"] == "stopped"
+    assert not control.paths(config.reports_dir)["lock"].exists()  # finally снял lock
+    assert signal.getsignal(signal.SIGTERM) == handler_before  # обработчик восстановлен
+
+
+def test_sigterm_mid_iteration_skips_remaining_tickers(tmp_path):
+    """Сигнал посреди итерации: текущий тикер дорабатывает, по остальным заявки не выставляются."""
+    steps: list[str] = []
+    bot = _stub_bot(tmp_path)
+    bot._daemon_runner = bot_module._DaemonRunner(bot, tmp_path)
+
+    def step(ticker, instrument, portfolio, entries_allowed) -> None:
+        steps.append(ticker)
+        bot._daemon_runner.stop_requested = True  # сигнал пришёл во время шага первого тикера
+
+    bot.step_ticker = step
+    bot.run_forever(max_iterations=None)
+
+    assert steps == ["SBER"]  # GAZP и LKOH пропущены
+
+
+def test_stop_requested_before_loop_runs_no_iteration(tmp_path):
+    """SIGTERM на старте (до входа в цикл): итерация с заявками не выполняется вовсе."""
+    steps: list[str] = []
+    bot = _stub_bot(tmp_path)
+    bot.step_ticker = lambda ticker, instrument, portfolio, entries_allowed: steps.append(ticker)
+    bot._daemon_runner = bot_module._DaemonRunner(bot, tmp_path)
+    bot._daemon_runner.stop_requested = True
+
+    bot.run_forever(max_iterations=3)
+
+    assert steps == []
+    assert control.read_status(tmp_path)["state"] == "stopped"
+
+
+# =====================================================================
+# (6) Очередь команд: прошлое не исполняется, последнее не теряется
+# =====================================================================
+
+def test_stale_command_from_previous_run_is_discarded_not_executed(tmp_path):
+    """stop от убитого демона не должен останавливать свежезапущенный после первой итерации."""
+    config = make_config(tmp_path)
+    stale = control.enqueue_command(config.reports_dir, "stop")
+    bot = make_fake_bot(config)
+
+    assert run_headless(bot, max_iterations=3, reports_dir=config.reports_dir) == 0
+
+    payload = control.read_status(config.reports_dir)
+    assert payload["iteration"] >= 3  # отработал все итерации
+    ack = json.loads(
+        (control.paths(config.reports_dir)["acks"] / f"{stale}.json").read_text(encoding="utf-8")
+    )
+    assert ack["ok"] is False  # клиент видит честный отказ, а не «принято»
+    assert "прошлому запуску" in ack["detail"]
+
+
+def test_command_during_last_iteration_is_drained_not_left_in_queue(tmp_path):
+    """`--iterations N`: последняя итерация кончается без тика — очередь дренируется в конце."""
+    config = make_config(tmp_path, loop_interval_sec=30.0, daemon_tick_sec=0.01)
+    bot = make_fake_bot(config)
+    bot.in_trading_session = lambda: True
+    enqueued = _enqueue_when_iteration_started(config, "stop")
+
+    def slow_news() -> None:
+        # команда приходит, пока итерация в работе (после публикации iteration=1)
+        deadline = time.monotonic() + 5.0
+        while not enqueued and time.monotonic() < deadline:
+            time.sleep(0.002)
+
+    bot.update_news = slow_news
+
+    assert run_headless(bot, max_iterations=1, reports_dir=config.reports_dir) == 0
+
+    assert len(enqueued) == 1
+    assert list(control.paths(config.reports_dir)["commands"].glob("*.json")) == []
+    ack = json.loads(
+        (control.paths(config.reports_dir)["acks"] / f"{enqueued[0]}.json").read_text(encoding="utf-8")
+    )
+    assert ack["ok"] is True
+
+
+# =====================================================================
+# (7) daemon stop: мёртвый процесс и systemd
+# =====================================================================
+
+def test_daemon_stop_when_process_died_returns_immediately_and_queues_nothing(tmp_path, monkeypatch, capsys):
+    """Демон умер мимо finally: статус заморожен в running — ждать ack нечего."""
+    config = make_config(tmp_path)
+    control.write_status(
+        config.reports_dir, {"state": "running", "iteration": 1, "mode": "sandbox", "pid": 999999}
+    )
+    monkeypatch.setattr(control, "_pid_alive", lambda pid: pid == os.getpid())  # 999999 мёртв
+
+    started = time.monotonic()
+    rc = cli.cmd_daemon_stop(config, timeout=30.0, poll_interval=0.01)
+    elapsed = time.monotonic() - started
+
+    assert rc == 0
+    assert elapsed < 1.0  # не полные 30 секунд таймаута
+    assert "не запущен" in capsys.readouterr().out.lower()
+    assert not control.paths(config.reports_dir)["commands"].exists()  # команда не останется в очереди
+
+
+def test_daemon_stop_under_systemd_refuses_and_leaves_queue_alone(tmp_path, monkeypatch, capsys):
+    """Restart=always перезапустил бы демона через RestartSec: останавливает только systemctl."""
+    config = make_config(tmp_path)
+    control.write_status(
+        config.reports_dir, {"state": "running", "iteration": 1, "mode": "sandbox", "pid": 4242}
+    )
+    monkeypatch.setattr(control, "daemon_pid_alive", lambda status: True)
+    monkeypatch.setattr(control, "systemd_unit_of_pid", lambda pid: "tbank-bot.service")
+
+    assert cli.cmd_daemon_stop(config, timeout=5.0, poll_interval=0.01) == 2
+
+    err = capsys.readouterr().err
+    assert "systemctl stop tbank-bot.service" in err
+    assert not control.paths(config.reports_dir)["commands"].exists()
+
+
+def test_daemon_stop_ignores_foreign_systemd_unit(tmp_path, monkeypatch, capsys):
+    """Демон живёт не в своём юните (другое имя) — не угадываем, а останавливаем как обычно."""
+    config = make_config(tmp_path)
+    control.write_status(config.reports_dir, {"state": "running", "iteration": 1, "mode": "sandbox"})
+    monkeypatch.setattr(control, "systemd_unit_of_pid", lambda pid: "actions-runner.service")
+    enqueued: list[str] = []
+    monkeypatch.setattr(
+        cli.control, "enqueue_command", lambda reports_dir, name: enqueued.append(name) or "cmd-1"
+    )
+
+    rc = cli.cmd_daemon_stop(config, timeout=0.05, poll_interval=0.01)
+
+    assert enqueued == ["stop"]
+    assert rc == 1  # ack не пришёл: честный таймаут, а не отказ «под systemd»
+
+
+# =====================================================================
+# (8) Kill-switch после сброса: запрет не взводится сам собой
+# =====================================================================
+
+def test_kill_switch_reset_does_not_retrigger_below_old_budget_threshold(tmp_path):
+    """Капитал всё ещё ниже бюджет×(1−порог): сброс переносит якорь, а не дарит лишнее письмо."""
+    config = make_config(tmp_path, loop_interval_sec=0.5, daemon_tick_sec=0.01)
+    config.reports_dir.mkdir(parents=True)
+    bot_module._write_kill_switch(config.reports_dir, {"triggered_at": "2026-01-01T00:00:00+00:00"})
+    bot = TradingBot(config, api=FakeTBankAPI(config.tickers, cash_rub=50_000.0))  # < 100_000 × 0.85
+    bot.in_trading_session = lambda: True
+    bot.step_ticker = lambda ticker, instrument, portfolio, entries_allowed: None
+    enqueued = _enqueue_when_iteration_started(config, "kill_switch_reset")
+
+    assert bot._entries_allowed is False
+
+    assert run_headless(bot, max_iterations=3, reports_dir=config.reports_dir) == 0
+
+    assert len(enqueued) == 1
+    assert bot._entries_allowed is True
+    assert not bot_module.kill_switch_path(config.reports_dir).exists()  # итерации 2–3 не взвели запрет
+    assert bot_module.read_kill_switch_anchor(config.reports_dir)["anchor_rub"] == pytest.approx(50_000.0)
+    assert control.read_status(config.reports_dir)["kill_switch_active"] is False

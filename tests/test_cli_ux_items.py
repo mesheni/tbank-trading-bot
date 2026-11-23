@@ -7,6 +7,7 @@ U4 (сгруппированный --help), U5 (--json для report и check-co
 from __future__ import annotations
 
 import json
+import secrets
 import sys
 from types import SimpleNamespace
 
@@ -183,7 +184,7 @@ def test_parser_accepts_json_for_report_and_check_config() -> None:
 
 
 def test_check_config_json_is_offline_and_masks_token(tmp_path, monkeypatch, capsys) -> None:
-    secret = "t.SUPER-SECRET-TOKEN-VALUE-1234567890"
+    secret = "t." + secrets.token_hex(20)  # генерируется на прогон: в репозитории нет «секрета»
     config = make_config(tmp_path, token=secret)
     monkeypatch.setattr(Config, "validate", lambda self: None)
 

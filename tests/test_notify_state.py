@@ -1,9 +1,11 @@
 """Persistent notification throttle: окна троттлинга переживают рестарт (аудит F-C3.9)."""
 from __future__ import annotations
 
+import datetime as dt
 import json
 from types import SimpleNamespace
 
+import notify
 from notify import Notifier, SmtpConfig
 
 
@@ -56,6 +58,49 @@ def test_failed_send_does_not_persist_key(tmp_path, monkeypatch):
     assert notifier.send_throttled("k", "s", "b") is False
     assert notifier._last_sent == {}
     assert not state_path.exists()
+
+
+def test_failed_send_is_not_retried_before_retry_window(monkeypatch):
+    """SMTP недоступен: попытка блокирует цикл на таймаут — не чаще раза в FAILED_SEND_RETRY_SEC."""
+    attempts: list[str] = []
+    monkeypatch.setattr(Notifier, "send", lambda self, subject, body: attempts.append(subject) or False)
+    notifier = Notifier(smtp_cfg())
+
+    assert notifier.send_throttled("k", "s", "b") is False
+    assert notifier.send_throttled("k", "s", "b") is False  # следующая итерация торгового цикла
+    assert notifier.send_throttled("other", "s2", "b") is False  # чужие ключи не заглушены
+    assert attempts == ["s", "s2"]
+
+    notifier._last_failed["k"] -= dt.timedelta(seconds=notify.FAILED_SEND_RETRY_SEC + 1)
+    assert notifier.send_throttled("k", "s", "b") is False
+    assert attempts == ["s", "s2", "s"]  # окно прошло — пробуем снова
+
+
+def test_success_after_failure_clears_failure_window(tmp_path, monkeypatch):
+    outcomes = iter([False, True])
+    monkeypatch.setattr(Notifier, "send", lambda self, subject, body: next(outcomes))
+    state_path = tmp_path / "notify_state.json"
+    notifier = Notifier(smtp_cfg(), state_path=state_path)
+
+    assert notifier.send_throttled("k", "s", "b") is False
+    notifier._last_failed.clear()  # как если бы окно повтора прошло
+    assert notifier.send_throttled("k", "s", "b") is True
+
+    assert "k" not in notifier._last_failed
+    assert "k" in json.loads(state_path.read_text(encoding="utf-8"))
+
+
+def test_failure_window_lives_only_in_memory(tmp_path, monkeypatch):
+    """После рестарта одна попытка допустима: состояние неудач на диск не пишется."""
+    attempts: list[str] = []
+    monkeypatch.setattr(Notifier, "send", lambda self, subject, body: attempts.append(subject) or False)
+    state_path = tmp_path / "notify_state.json"
+    Notifier(smtp_cfg(), state_path=state_path).send_throttled("k", "s", "b")
+    restarted = Notifier(smtp_cfg(), state_path=state_path)
+
+    assert restarted._last_failed == {}
+    assert restarted.send_throttled("k", "s", "b") is False
+    assert len(attempts) == 2
 
 
 def test_malformed_state_entries_are_ignored(tmp_path):

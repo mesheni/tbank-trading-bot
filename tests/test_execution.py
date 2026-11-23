@@ -1,16 +1,19 @@
 """Исполнение ордеров: разбор статусов, частичные заполнения, знаки Quotation."""
 from __future__ import annotations
 
+import uuid
 from types import SimpleNamespace
 
 import pandas as pd
 import pytest
+import requests
 
 from bot import TradingBot
 from models.registry import ModelArtifact
 from nlp.agenda import AgendaScore
 from strategy import PortfolioState, Position, RiskConfig
-from tbank.api import float_to_quotation, parse_order_state, quotation_to_float
+from tbank.api import TBankAPI, float_to_quotation, parse_order_state, quotation_to_float
+from tbank.rest import APIError
 from tbank.trader import Trader
 
 
@@ -72,6 +75,57 @@ def test_quotation_roundtrip(value):
 def test_quotation_to_float_negative_units_and_nano():
     # proto: знак несут оба поля: -260.5 = units -260, nano -500000000
     assert quotation_to_float({"units": "-260", "nano": -500000000}) == pytest.approx(-260.5)
+
+
+# ---------- TBankAPI.post_order: потерянный ответ и рыночный fallback ----------
+
+class _PostClient:
+    """Минимальный клиент: только post(), как у TBankRestClient."""
+
+    mode = "sandbox"
+
+    def __init__(self, outcomes: list):
+        self.outcomes = list(outcomes)
+        self.payloads: list[dict] = []
+
+    def post(self, url, payload):
+        self.payloads.append(dict(payload))
+        outcome = self.outcomes.pop(0)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+
+def test_post_order_tags_lost_response_with_order_id():
+    client = _PostClient([requests.exceptions.ReadTimeout("timed out")])
+    api = TBankAPI(client, order_market_fallback=False)
+
+    with pytest.raises(requests.exceptions.ReadTimeout) as info:
+        api.post_order("acc", "BBG_TEST", 2, "ORDER_DIRECTION_BUY", price=250.5)
+
+    order_id = info.value.unconfirmed_order_id
+    assert order_id == client.payloads[0]["orderId"]  # id именно той заявки, что ушла на сервер
+    assert uuid.UUID(order_id).version == 4
+
+
+def test_market_fallback_posts_order_with_new_id():
+    filled = {
+        "orderId": "o-market",
+        "executionReportStatus": "EXECUTION_REPORT_STATUS_FILL",
+        "lotsRequested": "2",
+        "lotsExecuted": "2",
+        "executedOrderPrice": {"units": "251", "nano": 0},
+    }
+    client = _PostClient([APIError(400, "client error", "invalid price"), filled])
+    api = TBankAPI(client, order_market_fallback=True)
+
+    state = api.post_order("acc", "BBG_TEST", 2, "ORDER_DIRECTION_BUY", price=250.5)
+
+    assert state["status"] == "fill"
+    limit, market = client.payloads
+    assert market["orderType"] == "ORDER_TYPE_MARKET"
+    assert "price" not in market
+    assert market["orderId"] != limit["orderId"]  # другая заявка — свой идемпотентный ключ
 
 
 # ---------- Trader._execute: дозапрос статуса на new/partiallyfill ----------

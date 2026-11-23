@@ -12,6 +12,7 @@ from __future__ import annotations
 import datetime as dt
 import json
 import re
+import secrets
 from pathlib import Path
 
 import pytest
@@ -25,9 +26,11 @@ from config import Config
 from web.app import create_app
 from web.control import ControlResult
 
-PASSWORD = "testpass12345"
+# Dummy credentials are generated per test run: nothing in the repo looks like a real secret.
+PASSWORD = secrets.token_urlsafe(16)
 PASSWORD_HASH = PasswordHasher().hash(PASSWORD)
-SECRET_KEY = "t7-test-secret-key-" + "x" * 40
+SECRET_KEY = secrets.token_urlsafe(64)
+WRONG_PASSWORD = secrets.token_urlsafe(16)
 GENERIC_REAUTH_ERROR = "повторный ввод пароля неверен"
 
 CSRF_RE = re.compile(r'name="csrf_token"[^>]*value="([^"]+)"')
@@ -173,11 +176,11 @@ def test_post_stop_with_wrong_password_is_generic_403(tmp_path):
     client = make_client(config)
     token = login(client)
 
-    response = post_control(client, "/control/stop", token, password="wrong-password")
+    response = post_control(client, "/control/stop", token, password=WRONG_PASSWORD)
 
     assert response.status_code == 403
     assert GENERIC_REAUTH_ERROR in response.text
-    assert "wrong-password" not in response.text
+    assert WRONG_PASSWORD not in response.text
     assert command_files(config.reports_dir) == []
 
 

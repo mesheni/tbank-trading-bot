@@ -6,8 +6,9 @@ HTTP здесь нет. Роуты (T7) вызывают эти функции �
 Правила те же, что в TUI (``tui/app.py:156-268``), и логика гвардов не
 копируется — импортируется из ``tui.controls``:
 
-* stop — только для живого демона, затем команда ``stop`` и ожидание ack,
-  подтверждённого наблюдаемым ``state=stopped``;
+* stop — для живого демона команда ``stop`` и ожидание ack, подтверждённого
+  наблюдаемым ``state=stopped``; под ``TUI_SYSTEMD_MANAGED=1`` — ``systemctl stop``
+  (``Restart=always`` иначе перезапустит демона через RestartSec);
 * kill_switch_reset — через демон, если он жив или статус повреждён (fail
   closed), иначе прямая очистка файла;
 * start — ``TUI_SYSTEMD_MANAGED=1`` делегирует узкому systemctl-адаптеру,
@@ -135,6 +136,23 @@ def request_stop(
     _require_reauth(reauth_ok)
     context = _AuditContext("stop", user, client_ip)
     reports_dir = Path(config.reports_dir)
+
+    if controls.systemd_managed():
+        # Под Restart=always выход демона по команде из очереди означает рестарт через
+        # RestartSec: останавливает только сам systemd (start идёт тем же адаптером).
+        try:
+            outcome = systemd.run_systemctl("stop")
+        except (OSError, ValueError) as exc:
+            return _finish(
+                config, context, ControlResult(False, f"systemctl stop: {exc}", None, "error")
+            )
+        if outcome.ok:
+            return _finish(config, context, ControlResult(True, controls.STOPPED, None, "ok"))
+        detail = outcome.detail or f"код возврата {outcome.returncode}"
+        return _finish(
+            config, context, ControlResult(False, f"systemctl stop: {detail}", None, "error")
+        )
+
     if not controls.daemon_online(data.daemon_state(reports_dir)):
         return _finish(
             config, context, ControlResult(False, controls.DAEMON_NOT_RUNNING, None, "refused")

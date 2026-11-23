@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import secrets
 
 import cli
 from bot import MSK, SessionCalendar, write_heartbeat
@@ -13,7 +14,7 @@ from notify import Notifier, SmtpConfig
 def make_notifier(**overrides) -> Notifier:
     cfg = SmtpConfig(
         host="smtp.example.ru", port=465, user="bot@example.ru",
-        password="app-password", to_addr="trader@example.ru",
+        password=secrets.token_urlsafe(16), to_addr="trader@example.ru",
     )
     for key, value in overrides.items():
         setattr(cfg, key, value)
@@ -141,7 +142,7 @@ def test_last_activity_prefers_freshest_stamp(tmp_path):
 
     now = dt.datetime.now(dt.timezone.utc)
     write_heartbeat(tmp_path / "heartbeat")
-    with open(tmp_path / "equity_live.csv", "w", encoding="utf-8") as f:
+    with (tmp_path / "equity_live.csv").open("w", encoding="utf-8") as f:
         f.write("time,total_rub,cash_rub,positions_rub\n")
         f.write(f"{(now - dt.timedelta(hours=5)).isoformat()},1,1,0\n")
 

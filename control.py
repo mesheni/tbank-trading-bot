@@ -7,11 +7,13 @@
 """
 from __future__ import annotations
 
+import contextlib
 import ctypes
 import datetime as dt
 import json
 import logging
 import os
+import time
 import uuid
 from pathlib import Path
 
@@ -42,6 +44,12 @@ _WARNED_BAD_COMMANDS: set[str] = set()
 _WIN_STILL_ACTIVE = 259
 _WIN_PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 _WIN_ERROR_ACCESS_DENIED = 5
+
+# Окно между созданием lock (O_EXCL) и записью pid — микросекунды, но второй процесс
+# успевает прочитать пустой файл: даём владельцу дописать, прежде чем считать lock повреждённым.
+_LOCK_PID_WAIT_SEC = 1.0
+# Сколько ждать блокировки-«замка́» перехвата: сама критическая секция занимает миллисекунды.
+_TAKEOVER_WAIT_SEC = 5.0
 
 if os.name == "nt":
     _KERNEL32 = ctypes.windll.kernel32
@@ -78,17 +86,42 @@ def _utc_stamp() -> str:
     return dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
 
 
-def _write_text_atomic(path: Path, text: str) -> None:
-    """Атомарная запись: временный файл рядом + os.replace (как bot.py:99-105)."""
+#: На Windows os.replace падает с PermissionError, если файл в этот момент читает другой
+#: процесс (TUI, веб-панель). Читатель держит файл микросекунды — повторы короткие.
+_REPLACE_ATTEMPTS = 5
+_REPLACE_PAUSE_SEC = 0.02
+
+
+def _discard(path: Path) -> None:
+    try:
+        path.unlink()
+    except OSError:
+        pass
+
+
+def write_text_atomic(path: Path, text: str) -> None:
+    """Атомарная запись: временный файл рядом + os.replace (как bot.py:99-105).
+
+    ``PermissionError`` от replace на Windows временен (файл читает другой процесс):
+    несколько коротких повторов вместо потерянной записи и traceback в логе.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
     tmp.write_text(text, encoding="utf-8")
-    os.replace(tmp, path)
+    for attempt in range(1, _REPLACE_ATTEMPTS + 1):
+        try:
+            os.replace(tmp, path)
+            return
+        except PermissionError:
+            if attempt == _REPLACE_ATTEMPTS:
+                _discard(tmp)
+                raise
+            time.sleep(_REPLACE_PAUSE_SEC * attempt)
 
 
 def _write_json_atomic(path: Path, payload: dict) -> None:
     """Атомарная запись JSON в UTF-8 без экранирования кириллицы."""
-    _write_text_atomic(path, json.dumps(payload, ensure_ascii=False, indent=2))
+    write_text_atomic(path, json.dumps(payload, ensure_ascii=False, indent=2))
 
 
 def write_status(reports_dir, payload: dict) -> None:
@@ -263,11 +296,83 @@ def _read_lock_pid(path: Path) -> int | None:
     return pid if pid > 0 else None
 
 
+def _is_empty_file(path: Path) -> bool:
+    try:
+        return path.stat().st_size == 0
+    except OSError:
+        return False
+
+
+def _await_lock_pid(path: Path) -> int | None:
+    """Ждёт pid в только что созданном lock; None — владелец не появился или lock снят."""
+    deadline = time.monotonic() + _LOCK_PID_WAIT_SEC
+    while True:
+        holder = _read_lock_pid(path)
+        if holder is not None:
+            return holder
+        if time.monotonic() >= deadline or not path.exists():
+            return None
+        time.sleep(0.01)
+
+
+@contextlib.contextmanager
+def _takeover_guard(lock_path: Path):
+    """Блокировка ОС на время перехвата lock: снимается самой системой при смерти процесса.
+
+    Отдаёт ``True``, если блокировка взята, и ``False`` — если другой процесс держит
+    её дольше ``_TAKEOVER_WAIT_SEC``. Файл блокировки не удаляется: зависших
+    маркеров перехвата не бывает.
+    """
+    guard_path = lock_path.with_name(f"{lock_path.name}.guard")
+    descriptor = os.open(guard_path, os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        deadline = time.monotonic() + _TAKEOVER_WAIT_SEC
+        while True:
+            try:
+                if os.name == "nt":
+                    import msvcrt
+
+                    msvcrt.locking(descriptor, msvcrt.LK_NBLCK, 1)
+                else:
+                    import fcntl
+
+                    fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                acquired = True
+                break
+            except OSError:
+                if time.monotonic() >= deadline:
+                    acquired = False
+                    break
+                time.sleep(0.01)
+        yield acquired
+    finally:
+        os.close(descriptor)  # закрытие дескриптора снимает блокировку
+
+
+def _takeover_lock(lock_path: Path, pid: int) -> bool:
+    """Перехват устаревного lock: одновременно его может взять только один процесс.
+
+    Два старта поверх мёртвого pid иначе оба вернули бы True — и два демона торговали
+    бы на одном счёте. Взяв блокировку, ещё раз проверяем владельца: пока мы ждали,
+    другой процесс мог уже перехватить lock.
+    """
+    with _takeover_guard(lock_path) as guarded:
+        if not guarded:
+            log.warning("Не удалось получить блокировку перехвата %s — отступаю", lock_path.name)
+            return False
+        holder = _read_lock_pid(lock_path)
+        if holder is not None and _pid_alive(holder):
+            log.info("Демон уже запущен (pid %s) — lock не захвачен", holder)
+            return False
+        write_text_atomic(lock_path, f"{pid}\n")
+    return True
+
+
 def acquire_lock(reports_dir) -> bool:
     """Захватывает daemon.lock; False — lock уже держит живой процесс.
 
-    Создание O_CREAT|O_EXCL; устаревший/повреждённый lock перехватывается
-    атомарной перезаписью (теоретическое окно гонки приемлемо для файлов).
+    Создание O_CREAT|O_EXCL; устаревший/повреждённый lock перехватывается под
+    блокировкой ОС (``_takeover_lock``), поэтому гонки «два демона на одном счёте» нет.
     """
     channel = paths(reports_dir)
     lock_path = channel["lock"]
@@ -278,6 +383,10 @@ def acquire_lock(reports_dir) -> bool:
         descriptor = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
     except FileExistsError:
         holder = _read_lock_pid(lock_path)
+        if holder is None and _is_empty_file(lock_path):
+            # lock только что создан другим процессом и ещё без pid: даём владельцу
+            # дописать, иначе перехватили бы чужой живой lock
+            holder = _await_lock_pid(lock_path)
         if holder is not None and _pid_alive(holder):
             log.info("Демон уже запущен (pid %s) — lock не захвачен", holder)
             return False
@@ -285,12 +394,13 @@ def acquire_lock(reports_dir) -> bool:
             log.warning("Файл %s повреждён — перехватываю lock", lock_path.name)
         else:
             log.warning("Снимаю устаревший lock мёртвого процесса pid %s", holder)
-        _write_text_atomic(lock_path, f"{pid}\n")
+        if not _takeover_lock(lock_path, pid):
+            return False
     else:
         with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
             handle.write(f"{pid}\n")
 
-    _write_text_atomic(channel["pid"], f"{pid}\n")
+    write_text_atomic(channel["pid"], f"{pid}\n")
     return True
 
 
@@ -313,3 +423,42 @@ def release_lock(reports_dir) -> bool:
     except FileNotFoundError:
         pass
     return True
+
+
+def daemon_pid_alive(status: dict | None) -> bool:
+    """Жив ли процесс, опубликовавший снимок статуса (False — статуса нет или pid мёртв)."""
+    pid = status.get("pid") if isinstance(status, dict) else None
+    return isinstance(pid, int) and not isinstance(pid, bool) and _pid_alive(pid)
+
+
+def daemon_running(reports_dir) -> bool:
+    """Работает ли демон сейчас: жив pid из daemon.lock или из снимка в состоянии running/stopping."""
+    holder = _read_lock_pid(paths(reports_dir)["lock"])
+    if holder is not None and _pid_alive(holder):
+        return True
+    status = read_status(reports_dir)
+    state_name = status.get("state") if isinstance(status, dict) and not status.get("corrupt") else None
+    return state_name in ("running", "stopping") and daemon_pid_alive(status)
+
+
+def parse_systemd_unit(cgroup_text: str) -> str | None:
+    """Имя systemd-юнита из текста ``/proc/<pid>/cgroup``; None — процесс вне systemd.
+
+    Строка cgroup v2: ``0::/system.slice/tbank-bot.service``; v1 — несколько строк
+    с разными контроллерами, имя юнита одинаковое. Юнит — последний компонент пути.
+    """
+    for line in cgroup_text.splitlines():
+        path = line.split(":", 2)[-1].strip()
+        name = path.rsplit("/", 1)[-1]
+        if name.endswith(".service"):
+            return name
+    return None
+
+
+def systemd_unit_of_pid(pid: int) -> str | None:
+    """Юнит systemd, в cgroup которого живёт процесс (Linux); вне systemd — None."""
+    try:
+        cgroup = Path(f"/proc/{int(pid)}/cgroup").read_text(encoding="utf-8")
+    except (OSError, ValueError):
+        return None
+    return parse_systemd_unit(cgroup)

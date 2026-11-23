@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import csv
 import re
+import secrets
 from pathlib import Path
 
 import pytest
@@ -14,9 +15,11 @@ import web.app as web_app
 from config import Config
 from web.app import create_app
 
-PASSWORD = "testpass12345"
+# Dummy credentials are generated per test run: nothing in the repo looks like a real secret.
+PASSWORD = secrets.token_urlsafe(16)
 PASSWORD_HASH = PasswordHasher().hash(PASSWORD)
-SECRET_KEY = "t4-test-secret-key-" + "x" * 40
+SECRET_KEY = secrets.token_urlsafe(64)
+WRONG_PASSWORD = secrets.token_urlsafe(16)
 
 CSRF_RE = re.compile(r'name="csrf_token"[^>]*value="([^"]+)"')
 
@@ -93,7 +96,7 @@ def write_status(reports: Path, **overrides) -> None:
 def write_journal(reports: Path, rows: list[dict]) -> None:
     reports.mkdir(parents=True, exist_ok=True)
     fields = ["time", "ticker", "action", "lots", "price", "reason"]
-    with open(reports / "journal.csv", "w", encoding="utf-8", newline="") as handle:
+    with (reports / "journal.csv").open("w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=fields)
         writer.writeheader()
         for row in rows:
@@ -170,11 +173,11 @@ def test_login_with_wrong_password_is_generic_401(tmp_path):
     client = make_client(make_config(tmp_path))
     token = login_csrf(client)
 
-    response = post_login(client, token, password="wrong-password")
+    response = post_login(client, token, password=WRONG_PASSWORD)
 
     assert response.status_code == 401
     assert "неверный логин или пароль" in response.text
-    assert "wrong-password" not in response.text
+    assert WRONG_PASSWORD not in response.text
 
 
 def test_login_with_wrong_username_is_generic_401(tmp_path):
@@ -227,7 +230,7 @@ def test_successful_login_resets_throttle(tmp_path):
     good = post_login(client, token, password=PASSWORD)
     # A successful login rotates the CSRF token; fetch the fresh one.
     rotated = login_csrf(client)
-    after = post_login(client, rotated, password="bad-again")
+    after = post_login(client, rotated, password=WRONG_PASSWORD)
 
     assert good.status_code == 303
     assert after.status_code == 401

@@ -6,12 +6,16 @@ The SQL-free suite pins the security contracts the FastAPI layer (T4/T7) relies 
 from __future__ import annotations
 
 import logging
+import secrets
+import threading
+import time
 from types import SimpleNamespace
 
 import pytest
 from argon2 import PasswordHasher
 from starlette.middleware.sessions import SessionMiddleware
 
+import web.security as security
 from web.security import (
     LoginThrottle,
     check_credentials,
@@ -24,8 +28,10 @@ from web.security import (
     verify_password,
 )
 
-PASSWORD = "correct horse battery staple"
+# Dummy credentials are generated per test run: nothing in the repo looks like a real secret.
+PASSWORD = secrets.token_urlsafe(16)
 PASSWORD_HASH = PasswordHasher().hash(PASSWORD)
+WRONG_PASSWORD = secrets.token_urlsafe(16)
 
 
 def _config(**overrides) -> SimpleNamespace:
@@ -60,7 +66,7 @@ def test_verify_password_accepts_correct_password() -> None:
 
 
 def test_verify_password_wrong_password_returns_false_without_raising() -> None:
-    assert verify_password(PASSWORD_HASH, "wrong-password") is False
+    assert verify_password(PASSWORD_HASH, WRONG_PASSWORD) is False
 
 
 @pytest.mark.parametrize("bad_hash", ["", "not-a-hash", "$argon2id$broken", "$2b$12$abcdef"])
@@ -71,9 +77,82 @@ def test_verify_password_malformed_hash_returns_false(bad_hash: str) -> None:
 def test_verify_password_never_logs_password(caplog: pytest.LogCaptureFixture) -> None:
     with caplog.at_level(logging.DEBUG):
         verify_password(PASSWORD_HASH, PASSWORD)
-        verify_password(PASSWORD_HASH, "wrong-password")
+        verify_password(PASSWORD_HASH, WRONG_PASSWORD)
     assert PASSWORD not in caplog.text
-    assert "wrong-password" not in caplog.text
+    assert WRONG_PASSWORD not in caplog.text
+
+
+def test_verify_password_runs_at_most_two_hashes_concurrently(monkeypatch) -> None:
+    """Каждая проверка держит memory_cost (64 МиБ): параллельный флуд не растёт по числу потоков."""
+    lock = threading.Lock()
+    state = {"active": 0, "peak": 0}
+
+    class SlowHasher:
+        @staticmethod
+        def verify(password_hash: str, password: str) -> bool:
+            with lock:
+                state["active"] += 1
+                state["peak"] = max(state["peak"], state["active"])
+            time.sleep(0.02)
+            with lock:
+                state["active"] -= 1
+            return True
+
+    monkeypatch.setattr(security, "_PASSWORD_HASHER", SlowHasher)
+    results: list[bool] = []
+
+    def worker() -> None:
+        results.append(verify_password("hash", "password"))
+
+    threads = [threading.Thread(target=worker) for _ in range(12)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(10)
+
+    assert results == [True] * 12
+    assert state["peak"] <= security._MAX_CONCURRENT_VERIFIES
+
+
+def test_verify_password_is_refused_while_all_slots_are_busy(monkeypatch) -> None:
+    """Слоты заняты надолго: третий не копится в памяти, а получает отказ без ожидания."""
+    entered = threading.Semaphore(0)
+    release = threading.Event()
+
+    class BlockingHasher:
+        @staticmethod
+        def verify(password_hash: str, password: str) -> bool:
+            entered.release()
+            release.wait(5)
+            return True
+
+    monkeypatch.setattr(security, "_PASSWORD_HASHER", BlockingHasher)
+    monkeypatch.setattr(security, "_VERIFY_WAIT_SEC", 0.0)
+    holders = [
+        threading.Thread(target=lambda: verify_password("hash", "password"), daemon=True)
+        for _ in range(security._MAX_CONCURRENT_VERIFIES)
+    ]
+    for holder in holders:
+        holder.start()
+    try:
+        assert all(entered.acquire(timeout=5) for _ in holders)  # оба слота заняты
+        assert verify_password("hash", "password") is False
+    finally:
+        release.set()
+        for holder in holders:
+            holder.join(5)
+
+
+def test_ipv4_mapped_peer_matches_trusted_proxy() -> None:
+    """Двухстековый слушатель отдаёт peer как ::ffff:127.0.0.1 — прокси всё равно должен узнатьться."""
+    trusted = parse_trusted_proxies("127.0.0.1")
+
+    assert resolve_client_ip("::ffff:127.0.0.1", "198.51.100.9, 127.0.0.1", trusted) == "198.51.100.9"
+    assert resolve_client_ip("::ffff:127.0.0.1", None, trusted) == "127.0.0.1"
+
+
+def test_trusted_proxies_list_normalizes_mapped_entries() -> None:
+    assert parse_trusted_proxies("::ffff:127.0.0.1, 10.0.0.1") == {"127.0.0.1", "10.0.0.1"}
 
 
 # --------------------------------------------------------------------- credentials
@@ -88,7 +167,7 @@ def test_check_credentials_wrong_user_with_right_password_returns_false() -> Non
 
 
 def test_check_credentials_wrong_password_with_right_user_returns_false() -> None:
-    assert check_credentials(_config(), "admin", "wrong-password") is False
+    assert check_credentials(_config(), "admin", WRONG_PASSWORD) is False
 
 
 @pytest.mark.parametrize("username,password", [("", ""), ("", PASSWORD), ("admin", "")])

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import io
+import secrets
 import sys
 
 import pytest
@@ -80,7 +81,7 @@ def _run_cli(monkeypatch, argv: list[str], stdin_text: str | None = None) -> int
 
 
 def test_hash_password_stdin_prints_argon2id_hash_only(monkeypatch, capsys) -> None:
-    password = "testpass12345"
+    password = secrets.token_urlsafe(16)
 
     rc = _run_cli(monkeypatch, ["web-hash-password", "--stdin"], password + "\n")
 
@@ -94,7 +95,7 @@ def test_hash_password_stdin_prints_argon2id_hash_only(monkeypatch, capsys) -> N
 
 
 def test_hash_password_printed_hash_really_verifies(monkeypatch, capsys) -> None:
-    password = "testpass12345"
+    password = secrets.token_urlsafe(16)
 
     rc = _run_cli(monkeypatch, ["web-hash-password", "--stdin"], password + "\n")
     stdout = capsys.readouterr().out.strip()

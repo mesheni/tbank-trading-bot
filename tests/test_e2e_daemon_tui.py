@@ -86,9 +86,11 @@ def _python_pids() -> set[int]:
         # POSIX fallback (/proc alternative: scan /proc/<pid>/cmdline for "python").
         out = subprocess.run(["pgrep", "-f", "python"], capture_output=True, text=True, check=False).stdout
         return {int(part) for part in out.split() if part.isdigit()}
-    out = subprocess.run(["tasklist", "/FI", "IMAGENAME eq python.exe", "/FO", "CSV", "/NH"],
-                         capture_output=True, text=True, timeout=30, check=False).stdout
-    return {int(row[1]) for row in csv.reader(out.splitlines())
+    # tasklist пишет в кодовой странице консоли (cp866), а не в кодировке Python:
+    # при PYTHONUTF8=1 декодирование text=True падает на кириллице колонки «Память»
+    raw = subprocess.run(["tasklist", "/FI", "IMAGENAME eq python.exe", "/FO", "CSV", "/NH"],
+                         capture_output=True, timeout=30, check=False).stdout
+    return {int(row[1]) for row in csv.reader(raw.decode("oem", errors="replace").splitlines())
             if len(row) >= 2 and row[0].strip().lower() == "python.exe" and row[1].strip().isdigit()}
 
 

@@ -2,11 +2,13 @@
 from __future__ import annotations
 
 import json
+import os
 from types import SimpleNamespace
 
 import pytest
 
 import cli
+import control
 import tbank.trader as trader_mod
 from tbank.trader import Trader
 
@@ -195,6 +197,76 @@ def test_cmd_reset_sandbox_cancelled_without_yes(tmp_path, monkeypatch):
     assert api_stub.closed == []
     assert api_stub.paid_in == []
     assert (tmp_path / "journal.csv").exists() is False  # файлов и не было — ничего не тронуто
+
+
+def test_cmd_reset_sandbox_refuses_while_daemon_running(tmp_path, monkeypatch, capsys):
+    """Счёт закрывается у работающего бота: при живом демоне — отказ до любых обращений к API."""
+    monkeypatch.setattr(cli, "make_api", lambda cfg: pytest.fail("API не нужен"))
+    config = SimpleNamespace(mode="sandbox", reports_dir=tmp_path, sandbox_initial_rub=1_000_000.0)
+    control.write_status(config.reports_dir, {"state": "running", "iteration": 1, "mode": "sandbox"})
+
+    rc = cli.cmd_reset_sandbox(config, assume_yes=True)
+
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert "Демон запущен" in err and "daemon stop" in err
+
+
+def test_cmd_reset_sandbox_allows_when_daemon_died_and_left_running_status(tmp_path, monkeypatch):
+    """Демон умер мимо finally: устаревший `running` не должен навсегда блокировать сброс."""
+    api_stub = ResetAPI()
+    monkeypatch.setattr(cli, "make_api", lambda cfg: api_stub)
+    monkeypatch.setattr(trader_mod, "Trader", lambda api, path, account_id="": make_trader_stub(1_995_000.0))
+    config = SimpleNamespace(mode="sandbox", reports_dir=tmp_path, sandbox_initial_rub=1_000_000.0)
+    control.write_status(
+        config.reports_dir, {"state": "running", "iteration": 1, "mode": "sandbox", "pid": 999999}
+    )
+    monkeypatch.setattr(control, "_pid_alive", lambda pid: pid == os.getpid())  # 999999 мёртв
+
+    assert cli.cmd_reset_sandbox(config, assume_yes=True) == 0
+
+    assert api_stub.closed == ["old-acc"]
+
+
+def test_cmd_reset_sandbox_refuses_while_lock_held(tmp_path, monkeypatch, capsys):
+    """Демон ещё стартует (статуса нет, lock уже взят): счёт под ним не закрываем."""
+    monkeypatch.setattr(cli, "make_api", lambda cfg: pytest.fail("API не нужен"))
+    config = SimpleNamespace(mode="sandbox", reports_dir=tmp_path, sandbox_initial_rub=1_000_000.0)
+    assert control.acquire_lock(config.reports_dir) is True
+
+    try:
+        rc = cli.cmd_reset_sandbox(config, assume_yes=True)
+    finally:
+        control.release_lock(config.reports_dir)
+
+    assert rc == 2
+    assert "Демон запущен" in capsys.readouterr().err
+
+
+def test_cmd_reset_sandbox_rotates_before_touching_account(tmp_path, monkeypatch, capsys):
+    """Сбой API посреди сброса: история старого счёта уже в архиве, а не в живых файлах."""
+    journal = tmp_path / "journal.csv"
+    journal.write_text("time,ticker\n", encoding="utf-8")
+    (tmp_path / "kill_switch.json").write_text('{"triggered_at": "x"}', encoding="utf-8")
+    (tmp_path / "kill_switch_anchor.json").write_text('{"anchor_rub": 5.0}', encoding="utf-8")
+
+    class FailingAPI(ResetAPI):
+        def close_sandbox_account(self, account_id: str) -> None:
+            raise RuntimeError("sandbox unavailable")
+
+    monkeypatch.setattr(cli, "make_api", lambda cfg: FailingAPI())
+    monkeypatch.setattr(trader_mod, "Trader", lambda api, path, account_id="": make_trader_stub(1_995_000.0))
+    config = SimpleNamespace(mode="sandbox", reports_dir=tmp_path, sandbox_initial_rub=1_000_000.0)
+
+    with pytest.raises(RuntimeError, match="sandbox unavailable"):
+        cli.cmd_reset_sandbox(config, assume_yes=True)
+
+    err = capsys.readouterr().err
+    assert "Сброс не завершён" in err
+    assert "уже заархивированы" in err
+    assert not journal.exists() and list(tmp_path.glob("journal_*.csv"))  # архив, а не потеря
+    assert not (tmp_path / "kill_switch.json").exists()
+    assert list(tmp_path.glob("kill_switch_*.json")) and list(tmp_path.glob("kill_switch_anchor_*.json"))
 
 
 def test_cmd_normalize_refuses_real_mode():

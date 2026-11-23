@@ -10,6 +10,7 @@ import time
 from pathlib import Path
 
 from .api import TBankAPI
+from .rest import APIError
 
 log = logging.getLogger(__name__)
 
@@ -24,6 +25,34 @@ PENDING_ORDERS_FILE = "pending_orders.json"
 # повреждённый файл блокирует новые заявки по всем инструментам (fail closed)
 PENDING_CORRUPT_KEY = "*"
 PENDING_CORRUPT_VALUE = "corrupt-pending-file"
+# ответ GetOrderState «заявка не найдена»: она не дошла до биржи, блокировать нечего
+ORDER_NOT_FOUND_STATUSES = frozenset({400, 404})
+
+
+def order_may_exist(exc: Exception) -> bool:
+    """Могла ли заявка дойти до биржи, несмотря на исключение.
+
+    Отказ сервера 4xx (невалидная цена, лимит запросов) и «circuit open» (запрос
+    не отправлялся) означают, что заявки нет. Таймаут, обрыв связи и 5xx после
+    ретраев — исход неизвестен: сервер мог принять заявку, а ответ потерялся.
+    """
+    if isinstance(exc, APIError):
+        if exc.message == "circuit open":
+            return False
+        return not (400 <= exc.status < 500 and exc.status != 408)
+    return True
+
+
+def _replace_with_retry(tmp: Path, path: Path) -> None:
+    """os.replace с повторами: на Windows файл в этот момент может читать TUI (PermissionError)."""
+    for attempt in range(3):
+        try:
+            os.replace(tmp, path)
+            return
+        except PermissionError:
+            if attempt == 2:
+                raise
+            time.sleep(0.05 * (attempt + 1))
 
 
 class Trader:
@@ -182,7 +211,7 @@ class Trader:
                 json.dumps(self._pending_registry(), ensure_ascii=False, indent=2),
                 encoding="utf-8",
             )
-            os.replace(tmp, path)
+            _replace_with_retry(tmp, path)
         except OSError as exc:
             log.warning(
                 "Не удалось сохранить незавершённые заявки в %s (%s) — "
@@ -195,7 +224,8 @@ class Trader:
 
         Возвращает order_id, если заявка всё ещё может исполниться (новую
         выставлять нельзя), и None, когда можно торговать дальше. Ошибка
-        GetOrderState трактуется как «статус неизвестен» — fail closed.
+        GetOrderState трактуется как «статус неизвестен» — fail closed; ответ
+        «заявка не найдена» означает, что она не дошла до биржи.
         """
         pending = self._pending_registry()
         sentinel = pending.get(PENDING_CORRUPT_KEY)
@@ -213,6 +243,20 @@ class Trader:
             return None
         try:
             state = self.api.get_order_state(self.account_id, order_id)
+        except APIError as exc:
+            if exc.status in ORDER_NOT_FOUND_STATUSES:
+                pending.pop(instrument_id, None)
+                self._persist_pending()
+                log.info(
+                    "Заявки %s по %s на бирже нет (HTTP %d) — блокировка снята",
+                    order_id, instrument_id, exc.status,
+                )
+                return None
+            log.warning(
+                "Статус прошлой заявки %s по %s не получен (%s) — новые заявки блокируем",
+                order_id, instrument_id, exc,
+            )
+            return order_id
         except Exception as exc:
             log.warning(
                 "Статус прошлой заявки %s по %s не получен (%s) — новые заявки блокируем",
@@ -220,7 +264,13 @@ class Trader:
             )
             return order_id
         status = str(state.get("status") or "")
-        if status in FINAL_STATUSES:
+        # заявка без лотов — пустой ответ сервера на неизвестный id, а не живая заявка;
+        # нечитаемые поля таким сигналом не считаем (лучше лишняя блокировка, чем дубль)
+        try:
+            phantom = int(state.get("lots_requested") or 0) <= 0 and int(state.get("lots_executed") or 0) <= 0
+        except (TypeError, ValueError):
+            phantom = False
+        if status in FINAL_STATUSES or phantom:
             pending.pop(instrument_id, None)
             self._persist_pending()
             log.info(
@@ -228,6 +278,16 @@ class Trader:
                 order_id, instrument_id, status,
             )
             return None
+        # заявка всё ещё жива (отмена не удалась, ответ потерян, был рестарт): как и в
+        # _execute, отзываем — лимитка не должна исполниться через часы по устаревшему сигналу
+        try:
+            self.api.cancel_order(self.account_id, order_id)
+            log.info(
+                "Живая заявка %s по %s отозвана — блокировка снимется по финальному статусу",
+                order_id, instrument_id,
+            )
+        except Exception as exc:
+            log.warning("Отмена живой заявки %s по %s не удалась (%s)", order_id, instrument_id, exc)
         log.warning(
             "По %s всё ещё жива заявка %s (статус %s) — новую не выставляем",
             instrument_id, order_id, status or "неизвестен",
@@ -266,7 +326,20 @@ class Trader:
                 "avg_exec_price": 0.0, "commission": 0.0, "total_amount": 0.0,
                 "message": "0 лотов — заявка не выставлялась",
             }
-        state = self.api.post_order(self.account_id, instrument_id, lots, direction, price=price)
+        try:
+            state = self.api.post_order(self.account_id, instrument_id, lots, direction, price=price)
+        except Exception as exc:
+            order_id = getattr(exc, "unconfirmed_order_id", None)
+            if order_id and order_may_exist(exc):
+                # Ответ не получен, но заявка могла дойти до биржи. Без реестра следующий
+                # цикл выставил бы вторую: запоминаем id и сверяем, как «зависшую».
+                self._pending_registry()[instrument_id] = str(order_id)
+                self._persist_pending()
+                log.warning(
+                    "Исход заявки по %s неизвестен (%s) — id %s сохранён для сверки с биржей",
+                    instrument_id, exc, order_id,
+                )
+            raise
         attempts = 0
         while state["status"] not in FINAL_STATUSES and attempts < 3 and state["order_id"]:
             attempts += 1

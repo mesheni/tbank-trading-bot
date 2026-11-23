@@ -95,17 +95,16 @@ def fmt_session_pnl(pnl: dict | None) -> str:
 
 
 def daemon_online(state: dict) -> bool:
-    """Демон считается живым, если статус ``running``/``stopping`` или свежий heartbeat.
+    """Демон считается живым по свежему статусу ``running``/``stopping`` или свежему heartbeat.
 
     Явный ``stopped`` сильнее heartbeat: после мягкой остановки heartbeat ещё свежий,
-    но команды слать уже некому.
+    но команды слать уже некому. ``running`` с устаревшим ``updated_at`` (демон упал
+    или убит мимо finally) — не «онлайн»: иначе после падения запуск отказывает
+    «уже запущен», а stop и сброс ждут ack от мёртвого процесса.
     """
     if state.get("corrupt"):
         return False
-    state_name = state.get("state")
-    if state_name in ("running", "stopping"):
-        return True
-    if state_name == "stopped":
+    if state.get("state") == "stopped":
         return False
     return badge(state) in ("running", "stale")
 

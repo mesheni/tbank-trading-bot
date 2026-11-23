@@ -14,6 +14,7 @@ import datetime as dt
 import json
 import logging
 import os
+import signal
 import time
 from collections.abc import Mapping
 from dataclasses import replace
@@ -87,23 +88,66 @@ def read_kill_switch(reports_dir) -> dict | None:
     return payload if isinstance(payload, dict) else {"corrupt": True}
 
 
-def clear_kill_switch(reports_dir) -> bool:
-    """Снимает kill-switch (cli.py kill-switch-reset); True — файл существовал."""
-    path = kill_switch_path(reports_dir)
+def _unlink_kill_switch(reports_dir) -> bool:
+    """Удаляет файл состояния kill-switch; True — файл существовал."""
     try:
-        path.unlink()
+        kill_switch_path(reports_dir).unlink()
     except FileNotFoundError:
         return False
     return True
 
 
+def clear_kill_switch(reports_dir) -> bool:
+    """Снимает kill-switch (cli.py kill-switch-reset, TUI и веб офлайн); True — файл существовал.
+
+    Якорь помечается «капитал на момент запуска демона»: иначе при капитале ниже
+    бюджет×(1−порог) первая же итерация взвела бы запрет снова.
+    """
+    removed = _unlink_kill_switch(reports_dir)
+    if removed:
+        _write_kill_switch_anchor(reports_dir, None)
+    return removed
+
+
 def _write_kill_switch(reports_dir, payload: dict) -> None:
     """Атомарная запись состояния: временный файл рядом + os.replace."""
-    path = kill_switch_path(reports_dir)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
-    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    os.replace(tmp, path)
+    _write_kill_switch_json(kill_switch_path(reports_dir), payload)
+
+
+def _write_kill_switch_json(path: Path, payload: dict) -> None:
+    control.write_text_atomic(path, json.dumps(payload, ensure_ascii=False, indent=2))
+
+
+def kill_switch_anchor_path(reports_dir) -> Path:
+    """Путь к файлу якоря kill-switch (капитал, от которого считается просадка)."""
+    return Path(reports_dir) / "kill_switch_anchor.json"
+
+
+def _write_kill_switch_anchor(reports_dir, anchor_rub: float | None) -> None:
+    """Атомарно запоминает якорь kill-switch (переживает рестарт).
+
+    ``None`` — «капитал на момент запуска демона»: так помечается офлайн-сброс, когда
+    капитал без API неизвестен; демон при старте запишет конкретное значение.
+    """
+    _write_kill_switch_json(
+        kill_switch_anchor_path(reports_dir),
+        {
+            "anchor_rub": None if anchor_rub is None else float(anchor_rub),
+            "reset_at": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
+        },
+    )
+
+
+def read_kill_switch_anchor(reports_dir) -> dict | None:
+    """Сохранённый якорь kill-switch; None — файла нет или он битый (тогда якорь — бюджет)."""
+    path = kill_switch_anchor_path(reports_dir)
+    if not path.exists():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return payload if isinstance(payload, dict) and "anchor_rub" in payload else None
 
 
 def model_passes_live_gate(metrics: Mapping, min_dir_acc: float) -> bool:
@@ -639,7 +683,9 @@ class TradingBot:
             self.config.mode, ",".join(self.instruments), self.config.candle_interval, self.config.forecast_horizon,
         )
         try:
-            while self._running and (max_iterations is None or iteration < max_iterations):
+            while self._running and not self._stop_requested() and (
+                max_iterations is None or iteration < max_iterations
+            ):
                 iteration += 1
                 self._daemon_event(iteration)
                 if not self.in_trading_session():
@@ -653,6 +699,11 @@ class TradingBot:
                     portfolio = self._load_portfolio()
                     self._check_kill_switch(portfolio.equity)
                     for ticker, instrument in self.instruments.items():
+                        if self._stop_requested():
+                            # SIGTERM посреди итерации: новые заявки не выставляем — демон
+                            # должен завершиться до SIGKILL от systemd (TimeoutStopSec)
+                            log.info("Остановка посреди итерации: %s и остальные тикеры пропущены", ticker)
+                            break
                         try:
                             self.step_ticker(ticker, instrument, portfolio, self._entries_allowed)
                         except StaleDataError as exc:
@@ -699,11 +750,17 @@ class TradingBot:
                 if max_iterations is None or iteration < max_iterations:
                     if not self._tick_wait(self.config.loop_interval_sec):
                         break
+            self._daemon_drain()
         finally:
             self._running = False
             self._daemon_finish()
             self.conn.close()
             log.info("Бот остановлен")
+
+    def _stop_requested(self) -> bool:
+        """Запрошена ли остановка посреди итерации (SIGTERM): очередь читается лишь между итерациями."""
+        runner = getattr(self, "_daemon_runner", None)
+        return runner is not None and runner.stop_requested
 
     def _load_kill_switch_state(self) -> None:
         """Восстанавливает сработавший kill-switch с диска (в т.ч. повреждённый — fail closed)."""
@@ -722,7 +779,9 @@ class TradingBot:
 
     def _check_kill_switch(self, equity: float) -> None:
         """Просадка глубже MAX_DRAWDOWN_PCT — запретить входы до явного сброса (переживает рестарт)."""
-        anchor = self._budget_rub if self._budget_rub is not None else self.config.sandbox_initial_rub
+        anchor = getattr(self, "_kill_switch_anchor", None)
+        if anchor is None:
+            anchor = self._budget_rub if self._budget_rub is not None else self.config.sandbox_initial_rub
         if self._entries_allowed and equity < anchor * (1.0 - self.config.max_drawdown_pct):
             self._entries_allowed = False
             dd = 1.0 - equity / anchor
@@ -739,6 +798,8 @@ class TradingBot:
                             "threshold": self.config.max_drawdown_pct,
                         },
                     )
+                    # якорь, от которого сработал запрет, — чтобы рестарт не подменил его бюджетом
+                    _write_kill_switch_anchor(reports_dir, float(anchor))
                 except OSError as exc:
                     log.error("kill-switch: не удалось сохранить состояние (%s)", exc)
             log.error(
@@ -760,15 +821,66 @@ class TradingBot:
 
         _check_kill_switch только выставляет флаг в False и не умеет его снимать —
         сброс обязан сбрасывать и файл, и in-memory флаг (команда демона).
+
+        Якорь переносится на текущий капитал: при капитале всё ещё ниже
+        якорь×(1−порог) следующая же итерация взвела бы запрет снова, и сброс
+        означал бы лишь лишнее письмо. Новая просадка считается от новой точки.
         """
         reports_dir = getattr(self.config, "reports_dir", None)
-        cleared = clear_kill_switch(reports_dir) if reports_dir else False
+        active = not self._entries_allowed or (read_kill_switch(reports_dir) is not None if reports_dir else False)
+        if active:
+            # якорь — первым: если капитал недоступен, запрет остаётся ровно как был
+            self._rebase_kill_switch_anchor()
+            cleared = _unlink_kill_switch(reports_dir) if reports_dir else False
+        else:
+            cleared = clear_kill_switch(reports_dir) if reports_dir else False
         self._entries_allowed = True
         log.warning(
             "kill-switch сброшен (%s) — новые входы разрешены",
             "файл удалён" if cleared else "файл не был активен",
         )
         return cleared
+
+    def _rebase_kill_switch_anchor(self) -> None:
+        """Якорь kill-switch = капитал сейчас; сохраняется, чтобы пережить рестарт."""
+        equity = self._load_portfolio().equity
+        if not (isinstance(equity, (int, float)) and equity > 0):
+            raise RuntimeError(f"не удалось определить капитал для якоря kill-switch: {equity!r}")
+        self._kill_switch_anchor = float(equity)
+        reports_dir = getattr(self.config, "reports_dir", None)
+        if reports_dir:
+            _write_kill_switch_anchor(reports_dir, self._kill_switch_anchor)
+        log.info("Якорь kill-switch перенесён на текущий капитал: %.0f руб", self._kill_switch_anchor)
+
+    def _restore_kill_switch_anchor(self) -> None:
+        """Якорь kill-switch после рестарта: сохранённый при сбросе, иначе бюджет счёта."""
+        reports_dir = getattr(self.config, "reports_dir", None)
+        if not reports_dir:
+            return
+        saved = read_kill_switch_anchor(reports_dir)
+        if saved is None:
+            return
+        anchor = saved.get("anchor_rub")
+        if anchor is None:
+            # сброс выполнялся офлайн (CLI, TUI, веб): капитал известен только отсюда
+            try:
+                anchor = self._load_portfolio().equity
+            except Exception as exc:
+                log.warning("Капитал для якоря kill-switch не получен (%s) — считаю от бюджета", exc)
+                return
+        try:
+            anchor = float(anchor)
+        except (TypeError, ValueError):
+            anchor = float("nan")
+        if not anchor > 0:  # NaN и неположительные значения не годятся в якорь
+            log.warning("Сохранённый якорь kill-switch непригоден (%r) — считаю от бюджета", saved.get("anchor_rub"))
+            return
+        self._kill_switch_anchor = anchor
+        try:
+            _write_kill_switch_anchor(reports_dir, anchor)
+        except OSError as exc:
+            log.warning("Не удалось сохранить якорь kill-switch (%s)", exc)
+        log.info("Якорь kill-switch после рестарта: %.0f руб", anchor)
 
     # ---------- Демон: tick-цикл и статус ----------
 
@@ -804,6 +916,12 @@ class TradingBot:
         if runner is not None:
             runner.finish()
 
+    def _daemon_drain(self) -> None:
+        """Последний дренаж очереди: при ``--iterations N`` цикл кончается без тика."""
+        runner = getattr(self, "_daemon_runner", None)
+        if runner is not None:
+            runner.on_tick()
+
     def _setup_capital_profile(self) -> None:
         """Режим работы под размер счёта: профиль капитала + доступная вселенная.
 
@@ -817,6 +935,10 @@ class TradingBot:
         if budget is None:
             budget = self.config.sandbox_initial_rub if self.config.is_sandbox else equity
         self._budget_rub = float(budget)
+        # просадка kill-switch считается от своего якоря (по умолчанию — бюджет);
+        # сброс переносит якорь на капитал, и значение переживает рестарт
+        self._kill_switch_anchor = self._budget_rub
+        self._restore_kill_switch_anchor()
 
         profile = self.config.apply_profile(equity)
         self.risk = RiskConfig(
@@ -933,6 +1055,39 @@ class _DaemonRunner:
         self.cash: float | None = None
         self.positions: int = 0
         self.position_rows: list[dict] = []
+
+    def request_stop(self, reason: str = "SIGTERM") -> None:
+        """Мягкая остановка извне (systemctl stop/restart): текущая итерация — последняя.
+
+        Без обработчика сигнала процесс умирает мимо ``finally``: статус остаётся
+        ``running``, lock не снят, заявка может оборваться на середине.
+        """
+        if self.stop_requested:
+            return
+        self.stop_requested = True
+        self.bot._running = False
+        log.info("Демон: получен %s — завершаем текущую итерацию", reason)
+
+    def discard_stale_commands(self) -> None:
+        """Команды, оставшиеся от прошлого запуска, не исполняем: честный ack ok=False.
+
+        Иначе «stop» от зависшего или убитого демона останавливает свежезапущенный
+        после первой итерации, а «kill_switch_reset» молча разрешает входы.
+        """
+        try:
+            stale = control.drain_commands(self.reports_dir)
+        except Exception as exc:
+            log.exception("Демон: очередь команд недоступна (%s)", exc)
+            return
+        for command in stale:
+            name = str(command.get("name") or "")
+            command_id = str(command.get("id") or "")
+            if command_id:
+                control.write_ack(
+                    self.reports_dir, command_id, name, False,
+                    "команда адресована прошлому запуску демона — не выполнялась",
+                )
+            log.warning("Демон: команда %s оставлена прошлым запуском — отброшена", name)
 
     def _kill_switch(self) -> tuple[bool, str | None]:
         if getattr(self.bot, "_entries_allowed", True):
@@ -1057,6 +1212,24 @@ class _DaemonRunner:
         self.publish(state="stopped")
 
 
+_NO_HANDLER = object()  # сигнал(SIGTERM) недоступен: не main-поток
+
+
+def _install_sigterm_handler(runner: _DaemonRunner):
+    """SIGTERM (systemctl stop/restart, watchdog --restart) -> мягкая остановка демона.
+
+    Возвращает прежний обработчик для восстановления в ``finally``; вне main-потока
+    сигналы недоступны — тогда ``_NO_HANDLER``, и демон работает как раньше.
+    """
+    def handler(signum, frame) -> None:
+        runner.request_stop()
+
+    try:
+        return signal.signal(signal.SIGTERM, handler)
+    except (ValueError, OSError):  # не main-поток
+        return _NO_HANDLER
+
+
 def run_headless(bot, max_iterations: int | None = None, reports_dir=None, *, acquire: bool = True) -> int:
     """Foreground-демон: lock, tick-цикл, статус после итерации, команды.
 
@@ -1068,8 +1241,10 @@ def run_headless(bot, max_iterations: int | None = None, reports_dir=None, *, ac
         return 3
     runner = _DaemonRunner(bot, reports_dir)
     bot._daemon_runner = runner
+    previous_handler = _install_sigterm_handler(runner)
     try:
         runner.publish(iteration=0, state="running")
+        runner.discard_stale_commands()
         bot.run_forever(max_iterations=max_iterations)
         return 0
     except Exception as exc:
@@ -1079,3 +1254,6 @@ def run_headless(bot, max_iterations: int | None = None, reports_dir=None, *, ac
         runner.finish()
         if acquire:
             control.release_lock(reports_dir)
+        # обработчик снимаем последним: пока идёт уборка, SIGTERM не должен убить процесс мимо неё
+        if previous_handler is not _NO_HANDLER:
+            signal.signal(signal.SIGTERM, previous_handler)

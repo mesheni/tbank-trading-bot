@@ -5,7 +5,27 @@ import pytest
 
 from nlp.agenda import batch_score_news, score_agenda
 from nlp.embedder import NewsEmbedder
-from nlp.sentiment import LexiconSentiment, make_sentiment
+from nlp.sentiment import LexiconSentiment, make_sentiment, sentiment_label_score
+
+
+@pytest.mark.parametrize(
+    ("label", "expected"),
+    [
+        ("NEGATIVE", -1.0),
+        ("NEUTRAL", 0.0),
+        ("POSITIVE", 1.0),
+        ("negative", -1.0),
+        ("LABEL_0", -1.0),  # числовые метки: 0 = негатив, 1 = нейтраль, 2 = позитив
+        ("LABEL_1", 0.0),
+        ("LABEL_2", 1.0),
+        ("0", -1.0),
+        ("1", 0.0),
+        ("2", 1.0),
+        ("SOMETHING_ELSE", 0.0),
+    ],
+)
+def test_sentiment_label_score_neutral_is_not_positive(label, expected):
+    assert sentiment_label_score(label) == expected
 
 
 @pytest.fixture

@@ -85,6 +85,18 @@ def _iter_cert_files(search_dirs: list[Path]) -> list[Path]:
     return files
 
 
+def _write_text_atomic(path: Path, text: str) -> None:
+    """Атомарная запись: временный файл рядом + os.replace.
+
+    Бандл пересобирает каждый процесс, создающий клиент (демон, cron-команды);
+    прямой записью другой процесс мог бы прочитать половину файла и упасть на SSL.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    tmp.write_text(text, encoding="utf-8")
+    os.replace(tmp, path)
+
+
 def build_ca_bundle(
     search_dirs: list[Path] | None = None,
     output_path: Path | None = None,
@@ -116,8 +128,7 @@ def build_ca_bundle(
     base = Path(certifi.where()).read_text(encoding="utf-8", errors="ignore")
     merged = base.rstrip() + "\n" + extra
     try:
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        output_path.write_text(merged, encoding="utf-8")
+        _write_text_atomic(output_path, merged)
     except OSError as exc:
         # папка недоступна для записи (например, создана под root, а сервис работает от другого
         # пользователя) — бандл кладём во временный каталог, чтобы бот не падал на старте
@@ -129,7 +140,7 @@ def build_ca_bundle(
             "Проверьте владельца файлов проекта: chown -R <пользователь> <проект>",
             output_path, exc, fallback,
         )
-        fallback.write_text(merged, encoding="utf-8")
+        _write_text_atomic(fallback, merged)
         output_path = fallback
     log.info("TLS: использую бандл %s (certifi + %s)", output_path, ", ".join(used))
     return str(output_path)

@@ -3,9 +3,11 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import secrets
 from pathlib import Path
 
 import pytest
+from argon2 import PasswordHasher
 
 import control
 from config import Config
@@ -140,12 +142,13 @@ def test_secret_looking_keys_are_redacted(tmp_path, line, secret):
 
 
 def test_literal_config_secrets_are_redacted_anywhere(tmp_path):
+    # секреты генерируются на прогон: в репозитории нет ничего, похожего на настоящий секрет
     config = make_config(
         tmp_path,
-        token="tok-REAL-123",
-        smtp_password="smtp-PASS-9",
-        web_password_hash="$argon2id$v=19$hashvalue",
-        web_secret_key="secret-key-value-0123456789abcdef",
+        token="tok-" + secrets.token_hex(6),
+        smtp_password="smtp-" + secrets.token_hex(6),
+        web_password_hash=PasswordHasher().hash(secrets.token_urlsafe(16)),
+        web_secret_key=secrets.token_hex(16),
     )
     write(
         config.log_file,

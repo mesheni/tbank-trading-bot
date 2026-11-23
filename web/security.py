@@ -10,6 +10,7 @@ config))`` and reuses one ``LoginThrottle`` instance for both login and re-auth.
 from __future__ import annotations
 
 import hmac
+import logging
 import secrets
 import threading
 import time
@@ -19,10 +20,19 @@ from typing import Protocol
 from argon2 import PasswordHasher
 from argon2.exceptions import InvalidHashError, VerificationError, VerifyMismatchError
 
+log = logging.getLogger(__name__)
+
 _PASSWORD_HASHER = PasswordHasher()
 
 #: Safety valve for the throttle memory: keys are attacker-influenced behind a proxy.
 _MAX_TRACKED_IPS = 10_000
+
+#: One verification holds the hasher's memory_cost (64 MiB by default). Without a
+#: cap a parallel flood of /login spends that much per threadpool worker; two slots
+#: are plenty for a single-admin panel, everyone else waits briefly or is refused.
+_MAX_CONCURRENT_VERIFIES = 2
+_VERIFY_WAIT_SEC = 2.0
+_VERIFY_SLOTS = threading.BoundedSemaphore(_MAX_CONCURRENT_VERIFIES)
 
 
 class AuthConfig(Protocol):
@@ -37,14 +47,20 @@ def verify_password(password_hash: str, password: str) -> bool:
     """Return True only for a well-formed argon2 hash matching ``password``.
 
     Malformed hashes (including an empty one) and mismatches are reported as
-    False instead of raising; the password value itself is never logged.
+    False instead of raising; the password value itself is never logged. A caller
+    that cannot get a verification slot within ``_VERIFY_WAIT_SEC`` is refused too.
     """
     if not password_hash:
+        return False
+    if not _VERIFY_SLOTS.acquire(timeout=_VERIFY_WAIT_SEC):
+        log.warning("Отказ в проверке пароля: все %d слота заняты", _MAX_CONCURRENT_VERIFIES)
         return False
     try:
         return _PASSWORD_HASHER.verify(password_hash, password)
     except (VerifyMismatchError, InvalidHashError, VerificationError):
         return False
+    finally:
+        _VERIFY_SLOTS.release()
 
 
 def check_credentials(config: AuthConfig, username: str, password: str) -> bool:
@@ -61,11 +77,24 @@ def check_credentials(config: AuthConfig, username: str, password: str) -> bool:
     return bool(username_ok and password_ok)
 
 
+def normalize_ip(value: str | None) -> str:
+    """Trim an address and unwrap the IPv4-mapped IPv6 form (``::ffff:127.0.0.1`` -> ``127.0.0.1``).
+
+    Trusted proxies are compared as strings: without this a dual-stack listener
+    (peer ``::ffff:127.0.0.1``) never matches ``WEB_TRUSTED_PROXIES=127.0.0.1``,
+    X-Forwarded-For is ignored and every client shares the proxy's throttle key.
+    """
+    text = (value or "").strip()
+    if text.startswith("::ffff:") and "." in text:
+        return text[len("::ffff:") :]
+    return text
+
+
 def parse_trusted_proxies(raw: str | None) -> set[str]:
-    """Split WEB_TRUSTED_PROXIES (comma separated) into a trimmed set."""
+    """Split WEB_TRUSTED_PROXIES (comma separated) into a trimmed, normalized set."""
     if not raw:
         return set()
-    return {item.strip() for item in raw.split(",") if item.strip()}
+    return {normalize_ip(item) for item in raw.split(",") if item.strip()}
 
 
 def resolve_client_ip(
@@ -79,11 +108,12 @@ def resolve_client_ip(
     For a trusted peer, walk the X-Forwarded-For chain right-to-left and return
     the first hop that is not itself a trusted proxy; fall back to the peer.
     """
+    peer_host = normalize_ip(peer_host)
     if not peer_host or peer_host not in trusted_proxies:
         return peer_host
     if not forwarded_for:
         return peer_host
-    hops = [hop.strip() for hop in forwarded_for.split(",") if hop.strip()]
+    hops = [normalize_ip(hop) for hop in forwarded_for.split(",") if hop.strip()]
     for hop in reversed(hops):
         if hop not in trusted_proxies:
             return hop

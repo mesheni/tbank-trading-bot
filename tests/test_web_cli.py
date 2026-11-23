@@ -1,9 +1,11 @@
 """T8: команда `cli.py web` — валидация WEB_* и запуск uvicorn без токена API."""
 from __future__ import annotations
 
+import secrets
 import sys
 
 import pytest
+from argon2 import PasswordHasher
 
 import cli
 from config import Config
@@ -21,7 +23,8 @@ _WEB_ENV = (
     "WEB_ALLOW_PUBLIC",
 )
 
-_HASH = "$argon2id$v=19$m=65536,t=3,p=4$c29tZXNhbHQ$c29tZWhhc2g"
+# Dummy credentials are generated per test run: nothing in the repo looks like a real secret.
+_HASH = PasswordHasher().hash(secrets.token_urlsafe(16))
 
 
 @pytest.fixture(autouse=True)
@@ -80,14 +83,15 @@ def test_web_when_password_hash_missing_returns_2_naming_variable(monkeypatch, c
 
 
 def test_web_when_password_hash_not_argon2_returns_2(monkeypatch, capsys) -> None:
-    config = _make_config(monkeypatch, **_valid_env(WEB_PASSWORD_HASH="plain-text"))
+    not_a_hash = "not-an-argon2-hash-" + secrets.token_hex(6)
+    config = _make_config(monkeypatch, **_valid_env(WEB_PASSWORD_HASH=not_a_hash))
 
     rc = cli.cmd_web(config)
 
     captured = capsys.readouterr()
     assert rc == 2
     assert "WEB_PASSWORD_HASH" in captured.err
-    assert "plain-text" not in captured.err
+    assert not_a_hash not in captured.err
 
 
 def test_web_when_secret_key_too_short_returns_2_naming_variable(monkeypatch, capsys) -> None:

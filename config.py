@@ -1,6 +1,7 @@
 """Конфигурация бота: значения берутся из .env / переменных окружения."""
 from __future__ import annotations
 
+import math
 import os
 import sys
 from dataclasses import dataclass, field
@@ -29,10 +30,18 @@ def _env_float(name: str, default: float) -> float:
     if raw is None or raw == "":
         return default
     try:
-        return float(raw)
+        return _finite(raw)
     except ValueError:
         _env_warn(name, raw, default)
         return default
+
+
+def _finite(raw: str) -> float:
+    """float(raw), но nan/inf — «не распознано»: они проходят float() и тихо отключают любые сравнения."""
+    value = float(raw)
+    if not math.isfinite(value):
+        raise ValueError(f"{raw!r} — не конечное число")
+    return value
 
 
 def _env_int(name: str, default: int) -> int:
@@ -68,7 +77,7 @@ def _env_float_opt(name: str) -> float | None:
     if not raw:
         return None
     try:
-        return float(raw)
+        return _finite(raw)
     except ValueError:
         _env_warn(name, raw, "пропущено")
         return None
@@ -277,6 +286,39 @@ class Config:
         if self.commission_min_rub < 0:
             raise ValueError(
                 f"COMMISSION_MIN_RUB не может быть отрицательным, получено: {self.commission_min_rub}"
+            )
+        # Доли задаются в единицах (0.15 = 15%): запись «15 вместо 0.15» иначе молча
+        # отключала бы kill-switch — порог уходил в отрицательные значения.
+        if not 0 <= self.max_drawdown_pct < 1:
+            raise ValueError(
+                f"max_drawdown_pct должен быть в [0; 1) (доля: 0.15 = 15%), получено: {self.max_drawdown_pct}"
+            )
+        if not self.min_abs_return > 0:
+            raise ValueError(
+                f"MIN_ABS_RETURN должен быть положительным (доля: 0.004 = 0.4%), получено: {self.min_abs_return}"
+            )
+        if not self.reversal_exit_mult > 0:
+            raise ValueError(
+                f"REVERSAL_EXIT_MULT должен быть положительным, получено: {self.reversal_exit_mult}"
+            )
+        for name in ("commission_pct", "slippage_pct"):
+            value = getattr(self, name)
+            if not 0 <= value < 1:
+                raise ValueError(f"{name} должен быть в [0; 1), получено: {value}")
+        if self.max_total_exposure_pct is not None and not 0 < self.max_total_exposure_pct <= 1:
+            raise ValueError(
+                f"MAX_TOTAL_EXPOSURE_PCT должен быть в (0; 1] (доля: 0.8 = 80%) или none, "
+                f"получено: {self.max_total_exposure_pct}"
+            )
+        if self.forecast_horizon < 1:
+            raise ValueError(f"FORECAST_HORIZON должен быть ≥ 1, получено: {self.forecast_horizon}")
+        # интервал 0 — busy-loop, в котором очередь команд (stop!) вообще не опрашивается;
+        # доли секунды допустимы (команды читаются каждый тик DAEMON_TICK_SEC)
+        if self.loop_interval_sec <= 0:
+            raise ValueError(f"LOOP_INTERVAL_SEC должен быть положительным, получено: {self.loop_interval_sec}")
+        if self.is_sandbox and self.sandbox_initial_rub <= 0:
+            raise ValueError(
+                f"SANDBOX_INITIAL_RUB должен быть положительным числом, получено: {self.sandbox_initial_rub}"
             )
 
 

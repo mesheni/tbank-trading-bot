@@ -21,6 +21,7 @@ from textual.widgets import Button, Static
 import control
 import tui.app as tui_app
 import tui.controls as tui_controls
+import tui.data as tui_data
 from config import Config
 from tui.app import TbankApp
 from tui.controls import ConfirmScreen
@@ -300,6 +301,70 @@ def test_start_while_running_is_refused_even_after_double_press(tmp_path, monkey
     asyncio.run(scenario())
 
     assert spy.calls == []
+
+
+# =====================================================================
+# (c2) Демон умер мимо finally: статус заморожен в running, процесса нет
+# =====================================================================
+
+def _write_frozen_running(reports: Path, minutes_ago: float = 30.0) -> None:
+    """kill -9 / потеря питания: daemon_status.json навсегда running, updated_at не растёт."""
+    stamp = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=minutes_ago)).isoformat(
+        timespec="seconds"
+    )
+    payload = {"pid": 4242, "state": "running", "mode": "sandbox", "iteration": 1, "updated_at": stamp}
+    (reports / "daemon_status.json").write_text(json.dumps(payload), encoding="utf-8")
+
+
+def test_daemon_dead_with_frozen_running_status_is_offline(tmp_path):
+    _write_frozen_running(tmp_path)
+    state = tui_data.daemon_state(tmp_path)
+
+    assert tui_controls.daemon_online(state) is False
+    assert tui_controls.kill_switch_needs_daemon(state) is False
+    assert tui_controls.start_refusal(_config(tmp_path), state) is None
+
+
+def test_start_allowed_when_daemon_died_and_left_running_status(tmp_path, monkeypatch):
+    """После падения демона `s` запускает его, а не отвечает «уже запущен»."""
+    _write_frozen_running(tmp_path)
+    spy = _install_popen_spy(monkeypatch, tmp_path)
+    app = TbankApp(_config(tmp_path))
+
+    async def scenario() -> None:
+        async with app.run_test(size=(120, 42)) as pilot:
+            await pilot.press("s")
+            await _confirm(app, pilot)
+            assert "демон запускается" in _status(app)
+
+    asyncio.run(scenario())
+
+    assert len(spy.calls) == 1
+
+
+def test_kill_switch_reset_goes_direct_when_daemon_died_with_frozen_status(tmp_path, monkeypatch):
+    """Мёртвому процессу команду не шлём (не ждать ack 60 c) — файл чистим напрямую."""
+    _write_frozen_running(tmp_path)
+    (tmp_path / "kill_switch.json").write_text(
+        json.dumps({"triggered_at": "2026-01-01T00:00:00+00:00"}), encoding="utf-8"
+    )
+    cleared: list[Path] = []
+    monkeypatch.setattr(tui_app.bot, "clear_kill_switch", lambda reports_dir: cleared.append(reports_dir))
+    app = TbankApp(_config(tmp_path))
+    app.ack_timeout = 0.2
+
+    async def scenario() -> None:
+        async with app.run_test(size=(120, 42)) as pilot:
+            await pilot.press("k")
+            await _confirm(app, pilot)
+            await pilot.pause(0.1)
+            assert "kill-switch сброшен" in _status(app)
+            assert "не подтвердил" not in _status(app)
+
+    asyncio.run(scenario())
+
+    assert cleared == [tmp_path]
+    assert _command_files(tmp_path) == []
 
 
 # =====================================================================

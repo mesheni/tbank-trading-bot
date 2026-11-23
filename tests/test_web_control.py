@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import secrets
 import time
 from pathlib import Path
 
@@ -335,9 +336,12 @@ def test_audit_one_line_per_call_and_never_contains_secrets(tmp_path, monkeypatc
     config = _config(tmp_path)
     config.mode = "real"
     config.confirm_real_trading = False
-    config.token = "TINVEST_SECRET_TOKEN_abc123"
-    config.web_password_hash = "$argon2id$v=19$m=65536,t=3,p=4$SECRETHASHVALUE"
-    config.web_secret_key = "SECRETKEY" * 8
+    # секреты генерируются на прогон: в репозитории нет ничего, похожего на настоящий секрет
+    hash_salt = secrets.token_hex(8)
+    key_fragment = secrets.token_hex(8)
+    config.token = "TINVEST-" + secrets.token_hex(12)
+    config.web_password_hash = f"$argon2id$v=19$m=65536,t=3,p=4${hash_salt}"
+    config.web_secret_key = key_fragment * 4
     _spawn_spy(monkeypatch)
 
     stopped = web_control.request_stop(config, True, user="admin", client_ip="203.0.113.7")
@@ -360,9 +364,9 @@ def test_audit_one_line_per_call_and_never_contains_secrets(tmp_path, monkeypatc
 
     raw = (tmp_path / "web_audit.jsonl").read_text(encoding="utf-8")
     for secret in (
-        "TINVEST_SECRET_TOKEN_abc123",
-        "SECRETHASHVALUE",
-        "SECRETKEYSECRETKEY",
+        config.token,
+        hash_salt,
+        key_fragment * 2,
         "password",
         "token",
     ):
@@ -383,6 +387,84 @@ def test_audit_write_failure_does_not_raise_or_change_result(tmp_path, monkeypat
 # =====================================================================
 # Adversarial: устаревшая живость -> офлайн по badge
 # =====================================================================
+
+def _write_frozen_running(reports: Path, minutes_ago: float = 30.0) -> None:
+    """Демон умер мимо finally: в статусе навсегда running, но updated_at давно не растёт."""
+    stamp = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=minutes_ago)).isoformat(
+        timespec="seconds"
+    )
+    payload = {"pid": 4242, "state": "running", "mode": "sandbox", "iteration": 1, "updated_at": stamp}
+    (reports / "daemon_status.json").write_text(json.dumps(payload), encoding="utf-8")
+
+
+def test_stop_refused_when_daemon_died_with_frozen_running_status(tmp_path):
+    _write_frozen_running(tmp_path)
+
+    result = web_control.request_stop(_config(tmp_path), True)
+
+    assert result.ok is False
+    assert result.message == tui_controls.DAEMON_NOT_RUNNING
+    assert result.audit_result == "refused"
+    assert _command_files(tmp_path) == []  # мёртвому процессу команду не оставляем
+
+
+def test_kill_reset_goes_direct_when_daemon_died_with_frozen_running_status(tmp_path, monkeypatch):
+    _write_frozen_running(tmp_path)
+    (tmp_path / "kill_switch.json").write_text(
+        json.dumps({"triggered_at": "2026-01-01T00:00:00+00:00"}), encoding="utf-8"
+    )
+    cleared: list[Path] = []
+    monkeypatch.setattr(web_control.bot, "clear_kill_switch", lambda reports_dir: cleared.append(reports_dir))
+
+    result = web_control.request_kill_switch_reset(_config(tmp_path), True)
+
+    assert result.ok is True
+    assert result.message == tui_controls.KILL_SWITCH_CLEARED
+    assert result.command_id is None  # без ожидания ack от мёртвого процесса
+    assert cleared == [tmp_path]
+    assert _command_files(tmp_path) == []
+
+
+# =====================================================================
+# Stop под systemd: Restart=always перезапустил бы демона после выхода по команде
+# =====================================================================
+
+def test_stop_systemd_managed_uses_systemctl_not_queue(tmp_path, monkeypatch):
+    monkeypatch.setenv("TUI_SYSTEMD_MANAGED", "1")
+    _write_running(tmp_path)
+    calls: list[str] = []
+
+    def run(action: str) -> SystemctlResult:
+        calls.append(action)
+        return SystemctlResult(ok=True, returncode=0, detail="")
+
+    monkeypatch.setattr(web_control.systemd, "run_systemctl", run)
+
+    result = web_control.request_stop(_config(tmp_path), True)
+
+    assert result.ok is True
+    assert result.message == tui_controls.STOPPED
+    assert result.command_id is None
+    assert result.audit_result == "ok"
+    assert calls == ["stop"]
+    assert _command_files(tmp_path) == []  # в очередь команду не кладём
+
+
+def test_stop_systemd_failure_is_error_not_queue_fallback(tmp_path, monkeypatch):
+    monkeypatch.setenv("TUI_SYSTEMD_MANAGED", "1")
+    _write_running(tmp_path)
+    monkeypatch.setattr(
+        web_control.systemd,
+        "run_systemctl",
+        lambda action: SystemctlResult(ok=False, returncode=1, detail="Failed to stop unit"),
+    )
+
+    result = web_control.request_stop(_config(tmp_path), True)
+
+    assert result.ok is False
+    assert "Failed to stop unit" in result.message
+    assert result.audit_result == "error"
+    assert _command_files(tmp_path) == []  # не откатываемся на очередь: демон вернулся бы через 30 с
 
 def test_stale_heartbeat_without_status_is_offline_and_stop_refused(tmp_path):
     old = dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=25)

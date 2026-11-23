@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import base64
+import os
 from pathlib import Path
 
 import pytest
 import requests
 
+import tbank.rest as rest_mod
 from tbank.rest import (
     _der_to_pem,
     _read_certs,
@@ -71,6 +73,27 @@ def test_build_bundle_without_certs_returns_none(tmp_path):
     empty = tmp_path / "certs"
     empty.mkdir()
     assert build_ca_bundle(search_dirs=[empty], output_path=tmp_path / "b.pem") is None
+
+
+def test_build_bundle_writes_atomically_without_tmp_leftovers(tmp_path, monkeypatch):
+    """Бандл пересобирает каждый процесс с клиентом: читатель не должен увидеть половину файла."""
+    certs_dir = tmp_path / "certs"
+    certs_dir.mkdir()
+    (certs_dir / "Russian_Trusted_Root_CA.cer").write_text(_first_cert_pem(), encoding="utf-8")
+    out = tmp_path / "data" / "ca_bundle.pem"
+    replaced: list[tuple[Path, Path]] = []
+    real_replace = os.replace
+
+    def spy(src, dst):
+        replaced.append((Path(src), Path(dst)))
+        real_replace(src, dst)
+
+    monkeypatch.setattr(rest_mod.os, "replace", spy)
+
+    assert build_ca_bundle(search_dirs=[certs_dir], output_path=out) is not None
+
+    assert replaced == [(out.with_name(f"{out.name}.{os.getpid()}.tmp"), out)]  # tmp рядом -> os.replace
+    assert list(out.parent.iterdir()) == [out]  # временный файл не остался
 
 
 def test_build_bundle_falls_back_to_temp_when_dir_unwritable(tmp_path):

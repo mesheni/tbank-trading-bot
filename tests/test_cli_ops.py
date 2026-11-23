@@ -4,11 +4,15 @@ from __future__ import annotations
 import csv
 import datetime as dt
 import json
+import os
 import sys
 from types import SimpleNamespace
 
+import pytest
+
 import bot
 import cli
+import control
 import notify
 from config import Config
 
@@ -86,6 +90,68 @@ def test_kill_switch_reset_when_not_active(tmp_path, capsys):
     assert captured.out == ""
 
 
+def _active_switch(config):
+    """Файл активного kill-switch в reports/ конфигурации."""
+    config.reports_dir.mkdir(parents=True, exist_ok=True)
+    switch = bot.kill_switch_path(config.reports_dir)
+    switch.write_text(json.dumps({"triggered_at": "2026-01-01T00:00:00+00:00"}), encoding="utf-8")
+    return switch
+
+
+def test_kill_switch_reset_goes_through_live_daemon(tmp_path, monkeypatch, capsys):
+    """Живой демон держит запрет в памяти: файл напрямую не удаляем, шлём команду."""
+    config = make_config(tmp_path)
+    switch = _active_switch(config)
+    control.write_status(config.reports_dir, {"state": "running", "iteration": 1, "mode": "sandbox"})
+    commands: list[str] = []
+
+    def fake_daemon(reports_dir, name):
+        commands.append(name)
+        command_id = "20260101T000000000000Z-fake"
+        acks = control.paths(reports_dir)["acks"]
+        acks.mkdir(parents=True, exist_ok=True)
+        switch.unlink()  # демон снял флаг в памяти и удалил файл
+        (acks / f"{command_id}.json").write_text(json.dumps({"ok": True}), encoding="utf-8")
+        return command_id
+
+    monkeypatch.setattr(cli.control, "enqueue_command", fake_daemon)
+
+    assert cli.cmd_kill_switch_reset(config, timeout=1.0, poll_interval=0.01) == 0
+
+    assert commands == ["kill_switch_reset"]
+    assert not switch.exists()
+    assert "сброшен демоном" in capsys.readouterr().out.lower()
+
+
+def test_kill_switch_reset_reports_daemon_timeout_and_keeps_file(tmp_path, monkeypatch, capsys):
+    config = make_config(tmp_path)
+    switch = _active_switch(config)
+    control.write_status(config.reports_dir, {"state": "running", "iteration": 1, "mode": "sandbox"})
+    monkeypatch.setattr(cli.control, "enqueue_command", lambda reports_dir, name: "cmd-unanswered")
+
+    assert cli.cmd_kill_switch_reset(config, timeout=0.05, poll_interval=0.01) == 1
+
+    assert "не подтвердил" in capsys.readouterr().err
+    assert switch.exists()  # напрямую файл не трогали: демон держит запрет в памяти
+
+
+def test_kill_switch_reset_with_dead_daemon_and_stale_status_clears_file(tmp_path, monkeypatch, capsys):
+    config = make_config(tmp_path)
+    switch = _active_switch(config)
+    control.write_status(
+        config.reports_dir, {"state": "running", "iteration": 1, "mode": "sandbox", "pid": 999999}
+    )
+    monkeypatch.setattr(control, "_pid_alive", lambda pid: pid == os.getpid())  # 999999 мёртв
+    monkeypatch.setattr(
+        cli.control, "enqueue_command", lambda *a, **k: pytest.fail("мёртвому демону команду не шлём")
+    )
+
+    assert cli.cmd_kill_switch_reset(config) == 0
+
+    assert not switch.exists()
+    assert bot.read_kill_switch_anchor(config.reports_dir)["anchor_rub"] is None  # якорь — капитал при старте
+
+
 # ---------- MODE=real: подтверждение до любых обращений к API ----------
 
 def test_cmd_run_real_without_confirm_returns_2_before_api(tmp_path, monkeypatch, capsys):
@@ -101,6 +167,22 @@ def test_cmd_run_real_without_confirm_returns_2_before_api(tmp_path, monkeypatch
     captured = capsys.readouterr()
     assert "CONFIRM_REAL_TRADING=YES" in captured.err
     assert called == []  # гейт стоит до моделей и до TradingBot
+
+
+# ---------- train/backtest: без токена, но с проверкой риск-параметров ----------
+
+@pytest.mark.parametrize("command", ["train", "backtest"])
+def test_main_train_and_backtest_validate_risk_without_token(monkeypatch, capsys, command):
+    monkeypatch.delenv("T_INVEST_TOKEN", raising=False)
+    monkeypatch.setenv("MAX_DRAWDOWN_PCT", "15")  # проценты вместо доли
+    monkeypatch.setattr(
+        cli, f"cmd_{command}", lambda *a, **k: pytest.fail("с кривым риском обучение не запускается")
+    )
+    monkeypatch.setattr(sys, "argv", ["cli.py", command])
+
+    assert cli.main() == 2
+
+    assert "max_drawdown_pct" in capsys.readouterr().err
 
 
 # ---------- --no-color ----------
@@ -131,7 +213,7 @@ def test_status_json_is_valid_and_nan_safe(tmp_path, monkeypatch, capsys):
     (config.reports_dir / "heartbeat").write_text(
         dt.datetime.now(dt.timezone.utc).isoformat(), encoding="utf-8"
     )
-    with open(config.reports_dir / "journal.csv", "w", encoding="utf-8", newline="") as f:
+    with (config.reports_dir / "journal.csv").open("w", encoding="utf-8", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=["time", "ticker", "action", "lots", "price", "reason"])
         writer.writeheader()
         writer.writerow(

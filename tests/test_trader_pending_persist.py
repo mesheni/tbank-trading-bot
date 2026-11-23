@@ -2,9 +2,13 @@
 from __future__ import annotations
 
 import json
+import os
 
 import pytest
+import requests
 
+import tbank.trader as trader_mod
+from tbank.rest import APIError
 from tbank.trader import FINAL_STATUSES, Trader
 
 
@@ -235,3 +239,148 @@ def test_valid_file_rewrite_clears_corrupt_sentinel(tmp_path):
     other = trader.buy("SBER-UID", 1, 10.0)
     assert other["status"] == "fill"
     assert [post["instrument_id"] for post in api.posts] == ["SBER-UID"]
+
+
+# ---------------------------------------------------------------------------
+# (3) Ответ на PostOrder потерян: заявка могла дойти до биржи
+# ---------------------------------------------------------------------------
+
+class LostResponseAPI(FakeAPI):
+    """Сервер принял заявку, а ответ потерялся (таймаут/5xx после ретраев).
+
+    Как настоящий ``TBankAPI.post_order``, помечает исключение id заявки.
+    """
+
+    def __init__(self, error: Exception | None):
+        super().__init__()
+        self.error = error
+        self.placed: list[str] = []  # заявки, реально дошедшие до «биржи»
+
+    def post_order(self, account_id, instrument_id, lots, direction, price=None) -> dict:
+        order_id = f"o{len(self.posts) + 1}"
+        super().post_order(account_id, instrument_id, lots, direction, price)
+        if self.error is not None:
+            self.placed.append(order_id)
+            self.error.unconfirmed_order_id = order_id
+            raise self.error
+        return order_state(order_id, self.post_status, lots_requested=lots)
+
+
+def _lose_post_response(tmp_path, error: Exception) -> tuple[LostResponseAPI, Trader]:
+    api = LostResponseAPI(error)
+    trader = make_trader(api, tmp_path)
+    with pytest.raises(type(error)):
+        trader.buy("SBER-UID", 5, 100.0)
+    return api, trader
+
+
+def test_lost_post_response_registers_order_and_blocks_duplicate(tmp_path):
+    api, trader = _lose_post_response(tmp_path, requests.exceptions.ReadTimeout("timed out"))
+
+    assert api.placed == ["o1"]  # на «бирже» жива заявка, ответ на которую бот не получил
+    assert read_pending(tmp_path) == {"SBER-UID": "o1"}
+
+    blocked = trader.buy("SBER-UID", 5, 101.0)
+
+    assert blocked["status"] == "pending_unresolved"
+    assert blocked["order_id"] == "o1"
+    assert len(api.posts) == 1  # вторая заявка поверх потерянной не выставлена
+
+
+def test_lost_order_blocks_after_restart_until_final_status(tmp_path):
+    api, _trader = _lose_post_response(tmp_path, APIError(502, "server error"))
+    restarted_api = FakeAPI(post_status="fill")
+    restarted_api.state_queue = [
+        order_state("o1", "new"),        # ещё жива: отзываем и держим блокировку
+        order_state("o1", "cancelled"),  # финальный статус: блокировка снята
+    ]
+    restarted = make_trader(restarted_api, tmp_path)
+
+    blocked = restarted.buy("SBER-UID", 5, 101.0)
+
+    assert blocked["status"] == "pending_unresolved"
+    assert restarted_api.cancels == ["o1"]  # как в _execute: не дорабатывать по устаревшему сигналу
+    assert restarted_api.posts == []
+
+    filled = restarted.buy("SBER-UID", 5, 102.0)
+    assert filled["status"] == "fill"
+    assert read_pending(tmp_path) == {}
+    assert len(api.placed) == 1
+
+
+@pytest.mark.parametrize("status", sorted((400, 404)))
+def test_order_unknown_to_exchange_clears_block(tmp_path, status):
+    api, trader = _lose_post_response(tmp_path, requests.exceptions.ConnectionError("reset"))
+    api.error = None
+    api.post_status = "fill"
+    api.state_error = APIError(status, "client error")  # биржа не знает такой заявки
+
+    filled = trader.buy("SBER-UID", 5, 101.0)
+
+    assert filled["status"] == "fill"
+    assert read_pending(tmp_path) == {}
+
+
+def test_rate_limited_state_lookup_keeps_block(tmp_path):
+    api, trader = _lose_post_response(tmp_path, requests.exceptions.ReadTimeout("timed out"))
+    api.error = None
+    api.state_error = APIError(429, "rate limit")  # не «не найдена»: заявка может быть жива
+
+    blocked = trader.buy("SBER-UID", 5, 101.0)
+
+    assert blocked["status"] == "pending_unresolved"
+    assert read_pending(tmp_path) == {"SBER-UID": "o1"}
+    assert len(api.posts) == 1
+
+
+def test_state_without_lots_is_not_a_live_order(tmp_path):
+    """Пустой ответ сервера на неизвестный id — не живая заявка, вечной блокировки быть не должно."""
+    api, trader = _lose_post_response(tmp_path, requests.exceptions.ReadTimeout("timed out"))
+    api.error = None
+    api.post_status = "fill"
+    api.state_queue = [order_state("o1", "new", lots_requested=0, lots_executed=0)]
+
+    filled = trader.buy("SBER-UID", 5, 101.0)
+
+    assert filled["status"] == "fill"
+    assert read_pending(tmp_path) == {}
+
+
+def test_pending_registry_replace_retries_while_reader_holds_file(tmp_path, monkeypatch):
+    """Windows: TUI читает pending_orders.json в момент замены — повторяем, реестр не теряем."""
+    calls: list[int] = []
+    real_replace = os.replace
+
+    def flaky_replace(src, dst) -> None:
+        calls.append(1)
+        if len(calls) < 3:
+            raise PermissionError(5, "Отказано в доступе")
+        real_replace(src, dst)
+
+    monkeypatch.setattr(trader_mod.os, "replace", flaky_replace)
+    trader = make_trader(FakeAPI(), tmp_path)
+
+    leave_pending_order(FakeAPI(), trader)
+
+    assert read_pending(tmp_path) == {"SBER-UID": "o1"}
+    assert len(calls) == 3
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        APIError(400, "client error", "invalid price"),
+        APIError(429, "rate limit"),
+        APIError(503, "circuit open"),
+    ],
+    ids=["rejected-4xx", "rate-limited", "never-sent"],
+)
+def test_post_that_certainly_failed_registers_nothing(tmp_path, error):
+    api = LostResponseAPI(error)
+    trader = make_trader(api, tmp_path)
+
+    with pytest.raises(APIError):
+        trader.buy("SBER-UID", 5, 100.0)
+
+    assert trader._pending_orders == {}
+    assert not pending_path(tmp_path).exists()

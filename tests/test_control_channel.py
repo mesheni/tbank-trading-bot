@@ -10,6 +10,8 @@ import datetime as dt
 import json
 import logging
 import os
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -256,3 +258,117 @@ def test_pid_alive_current_process_is_true() -> None:
 @pytest.mark.parametrize("pid", [0, -1])
 def test_pid_alive_invalid_pid_is_false(pid: int) -> None:
     assert control._pid_alive(pid) is False
+
+
+def test_daemon_pid_alive_distinguishes_live_dead_and_missing() -> None:
+    assert control.daemon_pid_alive({"pid": os.getpid()}) is True
+    assert control.daemon_pid_alive({"pid": 999999}) is False  # pid, которого нет на хосте
+    assert control.daemon_pid_alive({"corrupt": True}) is False
+    assert control.daemon_pid_alive(None) is False
+
+
+# =====================================================================
+# Гонки захвата lock: пустой lock и одновременный перехват устаревшего
+# =====================================================================
+
+def test_acquire_lock_waits_for_pid_in_freshly_created_lock(tmp_path: Path) -> None:
+    """lock только что создан другим процессом и ещё пуст: перехватывать чужой живой lock нельзя."""
+    lock = tmp_path / "daemon.lock"
+    lock.write_text("", encoding="utf-8")
+    started = time.monotonic()
+    writer = threading.Timer(0.15, lambda: lock.write_text(f"{os.getpid()}\n", encoding="utf-8"))
+    writer.start()
+    try:
+        assert control.acquire_lock(tmp_path) is False
+        elapsed = time.monotonic() - started
+    finally:
+        writer.cancel()
+
+    assert elapsed >= 0.15  # дождался pid живого владельца, а не счёл файл повреждённым
+    assert lock.read_text(encoding="utf-8").strip() == str(os.getpid())
+    assert not (tmp_path / "daemon.pid").exists()
+
+
+def test_acquire_lock_takes_over_abandoned_empty_lock(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Владелец умер между созданием lock и записью pid: пустой lock в итоге перехватывается."""
+    monkeypatch.setattr(control, "_LOCK_PID_WAIT_SEC", 0.05)
+    (tmp_path / "daemon.lock").write_text("", encoding="utf-8")
+
+    assert control.acquire_lock(tmp_path) is True
+
+    assert (tmp_path / "daemon.lock").read_text(encoding="utf-8").strip() == str(os.getpid())
+    control.release_lock(tmp_path)
+
+
+def test_concurrent_takeover_is_serialized_and_sees_new_owner(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Два старта поверх мёртвого pid: второй ждёт блокировки перехвата и отступает."""
+    lock = tmp_path / "daemon.lock"
+    lock.write_text("999999\n", encoding="utf-8")
+    monkeypatch.setattr(control, "_pid_alive", lambda pid: pid == os.getpid())
+    monkeypatch.setattr(control, "_TAKEOVER_WAIT_SEC", 5.0)
+    results: list[bool] = []
+    with control._takeover_guard(lock) as guarded:  # «первый» процесс держит блокировку перехвата
+        assert guarded is True
+        contender = threading.Thread(target=lambda: results.append(control.acquire_lock(tmp_path)))
+        contender.start()
+        contender.join(0.2)
+        assert contender.is_alive()  # не лезет поверх: ждёт блокировки
+        lock.write_text(f"{os.getpid()}\n", encoding="utf-8")  # «первый» перехватил lock
+    contender.join(5.0)  # блокировка снята вместе с дескриптором
+
+    assert results == [False]  # взяв её, второй увидел живого владельца и отступил
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("0::/system.slice/tbank-bot.service\n", "tbank-bot.service"),
+        ("0::/user.slice/user-1000.slice/user@1000.service/app.slice/tbank-bot.service\n", "tbank-bot.service"),
+        ("12:pids:/system.slice/tbank-bot.service\n11:memory:/system.slice/tbank-bot.service\n", "tbank-bot.service"),
+        ("0::/user.slice/user-1000.slice/session-3.scope\n", None),
+        ("", None),
+    ],
+)
+def test_parse_systemd_unit_reads_cgroup_v1_v2_and_ignores_non_units(text: str, expected: str | None) -> None:
+    assert control.parse_systemd_unit(text) == expected
+
+
+def test_systemd_unit_of_pid_is_none_for_missing_process() -> None:
+    assert control.systemd_unit_of_pid(999_999_999) is None
+
+
+# =====================================================================
+# write_text_atomic: replace на Windows конфликтует с читателем файла
+# =====================================================================
+
+def test_write_text_atomic_retries_replace_while_reader_holds_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """PermissionError от replace временен (файл читает TUI/веб): повторяем, а не теряем запись."""
+    calls: list[int] = []
+    real_replace = os.replace
+
+    def flaky_replace(src, dst) -> None:
+        calls.append(1)
+        if len(calls) < 3:
+            raise PermissionError(5, "Отказано в доступе", str(dst))
+        real_replace(src, dst)
+
+    monkeypatch.setattr(control.os, "replace", flaky_replace)
+    monkeypatch.setattr(control.time, "sleep", lambda seconds: None)
+
+    control.write_text_atomic(tmp_path / "state.json", "{}")
+
+    assert len(calls) == 3
+    assert (tmp_path / "state.json").read_text(encoding="utf-8") == "{}"
+
+
+def test_write_text_atomic_gives_up_after_attempts_and_cleans_tmp(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    def busy(src, dst) -> None:
+        raise PermissionError(5, "Отказано в доступе", str(dst))
+
+    monkeypatch.setattr(control.os, "replace", busy)
+    monkeypatch.setattr(control.time, "sleep", lambda seconds: None)
+
+    with pytest.raises(PermissionError):
+        control.write_text_atomic(tmp_path / "state.json", "{}")
+
+    assert list(tmp_path.iterdir()) == []  # временный файл не остался мусором

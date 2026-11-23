@@ -14,6 +14,18 @@ from .rest import APIError, TBankRestClient
 log = logging.getLogger(__name__)
 
 
+def _tag_unconfirmed_order(exc: BaseException, order_id: str) -> None:
+    """Помечает исключение id заявки, которая могла дойти до биржи без ответа.
+
+    Трейдер по метке вносит заявку в реестр незавершённых — иначе следующий цикл
+    выставил бы вторую поверх потерянной.
+    """
+    try:
+        exc.unconfirmed_order_id = order_id
+    except AttributeError:  # pragma: no cover - исключение без __dict__
+        pass
+
+
 def quotation_to_float(quotation: dict | None) -> float:
     """{\"units\": \"260\", \"nano\": 500000000} -> 260.5.
 
@@ -190,7 +202,8 @@ class TBankAPI:
         for share in data.get("instruments", []):
             ticker = str(share.get("ticker", "")).upper()
             if ticker in wanted and ticker not in found:
-                if share.get("apiTradeAvailableFlag") is False and share.get("buyAvailableFlag") is False:
+                # торговать через API нельзя, если недоступна ИЛИ API-торговля, ИЛИ покупка
+                if share.get("apiTradeAvailableFlag") is False or share.get("buyAvailableFlag") is False:
                     continue
                 found[ticker] = {
                     "ticker": ticker,
@@ -358,7 +371,7 @@ class TBankAPI:
         if price is not None and order_type == "ORDER_TYPE_LIMIT":
             payload["price"] = float_to_quotation(price)
         try:
-            data = self.client.post(f"{self.ORDERS}/PostOrder", payload)
+            data = self._post_order_request(payload)
         except APIError as exc:
             if exc.status != 400 or order_type != "ORDER_TYPE_LIMIT" or not self.order_market_fallback:
                 raise
@@ -379,7 +392,8 @@ class TBankAPI:
             )
             payload["orderType"] = "ORDER_TYPE_MARKET"
             payload.pop("price", None)
-            data = self.client.post(f"{self.ORDERS}/PostOrder", payload)
+            payload["orderId"] = str(uuid.uuid4())  # другая заявка — свой идемпотентный ключ
+            data = self._post_order_request(payload)
             if self.on_market_fallback is not None:
                 try:
                     self.on_market_fallback(
@@ -389,6 +403,14 @@ class TBankAPI:
                 except Exception:
                     pass
         return parse_order_state(data, fallback_price=price)
+
+    def _post_order_request(self, payload: dict) -> dict:
+        """PostOrder с меткой id на исключении: ответ мог потеряться после приёма заявки."""
+        try:
+            return self.client.post(f"{self.ORDERS}/PostOrder", payload)
+        except Exception as exc:
+            _tag_unconfirmed_order(exc, str(payload.get("orderId") or ""))
+            raise
 
     def get_order_state(self, account_id: str, order_id: str) -> dict:
         """OrdersService/GetOrderState: статус заявки (в т.ч. после частичного исполнения)."""

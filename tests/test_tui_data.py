@@ -391,7 +391,7 @@ def test_tail_log_10mb_file_is_fast_and_exact(tmp_path):
     path = tmp_path / "big.log"
     # newline="\n" отключает CRLF-трансляцию на Windows: размер одинаков
     # на Windows и POSIX (1_000_000 * 13 байт = 13_000_000 > 10 MiB).
-    with open(path, "w", encoding="utf-8", newline="\n") as handle:
+    with path.open("w", encoding="utf-8", newline="\n") as handle:
         handle.write("".join(f"line {index:07d}\n" for index in range(1_000_000)))
     assert path.stat().st_size > 10 * 1024 * 1024
 

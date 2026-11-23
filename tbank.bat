@@ -1,7 +1,8 @@
-﻿chcp 65001 >nul
 @echo off
 rem Короткий вызов бота: tbank status, tbank run, tbank report ...
 rem Ищет venv рядом с собой, падает с подсказкой, если его нет.
+rem Файл без BOM: с ним cmd выполняет первую строку как несуществующую команду.
+chcp 65001 >nul
 setlocal
 cd /d "%~dp0"
 if exist ".venv\Scripts\python.exe" (

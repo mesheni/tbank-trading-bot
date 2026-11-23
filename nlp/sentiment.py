@@ -59,24 +59,34 @@ class LexiconSentiment:
         return strength * (pos_hits - neg_hits) / total
 
 
+def sentiment_label_score(label: str) -> float:
+    """Вес метки трёхклассового классификатора: -1 негатив, +1 позитив, 0 нейтраль.
+
+    Числовые метки идут в стандартном порядке LABEL_0 = негатив, LABEL_1 =
+    нейтраль, LABEL_2 = позитив. Считать LABEL_1 позитивом — значит пропускать
+    нейтральные новости через фильтр «хороших».
+    """
+    normalized = str(label).upper()
+    if "NEG" in normalized or normalized in {"LABEL_0", "0"}:
+        return -1.0
+    if "POS" in normalized or normalized in {"LABEL_2", "2"}:
+        return 1.0
+    return 0.0
+
+
 class TransformersSentiment:
     """Трёхклассовый трансформер тональности (NEGATIVE/NEUTRAL/POSITIVE и вариации)."""
 
-    name = "transformers"
+    name = "transformer"
 
     def __init__(self, model_name: str):
         from transformers import pipeline
 
         self._pipeline = pipeline("text-classification", model=model_name, truncation=True, max_length=256)
-        self._label_map = {}
-        for label in self._pipeline.model.config.id2label.values():
-            normalized = str(label).upper()
-            if "NEG" in normalized or normalized in {"LABEL_0", "0"}:
-                self._label_map[label] = -1.0
-            elif "POS" in normalized or normalized in {"LABEL_2", "LABEL_1", "2", "1"}:
-                self._label_map[label] = 1.0
-            else:
-                self._label_map[label] = 0.0
+        self._label_map = {
+            label: sentiment_label_score(label)
+            for label in self._pipeline.model.config.id2label.values()
+        }
 
     def score(self, text: str) -> float:
         text = (text or "").strip()
